@@ -1,5 +1,5 @@
-const API_BASE = 'http://localhost:8000/api';
-const WS_BASE = 'ws://localhost:8000/ws';
+const API_BASE = 'http://localhost:8001/api';
+const WS_BASE = 'ws://localhost:8001/ws';
 
 async function fetchJSON(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {

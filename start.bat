@@ -13,9 +13,9 @@ echo Initializing database...
 python -m backend.migrate
 echo.
 
-:: Start FastAPI backend (port 8000)
-echo Starting backend on http://localhost:8000 ...
-start "FlippingAI-Backend" cmd /c "cd /d %~dp0 && uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload"
+:: Start FastAPI backend (port 8001)
+echo Starting backend on http://localhost:8001 ...
+start "FlippingAI-Backend" cmd /c "cd /d %~dp0 && uvicorn backend.app:app --host 0.0.0.0 --port 8001 --reload"
 
 :: Wait for backend to start
 timeout /t 3 /nobreak >nul
@@ -31,9 +31,9 @@ start http://localhost:5173
 echo.
 echo ========================================
 echo  Flipping AI is running!
-echo  Backend:  http://localhost:8000
+echo  Backend:  http://localhost:8001
 echo  Frontend: http://localhost:5173
-echo  API Docs: http://localhost:8000/docs
+echo  API Docs: http://localhost:8001/docs
 echo ========================================
 echo.
 echo Press any key to stop all services...
