@@ -3,7 +3,7 @@ OSRS Flipping AI - FastAPI Application
 Main entry point for the backend server.
 
 Run with:
-    uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
+    uvicorn backend.app:app --reload --host 0.0.0.0 --port 8001
 """
 
 import sys
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "backend.app:app",
         host="0.0.0.0",
-        port=8000,
+        port=8001,
         reload=True,
         reload_dirs=[_PROJECT_ROOT],
     )
