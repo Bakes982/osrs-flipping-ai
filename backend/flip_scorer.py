@@ -226,6 +226,30 @@ class FlipScorer:
                 fs.vetoed = True
                 fs.veto_reasons.append("Crashing with no volume - avoid")
 
+        # Veto 7: Volume velocity trap - volume died recently
+        # Even if total_volume was historically high, if recent volume is 0
+        # the item is now illiquid and you'll be stuck holding the bag
+        if len(snapshots) >= 6:
+            recent_3 = snapshots[-3:]
+            older = snapshots[:-3]
+            recent_vol = sum((s.buy_volume or 0) + (s.sell_volume or 0) for s in recent_3)
+            if older:
+                older_vol = sum((s.buy_volume or 0) + (s.sell_volume or 0) for s in older)
+                avg_older = (older_vol / len(older)) * 3  # scale to same window
+                if recent_vol == 0 and avg_older > 5:
+                    fs.vetoed = True
+                    fs.veto_reasons.append("Volume velocity trap - trades died in last interval")
+                elif avg_older > 0:
+                    velocity = recent_vol / max(avg_older, 1)
+                    if velocity < 0.2 and rec.volume_5m < 5:
+                        fs.vetoed = True
+                        fs.veto_reasons.append(f"Volume crashed to {velocity:.0%} of normal - liquidity freeze")
+
+        # Veto 8: Waterfall crash detection
+        if self.pricer.detect_waterfall(snapshots):
+            fs.vetoed = True
+            fs.veto_reasons.append("Waterfall crash detected - price dropping >5% in 15 minutes")
+
     # ------------------------------------------------------------------
     # Component Scoring Functions (each returns 0-100)
     # ------------------------------------------------------------------

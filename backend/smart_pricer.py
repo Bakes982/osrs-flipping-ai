@@ -197,6 +197,44 @@ class SmartPricer:
         lower = middle - num_std * stdev
         return upper, middle, lower
 
+    def validate_against_5m(
+        self,
+        instant_buy: Optional[int],
+        instant_sell: Optional[int],
+        snapshots: List[PriceSnapshot],
+    ) -> Tuple[Optional[int], Optional[int], bool]:
+        """
+        Ghost Margin Fix: validate /latest prices against 5m averages.
+        If instant price deviates >5% from 5m avg, use the 5m avg instead.
+        Returns (validated_buy, validated_sell, was_ghost).
+        """
+        vwap_5m_buy = self.calculate_vwap(snapshots, 5, use_buy=True)
+        vwap_5m_sell = self.calculate_vwap(snapshots, 5, use_buy=False)
+        was_ghost = False
+
+        validated_buy = instant_buy
+        validated_sell = instant_sell
+
+        if vwap_5m_buy and instant_buy:
+            # If instant buy is >5% higher than 5m avg, it's a fake spike
+            if instant_buy > vwap_5m_buy * 1.05:
+                validated_buy = int(vwap_5m_buy)
+                was_ghost = True
+            # If instant buy is >5% lower than 5m avg, it's a fake dip
+            if instant_buy < vwap_5m_buy * 0.95:
+                validated_buy = int(vwap_5m_buy)
+                was_ghost = True
+
+        if vwap_5m_sell and instant_sell:
+            if instant_sell > vwap_5m_sell * 1.05:
+                validated_sell = int(vwap_5m_sell)
+                was_ghost = True
+            if instant_sell < vwap_5m_sell * 0.95:
+                validated_sell = int(vwap_5m_sell)
+                was_ghost = True
+
+        return validated_buy, validated_sell, was_ghost
+
     def calculate_undercut(
         self,
         price: int,
@@ -204,25 +242,34 @@ class SmartPricer:
         is_buy: bool,
     ) -> int:
         """
-        Calculate optimal undercut/overcut amount based on volume.
-        For buys: undercut means offering LESS (to buy cheaper).
-        For sells: overcut means listing LOWER (to sell faster).
+        Calculate optimal queue-jumping offset based on volume.
+        For buys: INCREASE offer price to jump ahead in the buy queue.
+        For sells: DECREASE list price to sell faster.
+
+        The key insight: never offer at the exact price - you'll be behind
+        hundreds of other players. Always offset to jump the queue.
         """
-        if volume_5m > 50:
-            # High volume: tiny undercut, 1 GP
+        if price < 10_000:
+            # Cheap items: 1 GP offset
             amount = 1
-        elif volume_5m > 20:
-            # Medium-high: 0.05% of price
-            amount = max(1, int(price * 0.0005))
-        elif volume_5m > 5:
-            # Medium: 0.1-0.5% of price
-            amount = max(1, int(price * 0.002))
-        elif volume_5m > 1:
-            # Low: 0.5-1%
-            amount = max(1, int(price * 0.005))
+        elif price < 10_000_000:
+            if volume_5m > 50:
+                # High volume cheap/mid items: 0.1% offset
+                amount = max(1, int(price * 0.001))
+            elif volume_5m > 10:
+                amount = max(1, int(price * 0.002))
+            elif volume_5m > 1:
+                amount = max(1, int(price * 0.005))
+            else:
+                amount = max(1, int(price * 0.01))
         else:
-            # Very low / no trades: 1-2%
-            amount = max(1, int(price * 0.015))
+            # Expensive items (10M+): cap offset
+            if volume_5m > 20:
+                amount = max(1, int(price * 0.001))
+            elif volume_5m > 5:
+                amount = max(1, int(price * 0.003))
+            else:
+                amount = min(50_000, max(1, int(price * 0.005)))
 
         return amount
 
@@ -285,6 +332,76 @@ class SmartPricer:
         # NEUTRAL: use insta_buy as-is
 
         return max(1, base)
+
+    def detect_waterfall(self, snapshots: List[PriceSnapshot]) -> bool:
+        """
+        Detect a 'waterfall' crash: price dropping >2% every 5 minutes
+        for 3+ consecutive intervals. If detected, DO NOT BUY.
+        """
+        if len(snapshots) < 10:
+            return False
+
+        # Group snapshots into 5-minute buckets and get avg price per bucket
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for s in snapshots:
+            if s.instant_buy and s.instant_buy > 0:
+                bucket = s.timestamp.replace(
+                    minute=(s.timestamp.minute // 5) * 5,
+                    second=0, microsecond=0,
+                )
+                buckets[bucket].append(s.instant_buy)
+
+        if len(buckets) < 4:
+            return False
+
+        # Get average price per bucket, sorted by time
+        sorted_buckets = sorted(buckets.items())
+        avg_prices = [statistics.mean(prices) for _, prices in sorted_buckets]
+
+        # Check last 3 intervals for consecutive drops
+        if len(avg_prices) < 4:
+            return False
+
+        recent = avg_prices[-4:]  # Last 4 buckets = 3 intervals
+        pct_changes = []
+        for i in range(1, len(recent)):
+            if recent[i - 1] > 0:
+                pct_changes.append((recent[i] - recent[i - 1]) / recent[i - 1])
+
+        # Waterfall = all 3 intervals negative AND total drop > 5%
+        if len(pct_changes) >= 3:
+            if all(c < 0 for c in pct_changes) and sum(pct_changes) < -0.05:
+                return True
+
+        return False
+
+    def check_volume_liveness(self, snapshots: List[PriceSnapshot]) -> str:
+        """
+        Check if volume has recently died. An item with historical volume
+        but 0 recent trades is a trap.
+        Returns: 'HEALTHY', 'DECLINING', or 'DEAD_VOLUME_TRAP'
+        """
+        if len(snapshots) < 6:
+            return "HEALTHY"
+
+        # Recent volume (last 3 snapshots = ~30 seconds)
+        recent = snapshots[-3:]
+        recent_vol = sum((s.buy_volume or 0) + (s.sell_volume or 0) for s in recent)
+
+        # Historical volume (older snapshots)
+        older = snapshots[:-3]
+        if not older:
+            return "HEALTHY"
+        older_vol = sum((s.buy_volume or 0) + (s.sell_volume or 0) for s in older)
+        avg_older = older_vol / len(older) * 3  # Scale to same window size
+
+        if recent_vol == 0 and avg_older > 5:
+            return "DEAD_VOLUME_TRAP"
+        elif avg_older > 0 and recent_vol / max(avg_older, 1) < 0.2:
+            return "DECLINING"
+
+        return "HEALTHY"
 
     def check_sanity(
         self,
@@ -378,6 +495,18 @@ class SmartPricer:
         # Volume from latest snapshot
         rec.volume_5m = (latest.buy_volume or 0) + (latest.sell_volume or 0)
 
+        # Ghost Margin Fix: validate /latest against 5m averages
+        # If instant price deviates >5% from 5m VWAP, it's likely a one-off
+        # fat-finger trade, not a real price. Use 5m avg instead.
+        validated_buy, validated_sell, was_ghost = self.validate_against_5m(
+            rec.instant_buy, rec.instant_sell, snapshots,
+        )
+        if was_ghost:
+            rec.anomalous_spread = True
+            rec.confidence *= 0.6  # Reduce confidence for ghost margins
+            rec.instant_buy = validated_buy
+            rec.instant_sell = validated_sell
+
         # Calculate VWAPs
         rec.vwap_1m = self.calculate_vwap(snapshots, 1)
         rec.vwap_5m = self.calculate_vwap(snapshots, 5)
@@ -392,6 +521,20 @@ class SmartPricer:
         if rec.bb_upper and rec.bb_lower and rec.bb_upper > rec.bb_lower:
             rec.bb_position = (rec.instant_buy - rec.bb_lower) / (rec.bb_upper - rec.bb_lower)
             rec.bb_position = max(0.0, min(1.0, rec.bb_position))
+
+        # Waterfall detection: if price is crashing, don't buy
+        if self.detect_waterfall(snapshots):
+            rec.confidence *= 0.2
+            rec.reason = "WATERFALL DETECTED - price crashing, avoid buying"
+
+        # Volume liveness check
+        vol_status = self.check_volume_liveness(snapshots)
+        if vol_status == "DEAD_VOLUME_TRAP":
+            rec.confidence *= 0.3
+            if not rec.reason:
+                rec.reason = "DEAD VOLUME - recent trades dried up, likely trap"
+        elif vol_status == "DECLINING":
+            rec.confidence *= 0.7
 
         # Compute historical spread from flip history
         historical_spread_pct = None
@@ -432,12 +575,14 @@ class SmartPricer:
             rec.momentum, spread,
         )
 
-        # Apply undercut/overcut
-        buy_undercut = self.calculate_undercut(rec.clamped_buy, rec.volume_5m, is_buy=True)
-        sell_overcut = self.calculate_undercut(rec.clamped_sell, rec.volume_5m, is_buy=False)
+        # Apply queue-jumping offsets
+        # Buy: INCREASE offer to jump ahead of other buyers
+        # Sell: DECREASE price to sell faster than other sellers
+        buy_offset = self.calculate_undercut(rec.clamped_buy, rec.volume_5m, is_buy=True)
+        sell_offset = self.calculate_undercut(rec.clamped_sell, rec.volume_5m, is_buy=False)
 
-        rec.recommended_buy = rec.clamped_buy - buy_undercut
-        rec.recommended_sell = rec.clamped_sell + sell_overcut
+        rec.recommended_buy = rec.clamped_buy + buy_offset   # Offer MORE to buy first
+        rec.recommended_sell = rec.clamped_sell - sell_offset  # List LOWER to sell first
 
         # Ensure buy < sell
         if rec.recommended_buy >= rec.recommended_sell:

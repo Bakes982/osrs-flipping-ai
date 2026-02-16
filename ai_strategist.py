@@ -216,9 +216,25 @@ def scan_all_items_for_flips(
         # Get 5-minute averaged prices (more accurate, like Flipping Copilot)
         avg_data = avg_5m_prices.get(item_id, {})
 
-        # Prefer 5m averaged prices, fall back to instant
-        high = avg_data.get('avgHighPrice') or instant_data.get('high')
-        low = avg_data.get('avgLowPrice') or instant_data.get('low')
+        # Use 5m averaged prices for DECISION MAKING (removes ghost margins)
+        # Use instant prices only for EXECUTION (setting specific buy/sell)
+        avg_high = avg_data.get('avgHighPrice')
+        avg_low = avg_data.get('avgLowPrice')
+        inst_high = instant_data.get('high')
+        inst_low = instant_data.get('low')
+
+        # Primary: use 5m average for margin calculation (ghost margin fix)
+        high = avg_high or inst_high
+        low = avg_low or inst_low
+
+        # Ghost margin validation: if instant price deviates >5% from 5m avg,
+        # it's a one-off fat-finger trade, not a real price
+        if avg_high and inst_high:
+            if inst_high > avg_high * 1.05 or inst_high < avg_high * 0.95:
+                high = avg_high  # Use 5m avg, ignore the ghost
+        if avg_low and inst_low:
+            if inst_low > avg_low * 1.05 or inst_low < avg_low * 0.95:
+                low = avg_low  # Use 5m avg, ignore the ghost
 
         # Skip items without both prices
         if not high or not low:
@@ -292,11 +308,18 @@ def scan_all_items_for_flips(
 
             # Volume-based risk (low volume = higher risk)
             if candidate['total_volume'] == 0:
-                risk += 3  # No trades in last 5m = risky
+                risk += 4  # No trades in last 5m = dead market, DO NOT BUY
             elif candidate['total_volume'] < 5:
                 risk += 2
             elif candidate['total_volume'] < 20:
                 risk += 1
+
+            # Volume velocity check: project hourly rate from 5m data
+            # If volume is way below normal for this item, it's dying
+            hourly_rate = candidate['total_volume'] * 12  # projected hourly
+            # Items with 0 projected hourly volume are traps
+            if hourly_rate == 0:
+                risk += 3
 
             # Freshness-based risk
             max_age = max(candidate['high_age_mins'], candidate['low_age_mins'])
@@ -317,6 +340,16 @@ def scan_all_items_for_flips(
 
             if risk > max_risk:
                 continue
+
+            # Volume velocity trap: if hourly rate is way below what's normal,
+            # the item has "died" and you will be stuck holding the bag
+            if candidate['total_volume'] > 0:
+                # Check if high_volume and low_volume are severely imbalanced
+                # (one side has volume but other doesn't = one-sided market)
+                hv = candidate.get('high_volume', 0)
+                lv = candidate.get('low_volume', 0)
+                if (hv > 0 and lv == 0) or (lv > 0 and hv == 0):
+                    risk += 1  # One-sided volume = harder to fill both sides
 
             # Determine confidence level
             if candidate['total_volume'] > 20 and max_age < 15:

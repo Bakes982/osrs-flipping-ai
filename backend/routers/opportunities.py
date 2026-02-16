@@ -18,12 +18,14 @@ if _PROJECT_ROOT not in sys.path:
 from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, Item
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
+from backend.arbitrage_finder import ArbitrageFinder
 from ai_strategist import scan_all_items_for_flips, analyze_single_item
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
 
 _pricer = SmartPricer()
 _scorer = FlipScorer()
+_arb_finder = ArbitrageFinder()
 
 
 @router.get("")
@@ -110,6 +112,21 @@ async def list_opportunities(
     results.sort(key=lambda x: x.get(sort_key) or 0, reverse=True)
 
     return {"items": results[:limit], "total": len(results)}
+
+
+@router.get("/arbitrage")
+async def list_arbitrage():
+    """Return current set unpacking & decanting arbitrage opportunities.
+
+    These are near-zero-risk trades:
+    - Buy set -> Unpack at GE -> Sell pieces
+    - Buy 3-dose potions -> Decant at Bob Barter -> Sell 4-dose
+    """
+    try:
+        results = _arb_finder.find_all_arbitrage()
+        return {"items": results, "total": len(results)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Arbitrage scan failed: {e}")
 
 
 @router.get("/{item_id}")
