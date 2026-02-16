@@ -308,18 +308,11 @@ def scan_all_items_for_flips(
 
             # Volume-based risk (low volume = higher risk)
             if candidate['total_volume'] == 0:
-                risk += 4  # No trades in last 5m = dead market, DO NOT BUY
+                risk += 3  # No trades in last 5m = risky
             elif candidate['total_volume'] < 5:
                 risk += 2
             elif candidate['total_volume'] < 20:
                 risk += 1
-
-            # Volume velocity check: project hourly rate from 5m data
-            # If volume is way below normal for this item, it's dying
-            hourly_rate = candidate['total_volume'] * 12  # projected hourly
-            # Items with 0 projected hourly volume are traps
-            if hourly_rate == 0:
-                risk += 3
 
             # Freshness-based risk
             max_age = max(candidate['high_age_mins'], candidate['low_age_mins'])
