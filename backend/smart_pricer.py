@@ -393,6 +393,24 @@ class SmartPricer:
             rec.bb_position = (rec.instant_buy - rec.bb_lower) / (rec.bb_upper - rec.bb_lower)
             rec.bb_position = max(0.0, min(1.0, rec.bb_position))
 
+        # Compute historical spread from flip history
+        historical_spread_pct = None
+        try:
+            db2 = get_db()
+            try:
+                flips = get_item_flips(db2, item_id, days=14)
+                if len(flips) >= 3:
+                    margins = [
+                        f.margin_pct for f in flips
+                        if f.margin_pct is not None and f.margin_pct > 0
+                    ]
+                    if margins:
+                        historical_spread_pct = statistics.median(margins)
+            finally:
+                db2.close()
+        except Exception:
+            pass
+
         # Sanity checks
         spread = rec.instant_buy - rec.instant_sell
         rec.stale_data, rec.anomalous_spread, rec.confidence = self.check_sanity(
@@ -401,7 +419,7 @@ class SmartPricer:
             latest.buy_time,
             latest.sell_time,
             rec.volume_5m,
-            historical_spread_pct=None,  # TODO: compute from flip_history
+            historical_spread_pct=historical_spread_pct,
         )
 
         # Clamp prices against trend

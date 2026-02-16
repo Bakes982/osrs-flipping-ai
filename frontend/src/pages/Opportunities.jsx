@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { RefreshCw, ArrowUpDown } from 'lucide-react';
+import { RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -12,21 +12,31 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
-const FILTERS = ['All', 'High Margin', 'High Liquidity', 'Best EV', 'Low Risk'];
+function scoreColor(score) {
+  if (score >= 70) return 'badge-green';
+  if (score >= 55) return 'badge-cyan';
+  if (score >= 45) return 'badge-yellow';
+  return 'badge-red';
+}
+
+const FILTERS = ['All', 'High Score', 'High Margin', 'High Liquidity', 'Best EV'];
 
 export default function Opportunities({ prices }) {
   const nav = useNavigate();
   const [filter, setFilter] = useState('All');
-  const [sortCol, setSortCol] = useState('expected_profit');
+  const [sortCol, setSortCol] = useState('flip_score');
   const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
-  const [minPrice, setMinPrice] = useState(100000);
+  const [minPrice, setMinPrice] = useState(0);
 
-  const { data: opps, loading, reload } = useApi(
+  const { data: raw, loading, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_profit: minPrice }),
     [minPrice],
     30000,
   );
+
+  // API now returns { items: [...], total: N }
+  const opps = raw?.items || raw || [];
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -34,7 +44,6 @@ export default function Opportunities({ prices }) {
   };
 
   const filtered = useMemo(() => {
-    if (!opps) return [];
     let items = [...opps];
 
     // Text search
@@ -44,10 +53,10 @@ export default function Opportunities({ prices }) {
     }
 
     // Filter pills
-    if (filter === 'High Margin') items = items.filter(o => o.margin_pct > 2);
-    else if (filter === 'High Liquidity') items = items.filter(o => o.volume_5m > 10);
-    else if (filter === 'Best EV') items.sort((a, b) => (b.expected_profit * (b.volume_5m || 1)) - (a.expected_profit * (a.volume_5m || 1)));
-    else if (filter === 'Low Risk') items = items.filter(o => o.risk_score <= 4);
+    if (filter === 'High Score') items = items.filter(o => o.flip_score >= 60);
+    else if (filter === 'High Margin') items = items.filter(o => o.margin_pct > 2);
+    else if (filter === 'High Liquidity') items = items.filter(o => o.volume > 10);
+    else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume || 1)) - (a.potential_profit * (a.volume || 1)));
 
     // Sort
     items.sort((a, b) => {
@@ -70,7 +79,7 @@ export default function Opportunities({ prices }) {
       <div className="page-header">
         <div>
           <h2 className="page-title">Opportunities</h2>
-          <p className="page-subtitle">{filtered.length} items found — prices update every 10s</p>
+          <p className="page-subtitle">{filtered.length} scored items — only showing flips with 45+ score</p>
         </div>
         <button className="btn-primary btn" onClick={reload}>
           <RefreshCw size={14} /> Refresh
@@ -120,36 +129,54 @@ export default function Opportunities({ prices }) {
             <thead>
               <tr>
                 <th>Item</th>
-                {th('Buy Price', 'buy_at')}
-                {th('Sell Price', 'sell_at')}
-                {th('Margin', 'margin_pct')}
-                {th('Profit', 'expected_profit')}
-                {th('Volume', 'volume_5m')}
-                {th('Risk', 'risk_score')}
-                <th>Confidence</th>
-                <th>Verdict</th>
+                {th('Score', 'flip_score')}
+                {th('Buy', 'buy_price')}
+                {th('Sell', 'sell_price')}
+                {th('Margin%', 'margin_pct')}
+                {th('Profit', 'potential_profit')}
+                {th('Volume', 'volume')}
+                {th('Win Rate', 'win_rate')}
+                <th>Trend</th>
+                <th>Reason</th>
               </tr>
             </thead>
             <tbody>
               {filtered.map((opp, i) => (
                 <tr key={i} onClick={() => nav(`/item/${opp.item_id}`)}>
                   <td style={{ fontWeight: 500 }}>{opp.name}</td>
-                  <td className="gp text-green">{formatGP(opp.buy_at)}</td>
-                  <td className="gp text-cyan">{formatGP(opp.sell_at)}</td>
+                  <td>
+                    <span className={`badge ${scoreColor(opp.flip_score)}`}>
+                      {opp.flip_score?.toFixed(0)}/100
+                    </span>
+                  </td>
+                  <td className="gp text-green">{formatGP(opp.buy_price)}</td>
+                  <td className="gp text-cyan">{formatGP(opp.sell_price)}</td>
                   <td className="gp">{opp.margin_pct?.toFixed(1)}%</td>
-                  <td className="gp text-green">+{formatGP(opp.expected_profit)}</td>
-                  <td className="gp">{opp.volume_5m || 0}</td>
+                  <td className="gp text-green">+{formatGP(opp.potential_profit)}</td>
+                  <td className="gp">{opp.volume || 0}</td>
                   <td>
-                    <span className={`badge ${opp.risk_score <= 4 ? 'badge-green' : opp.risk_score <= 6 ? 'badge-yellow' : 'badge-red'}`}>
-                      {opp.risk_score}/10
-                    </span>
+                    {opp.win_rate != null ? (
+                      <span className={`badge ${opp.win_rate >= 80 ? 'badge-green' : opp.win_rate >= 60 ? 'badge-yellow' : 'badge-red'}`}>
+                        {opp.win_rate?.toFixed(0)}%
+                      </span>
+                    ) : (
+                      <span className="text-muted">—</span>
+                    )}
                   </td>
                   <td>
-                    <span className={`badge ${opp.confidence === 'HIGH' ? 'badge-green' : opp.confidence === 'MEDIUM' ? 'badge-yellow' : 'badge-red'}`}>
-                      {opp.confidence}
+                    <span className={`badge ${
+                      opp.trend === 'NEUTRAL' ? 'badge-cyan' :
+                      opp.trend?.includes('UP') ? 'badge-green' : 'badge-red'
+                    }`}>
+                      {opp.trend === 'STRONG_UP' ? '\u25B2\u25B2' :
+                       opp.trend === 'UP' ? '\u25B2' :
+                       opp.trend === 'NEUTRAL' ? '\u25BA' :
+                       opp.trend === 'DOWN' ? '\u25BC' : '\u25BC\u25BC'}
                     </span>
                   </td>
-                  <td className="text-muted">{opp.verdict}</td>
+                  <td className="text-muted" style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {opp.reason}
+                  </td>
                 </tr>
               ))}
             </tbody>

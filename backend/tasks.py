@@ -163,28 +163,74 @@ class PriceCollector:
 
 
 # ---------------------------------------------------------------------------
-# FeatureComputer (stub)
+# FeatureComputer
 # ---------------------------------------------------------------------------
 
 class FeatureComputer:
     """Recomputes ML feature vectors for tracked items every 60 seconds.
 
-    This is a stub -- the actual feature engineering will be added by the
-    ML pipeline later.
+    Uses the ML pipeline's FeatureEngine to compute and cache features
+    in the ItemFeature table for fast inference.
     """
 
+    def __init__(self):
+        self._engine = None
+
+    def _get_engine(self):
+        if self._engine is None:
+            try:
+                from backend.ml.feature_engine import FeatureEngine
+                self._engine = FeatureEngine()
+            except Exception as e:
+                logger.error("Failed to initialize FeatureEngine: %s", e)
+        return self._engine
+
     async def compute_features(self):
-        """Placeholder: compute and cache features for all tracked items."""
+        """Compute and cache features for all tracked items."""
+        engine = self._get_engine()
+        if engine is None:
+            return
+
         db = SessionLocal()
         try:
+            from backend.database import ItemFeature, get_price_history, get_item_flips
             item_ids = get_tracked_item_ids(db)
-            # TODO: for each item_id, compute feature vector and store in ItemFeature table
-            logger.debug("FeatureComputer: %d items tracked (stub)", len(item_ids))
+            computed = 0
+
+            for item_id in item_ids:
+                try:
+                    snapshots = get_price_history(db, item_id, hours=4)
+                    flips = get_item_flips(db, item_id, days=30)
+                    features = engine.compute_features(item_id, snapshots, flips)
+
+                    if features:
+                        import json
+                        now = datetime.utcnow()
+                        # Upsert feature cache
+                        existing = db.query(ItemFeature).filter(
+                            ItemFeature.item_id == item_id
+                        ).first()
+                        if existing:
+                            existing.features = json.dumps(features)
+                            existing.timestamp = now
+                        else:
+                            db.add(ItemFeature(
+                                item_id=item_id,
+                                timestamp=now,
+                                features=json.dumps(features),
+                            ))
+                        computed += 1
+                except Exception as e:
+                    logger.debug("Feature compute failed for %d: %s", item_id, e)
+
+            db.commit()
+            if computed > 0:
+                logger.info("FeatureComputer: computed features for %d/%d items", computed, len(item_ids))
         finally:
             db.close()
 
     async def run_forever(self):
-        logger.info("FeatureComputer started (stub)")
+        logger.info("FeatureComputer started")
         while True:
             try:
                 await self.compute_features()
@@ -194,28 +240,59 @@ class FeatureComputer:
 
 
 # ---------------------------------------------------------------------------
-# MLScorer (stub)
+# MLScorer
 # ---------------------------------------------------------------------------
 
 class MLScorer:
     """Runs ML model predictions for all tracked items every 60 seconds.
 
-    This is a stub -- the real inference code will be plugged in once
-    models are trained.
+    Uses the Predictor from the ML pipeline. Falls back to statistical
+    methods if no trained models exist yet.
     """
 
+    def __init__(self):
+        self._predictor = None
+
+    def _get_predictor(self):
+        if self._predictor is None:
+            try:
+                from backend.ml.predictor import Predictor
+                self._predictor = Predictor()
+                self._predictor.load_models()
+            except Exception as e:
+                logger.error("Failed to initialize Predictor: %s", e)
+        return self._predictor
+
     async def score_items(self):
-        """Placeholder: run predictions for tracked items."""
+        """Run predictions for tracked items and store in DB."""
+        predictor = self._get_predictor()
+        if predictor is None:
+            return
+
         db = SessionLocal()
         try:
             item_ids = get_tracked_item_ids(db)
-            # TODO: load model, run inference, store Prediction rows
-            logger.debug("MLScorer: %d items to score (stub)", len(item_ids))
+            if not item_ids:
+                return
+
+            # Batch predict (saves to DB internally)
+            results = predictor.predict_batch(item_ids[:100], save_to_db=True)
+            logger.info("MLScorer: scored %d items (%s method)",
+                len(results),
+                "ml" if predictor._models_loaded else "statistical"
+            )
+
+            # Also record outcomes for past predictions (accuracy tracking)
+            for item_id in item_ids[:50]:
+                try:
+                    predictor.record_outcomes(item_id)
+                except Exception:
+                    pass
         finally:
             db.close()
 
     async def run_forever(self):
-        logger.info("MLScorer started (stub)")
+        logger.info("MLScorer started")
         while True:
             try:
                 await self.score_items()

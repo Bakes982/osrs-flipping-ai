@@ -11,15 +11,25 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
+function scoreColor(score) {
+  if (score >= 70) return 'badge-green';
+  if (score >= 55) return 'badge-cyan';
+  if (score >= 45) return 'badge-yellow';
+  return 'badge-red';
+}
+
 export default function Dashboard({ prices }) {
   const nav = useNavigate();
-  const { data: opps, loading: oppsLoading, reload: reloadOpps } = useApi(
-    () => api.getOpportunities({ limit: 10, sort_by: 'profit' }),
+  const { data: raw, loading: oppsLoading, reload: reloadOpps } = useApi(
+    () => api.getOpportunities({ limit: 10, sort_by: 'total_score' }),
     [],
     30000,
   );
   const { data: perf } = useApi(() => api.getPerformance(), [], 60000);
   const { data: portfolio } = useApi(() => api.getPortfolio(), [], 60000);
+
+  // API returns { items: [...], total: N }
+  const opps = raw?.items || raw || [];
 
   return (
     <div>
@@ -62,7 +72,7 @@ export default function Dashboard({ prices }) {
       {/* Top Opportunities */}
       <div className="card" style={{ marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 16, fontWeight: 600 }}>Top Opportunities</h3>
+          <h3 style={{ fontSize: 16, fontWeight: 600 }}>Top Opportunities (by Flip Score)</h3>
           <button className="btn" onClick={() => nav('/opportunities')}>View All</button>
         </div>
 
@@ -75,30 +85,38 @@ export default function Dashboard({ prices }) {
             <thead>
               <tr>
                 <th>Item</th>
-                <th>Buy Price</th>
-                <th>Sell Price</th>
+                <th>Score</th>
+                <th>Buy</th>
+                <th>Sell</th>
                 <th>Margin</th>
                 <th>Profit</th>
-                <th>Risk</th>
-                <th>Confidence</th>
+                <th>Volume</th>
+                <th>Trend</th>
               </tr>
             </thead>
             <tbody>
               {opps.slice(0, 10).map((opp, i) => (
                 <tr key={i} onClick={() => nav(`/item/${opp.item_id}`)}>
                   <td style={{ fontWeight: 500 }}>{opp.name}</td>
-                  <td className="gp text-green">{formatGP(opp.buy_at)}</td>
-                  <td className="gp text-cyan">{formatGP(opp.sell_at)}</td>
-                  <td className="gp">{opp.margin_pct?.toFixed(1)}%</td>
-                  <td className="gp text-green">+{formatGP(opp.expected_profit)}</td>
                   <td>
-                    <span className={`badge ${opp.risk_score <= 4 ? 'badge-green' : opp.risk_score <= 6 ? 'badge-yellow' : 'badge-red'}`}>
-                      {opp.risk_score}/10
+                    <span className={`badge ${scoreColor(opp.flip_score)}`}>
+                      {opp.flip_score?.toFixed(0)}
                     </span>
                   </td>
+                  <td className="gp text-green">{formatGP(opp.buy_price)}</td>
+                  <td className="gp text-cyan">{formatGP(opp.sell_price)}</td>
+                  <td className="gp">{opp.margin_pct?.toFixed(1)}%</td>
+                  <td className="gp text-green">+{formatGP(opp.potential_profit)}</td>
+                  <td className="gp">{opp.volume || 0}</td>
                   <td>
-                    <span className={`badge ${opp.confidence === 'HIGH' ? 'badge-green' : opp.confidence === 'MEDIUM' ? 'badge-yellow' : 'badge-red'}`}>
-                      {opp.confidence}
+                    <span className={`badge ${
+                      opp.trend === 'NEUTRAL' ? 'badge-cyan' :
+                      opp.trend?.includes('UP') ? 'badge-green' : 'badge-red'
+                    }`}>
+                      {opp.trend === 'STRONG_UP' ? '\u25B2\u25B2' :
+                       opp.trend === 'UP' ? '\u25B2' :
+                       opp.trend === 'NEUTRAL' ? '\u25BA' :
+                       opp.trend === 'DOWN' ? '\u25BC' : '\u25BC\u25BC'}
                     </span>
                   </td>
                 </tr>
