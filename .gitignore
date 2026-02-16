@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.env
+
+# Database
+*.db
+flipping_ai.db
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Data files (contain personal info)
+dink_trades.csv
+dink_webhooks_log.json
+portfolio.json
+user_config.json
+live_opportunities_*.json
+scheduled_opportunities_*.json
+flips.csv
+
+# Models
+models/
+*.pkl
+*.joblib
+
+# Charts
+charts/
+*.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
