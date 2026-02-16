@@ -36,23 +36,26 @@ def _ge_tax(sell_price: int) -> int:
 # These are sets you can buy as a single item and unpack via the GE interface
 # ---------------------------------------------------------------------------
 ITEM_SETS = {
-    # Barrows sets
-    "Dharok's armour set": {"id": 11846, "pieces": [4716, 4718, 4720, 4722]},
-    "Ahrim's armour set": {"id": 11848, "pieces": [4708, 4710, 4712, 4714]},
-    "Karil's armour set": {"id": 11850, "pieces": [4732, 4734, 4736, 4738]},
-    "Guthan's armour set": {"id": 11852, "pieces": [4724, 4726, 4728, 4730]},
-    "Torag's armour set": {"id": 11854, "pieces": [4745, 4747, 4749, 4751]},
-    "Verac's armour set": {"id": 11856, "pieces": [4753, 4755, 4757, 4759]},
+    # Barrows sets (confirmed IDs from Wiki)
+    "Dharok's armour set": {"id": 11848, "pieces": [4716, 4718, 4720, 4722]},  # Helm, Axe, Body, Legs
+    "Ahrim's armour set": {"id": 11846, "pieces": [4708, 4710, 4712, 4714]},   # Hood, Staff, Top, Skirt
+    "Karil's armour set": {"id": 11850, "pieces": [4732, 4734, 4736, 4738]},   # Coif, Crossbow, Top, Skirt
+    "Guthan's armour set": {"id": 11852, "pieces": [4724, 4726, 4728, 4730]},  # Helm, Spear, Body, Skirt
+    "Torag's armour set": {"id": 11854, "pieces": [4745, 4747, 4749, 4751]},   # Helm, Hammers, Body, Legs
+    "Verac's armour set": {"id": 11856, "pieces": [4753, 4755, 4757, 4759]},   # Helm, Flail, Brassard, Skirt
 
     # High-tier armor sets
-    "Inquisitor's armour set": {"id": 24488, "pieces": [24419, 24420, 24421]},
-    "Justiciar armour set": {"id": 22438, "pieces": [22326, 22327, 22328]},
-    "Ancestral robes set": {"id": 21015, "pieces": [21018, 21021, 21024]},
-    "Masori armour set (f)": {"id": 27241, "pieces": [27226, 27229, 27232]},
+    "Inquisitor's armour set": {"id": 24488, "pieces": [24419, 24420, 24421]},  # Great helm, Hauberk, Plateskirt
+    "Justiciar armour set": {"id": 22438, "pieces": [22326, 22327, 22328]},     # Faceguard, Chestguard, Legguards
+    "Ancestral robes set": {"id": 21015, "pieces": [21018, 21021, 21024]},      # Hat, Robe top, Robe bottom
+    "Masori armour set (f)": {"id": 27241, "pieces": [27226, 27229, 27232]},    # Mask, Body, Chaps
+
+    # Torva set (set box ID = 29306)
+    "Torva armour set": {"id": 29306, "pieces": [26382, 26384, 26386]},         # Full helm, Platebody, Platelegs
 
     # Dragon sets
-    "Dragon armour set (lg)": {"id": 11834, "pieces": [1149, 1187, 3140, 4087]},
-    "Dragon armour set (sk)": {"id": 11836, "pieces": [1149, 1187, 3140, 4585]},
+    "Dragon armour set (lg)": {"id": 11834, "pieces": [1149, 1187, 3140, 4087]},  # Med helm, Square shield, Chainbody, Platelegs
+    "Dragon armour set (sk)": {"id": 11836, "pieces": [1149, 1187, 3140, 4585]},  # Med helm, Square shield, Chainbody, Plateskirt
 
     # Rune/Adamant sets
     "Rune armour set (lg)": {"id": 11838, "pieces": [1163, 1127, 1201, 1079]},
@@ -63,6 +66,10 @@ ITEM_SETS = {
     # Gilded sets
     "Gilded armour set (lg)": {"id": 11858, "pieces": [3481, 3483, 3486, 3488]},
     "Gilded armour set (sk)": {"id": 11860, "pieces": [3481, 3483, 3486, 3485]},
+
+    # Mystic sets
+    "Mystic robes set (light)": {"id": 11872, "pieces": [4089, 4109, 4113, 4117, 4101]},
+    "Mystic robes set (dark)": {"id": 11874, "pieces": [4091, 4111, 4115, 4119, 4103]},
 }
 
 # ---------------------------------------------------------------------------
@@ -113,10 +120,11 @@ class ArbitrageFinder:
 
     def __init__(self):
         self._latest_prices: Dict = {}
+        self._avg_5m_prices: Dict = {}
         self._last_fetch: float = 0.0
 
     async def _fetch_prices(self) -> Dict:
-        """Fetch latest prices, cache for 30 seconds."""
+        """Fetch latest + 5m prices, cache for 30 seconds."""
         now = time.time()
         if now - self._last_fetch < 30 and self._latest_prices:
             return self._latest_prices
@@ -126,6 +134,11 @@ class ArbitrageFinder:
                 resp = await client.get(f"{WIKI_BASE}/latest")
                 resp.raise_for_status()
                 self._latest_prices = resp.json().get("data", {})
+
+                resp_5m = await client.get(f"{WIKI_BASE}/5m")
+                resp_5m.raise_for_status()
+                self._avg_5m_prices = resp_5m.json().get("data", {})
+
                 self._last_fetch = now
         except Exception as e:
             logger.error("ArbitrageFinder: failed to fetch prices: %s", e)
@@ -143,11 +156,37 @@ class ArbitrageFinder:
                 resp = client.get(f"{WIKI_BASE}/latest")
                 resp.raise_for_status()
                 self._latest_prices = resp.json().get("data", {})
+
+                resp_5m = client.get(f"{WIKI_BASE}/5m")
+                resp_5m.raise_for_status()
+                self._avg_5m_prices = resp_5m.json().get("data", {})
+
                 self._last_fetch = now
         except Exception as e:
             logger.error("ArbitrageFinder: failed to fetch prices: %s", e)
 
         return self._latest_prices
+
+    def _validated_price(self, item_id: str, key: str) -> Optional[int]:
+        """Get price with ghost margin validation against 5m average.
+
+        For 'high' (insta-buy): validate against avgHighPrice
+        For 'low' (insta-sell): validate against avgLowPrice
+        """
+        instant = self._latest_prices.get(item_id, {}).get(key)
+        if not instant:
+            return None
+
+        avg_key = "avgHighPrice" if key == "high" else "avgLowPrice"
+        avg = self._avg_5m_prices.get(item_id, {}).get(avg_key)
+
+        if avg and instant:
+            # If instant deviates >10% from 5m avg, use 5m avg (ghost margin)
+            if instant > avg * 1.10 or instant < avg * 0.90:
+                logger.debug("Ghost margin on %s: instant=%d, avg=%d", item_id, instant, avg)
+                return avg
+
+        return instant
 
     def find_set_arbitrage(self, prices: Optional[Dict] = None) -> List[Dict]:
         """
@@ -166,19 +205,21 @@ class ArbitrageFinder:
             piece_ids = [str(pid) for pid in data["pieces"]]
 
             # We INSTA-BUY the set (pay the 'high' price)
-            set_data = prices.get(set_id, {})
-            set_buy_price = set_data.get("high")
+            # Use validated price to avoid ghost margins
+            set_buy_price = self._validated_price(set_id, "high")
             if not set_buy_price:
                 continue
 
+            set_data = prices.get(set_id, {})
+
             # We INSTA-SELL the pieces (get the 'low' price per piece)
+            # Use validated prices to avoid ghost margins on pieces too
             pieces_sell_total = 0
             piece_details = []
             valid = True
 
             for pid in piece_ids:
-                p_data = prices.get(pid, {})
-                piece_sell = p_data.get("low")
+                piece_sell = self._validated_price(pid, "low")
                 if not piece_sell:
                     valid = False
                     break
@@ -206,6 +247,24 @@ class ArbitrageFinder:
             now = int(time.time())
             age_mins = (now - set_high_time) / 60 if set_high_time else 999
 
+            # Sanity check: if ROI is >100%, the set price is likely stale/ghost
+            # Real arbitrage opportunities are typically 1-10% ROI
+            if roi > 100:
+                confidence = "SUSPICIOUS"
+                risk = "MEDIUM - verify set trades recently"
+            elif age_mins > 120:
+                confidence = "LOW"
+                risk = "MEDIUM - stale set price (>2h old)"
+            elif age_mins < 15:
+                confidence = "HIGH"
+                risk = "VERY LOW"
+            elif age_mins < 60:
+                confidence = "MEDIUM"
+                risk = "LOW"
+            else:
+                confidence = "LOW"
+                risk = "MEDIUM"
+
             if profit > 50_000:  # Only report if > 50k profit per set
                 opportunities.append({
                     "type": "SET_UNPACK",
@@ -219,8 +278,8 @@ class ArbitrageFinder:
                     "max_profit_per_4h": int(profit * 8),
                     "pieces": piece_details,
                     "price_age_mins": round(age_mins, 1),
-                    "risk": "VERY LOW",
-                    "confidence": "HIGH" if age_mins < 15 else "MEDIUM" if age_mins < 60 else "LOW",
+                    "risk": risk,
+                    "confidence": confidence,
                 })
 
             # Also check REVERSE: buy pieces -> pack into set -> sell set
@@ -228,15 +287,14 @@ class ArbitrageFinder:
             pieces_buy_total = 0
             valid_reverse = True
             for pid in piece_ids:
-                p_data = prices.get(pid, {})
-                piece_buy = p_data.get("high")  # insta-buy the piece
+                piece_buy = self._validated_price(pid, "high")
                 if not piece_buy:
                     valid_reverse = False
                     break
                 pieces_buy_total += piece_buy
 
             if valid_reverse:
-                set_sell = set_data.get("low")  # insta-sell the set
+                set_sell = self._validated_price(set_id, "low")
                 if set_sell:
                     set_tax = _ge_tax(set_sell)
                     reverse_profit = (set_sell - set_tax) - pieces_buy_total
@@ -278,12 +336,10 @@ class ArbitrageFinder:
             src_doses = data["source_doses"]
             tgt_doses = data["target_doses"]
 
-            src_data = prices.get(src_id, {})
-            tgt_data = prices.get(tgt_id, {})
-
             # Buy source (insta-buy = 'high'), sell target (insta-sell = 'low')
-            src_buy = src_data.get("high")
-            tgt_sell = tgt_data.get("low")
+            # Use validated prices to avoid ghost margins
+            src_buy = self._validated_price(src_id, "high")
+            tgt_sell = self._validated_price(tgt_id, "low")
 
             if not src_buy or not tgt_sell:
                 continue
