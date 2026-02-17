@@ -464,66 +464,83 @@ class Database:
 # Initialization
 # ---------------------------------------------------------------------------
 
-def init_db():
-    """Initialize MongoDB connection, create indexes."""
-    global _client, _wrapper
-
-    _client = MongoClient(MONGODB_URL)
-    db = _client[DATABASE_NAME]
-    _wrapper = Database(db)
-
-    # Create indexes
-    _wrapper.price_snapshots.create_index(
+def _ensure_indexes(wrapper: "Database"):
+    """Create indexes on all collections. Safe to call multiple times."""
+    wrapper.price_snapshots.create_index(
         [("item_id", ASCENDING), ("timestamp", ASCENDING)],
         background=True,
     )
-    _wrapper.price_snapshots.create_index(
+    wrapper.price_snapshots.create_index(
         [("timestamp", ASCENDING)],
         background=True,
     )
-    _wrapper.price_aggregates.create_index(
+    wrapper.price_aggregates.create_index(
         [("item_id", ASCENDING), ("timestamp", ASCENDING), ("interval", ASCENDING)],
         background=True,
     )
-    _wrapper.trades.create_index(
+    wrapper.trades.create_index(
         [("item_id", ASCENDING), ("timestamp", DESCENDING)],
         background=True,
     )
-    _wrapper.trades.create_index(
+    wrapper.trades.create_index(
         [("timestamp", DESCENDING)],
         background=True,
     )
-    _wrapper.flip_history.create_index(
+    wrapper.flip_history.create_index(
         [("item_id", ASCENDING), ("sell_time", DESCENDING)],
         background=True,
     )
-    _wrapper.flip_history.create_index(
+    wrapper.flip_history.create_index(
         [("buy_trade_id", ASCENDING)],
         background=True,
     )
-    _wrapper.predictions.create_index(
+    wrapper.predictions.create_index(
         [("item_id", ASCENDING), ("horizon", ASCENDING), ("timestamp", DESCENDING)],
         background=True,
     )
-    _wrapper.model_metrics.create_index(
+    wrapper.model_metrics.create_index(
         [("horizon", ASCENDING), ("timestamp", DESCENDING)],
         background=True,
     )
-    _wrapper.item_features.create_index(
+    wrapper.item_features.create_index(
         [("item_id", ASCENDING)],
         unique=True,
         background=True,
     )
-    _wrapper.alerts.create_index(
+    wrapper.alerts.create_index(
         [("item_id", ASCENDING), ("timestamp", DESCENDING)],
         background=True,
     )
-    _wrapper.alerts.create_index(
+    wrapper.alerts.create_index(
         [("timestamp", DESCENDING)],
         background=True,
     )
 
-    logger.info("MongoDB initialized: %s / %s", MONGODB_URL.split("@")[-1], DATABASE_NAME)
+
+def init_db():
+    """Initialize MongoDB connection, create indexes.
+
+    Connection errors are caught so the app can still start and serve
+    the health-check endpoint even when MongoDB is temporarily unreachable.
+    """
+    global _client, _wrapper
+
+    _client = MongoClient(
+        MONGODB_URL,
+        serverSelectionTimeoutMS=5000,
+    )
+    db = _client[DATABASE_NAME]
+    _wrapper = Database(db)
+
+    try:
+        _ensure_indexes(_wrapper)
+        logger.info("MongoDB initialized: %s / %s", MONGODB_URL.split("@")[-1], DATABASE_NAME)
+    except Exception as e:
+        logger.warning(
+            "MongoDB indexes not created (DB may be unreachable): %s. "
+            "The app will keep running; background tasks will retry.",
+            e,
+        )
 
 
 def get_db() -> Database:

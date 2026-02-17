@@ -50,10 +50,16 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Runs once on startup, yields for the lifetime of the app, then cleans up."""
     logger.info("Initialising database...")
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        logger.error("Database init failed (app will still start): %s", e)
 
     logger.info("Starting background tasks...")
-    await start_background_tasks()
+    try:
+        await start_background_tasks()
+    except Exception as e:
+        logger.error("Background tasks failed to start: %s", e)
 
     yield  # Application is running
 
