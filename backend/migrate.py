@@ -32,6 +32,21 @@ GE_TAX_RATE = 0.02
 GE_TAX_CAP = 5_000_000
 
 
+def safe_int(value, default=0):
+    """Parse an int from a value that may be a float string (e.g. '2500000.0').
+
+    Pandas writes columns containing None as float64, so integer values
+    like 2500000 end up as '2500000.0' in CSV.  int('2500000.0') raises
+    ValueError, so we go through float() first.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return default
+
+
 def calculate_ge_tax(sell_price: int, quantity: int = 1) -> int:
     """Calculate GE tax: 2% of sell price per item, capped at 5M per item."""
     tax_per_item = min(int(sell_price * GE_TAX_RATE), GE_TAX_CAP)
@@ -65,13 +80,13 @@ def migrate_dink_trades():
                     except (ValueError, TypeError):
                         ts = datetime.utcnow()
 
-                    item_id = int(row.get("item_id", 0) or 0)
+                    item_id = safe_int(row.get("item_id"))
                     if item_id == 0:
                         skipped += 1
                         continue
 
-                    quantity = int(row.get("quantity", 0) or 0)
-                    price = int(row.get("price", 0) or 0)
+                    quantity = safe_int(row.get("quantity"))
+                    price = safe_int(row.get("price"))
 
                     trade = Trade(
                         timestamp=ts,
@@ -82,12 +97,12 @@ def migrate_dink_trades():
                         status=row.get("status", "UNKNOWN"),
                         quantity=quantity,
                         price=price,
-                        total_value=int(row.get("total_value", quantity * price) or quantity * price),
-                        slot=int(row.get("slot", 0) or 0),
-                        market_price=int(row.get("market_price", 0) or 0),
-                        seller_tax=int(row.get("seller_tax", 0) or 0),
-                        market_high=int(row.get("market_high", 0) or 0),
-                        market_low=int(row.get("market_low", 0) or 0),
+                        total_value=safe_int(row.get("total_value"), quantity * price),
+                        slot=safe_int(row.get("slot")),
+                        market_price=safe_int(row.get("market_price")),
+                        seller_tax=safe_int(row.get("seller_tax")),
+                        market_high=safe_int(row.get("market_high")),
+                        market_low=safe_int(row.get("market_low")),
                         source="csv_import",
                     )
                     db.add(trade)
@@ -202,9 +217,9 @@ def migrate_flips_csv():
             for row in reader:
                 try:
                     item_name = row.get("item_name", row.get("name", "Unknown"))
-                    buy_price = int(float(row.get("buy_price", row.get("avg_buy", 0)) or 0))
-                    sell_price = int(float(row.get("sell_price", row.get("avg_sell", 0)) or 0))
-                    quantity = int(float(row.get("quantity", row.get("qty", 1)) or 1))
+                    buy_price = safe_int(row.get("buy_price", row.get("avg_buy", 0)))
+                    sell_price = safe_int(row.get("sell_price", row.get("avg_sell", 0)))
+                    quantity = safe_int(row.get("quantity", row.get("qty", 1)), default=1)
 
                     if buy_price == 0 or sell_price == 0:
                         continue
@@ -228,7 +243,7 @@ def migrate_flips_csv():
                     duration = int((sell_time - buy_time).total_seconds()) if sell_time > buy_time else 0
 
                     flip = FlipHistory(
-                        item_id=int(row.get("item_id", row.get("id", 0)) or 0),
+                        item_id=safe_int(row.get("item_id", row.get("id", 0))),
                         item_name=item_name,
                         player=row.get("player", ""),
                         buy_price=buy_price,
