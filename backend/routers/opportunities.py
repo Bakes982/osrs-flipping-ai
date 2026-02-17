@@ -15,7 +15,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, Item
+from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
 from backend.arbitrage_finder import ArbitrageFinder
@@ -172,7 +172,7 @@ async def get_opportunity_detail(item_id: int):
         ]
 
         # Item metadata
-        item_row = db.query(Item).filter(Item.id == item_id).first()
+        item_row = get_item(db, item_id)
         item_name = item_row.name if item_row else f"Item {item_id}"
 
         return {
@@ -249,7 +249,7 @@ def _get_position_sizing(item_id, item_name, rec, fs):
 
         item_row_db = get_db()
         try:
-            item_row = item_row_db.query(Item).filter(Item.id == item_id).first()
+            item_row = get_item(item_row_db, item_id)
             buy_limit = item_row.buy_limit if item_row and item_row.buy_limit else 10000
         finally:
             item_row_db.close()

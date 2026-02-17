@@ -13,7 +13,7 @@ import ModelDashboard from './pages/ModelDashboard';
 import Alerts from './pages/Alerts';
 import SettingsPage from './pages/Settings';
 import Login from './pages/Login';
-import { createPriceSocket, api } from './api/client';
+import { createPriceSocket, api, clearToken } from './api/client';
 import './App.css';
 
 const NAV_ITEMS = [
@@ -34,23 +34,19 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [alertCount, setAlertCount] = useState(0);
 
-  // Check if user is logged in
+  // Check if user is logged in (uses Bearer token or cookie via api client)
   useEffect(() => {
-    fetch('/api/auth/me', { credentials: 'same-origin' })
-      .then((r) => {
-        if (r.ok) return r.json();
-        if (r.status === 401) {
-          setAuthRequired(true);
-          return null;
-        }
-        // Auth not configured or other error - allow open access
-        return null;
-      })
+    api.getMe()
       .then((data) => {
         if (data) setUser(data);
         setAuthChecked(true);
       })
-      .catch(() => setAuthChecked(true));
+      .catch((err) => {
+        if (err.message && err.message.includes('401')) {
+          setAuthRequired(true);
+        }
+        setAuthChecked(true);
+      });
   }, []);
 
   // Only connect WebSocket if authenticated (or auth not required)
@@ -77,7 +73,8 @@ export default function App() {
   }, [authRequired, user]);
 
   const handleLogout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    try { await api.logout(); } catch { /* ignore */ }
+    clearToken();
     setUser(null);
     setAuthRequired(true);
   };

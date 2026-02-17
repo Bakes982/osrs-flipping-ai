@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 from backend.database import (
-    get_db, SessionLocal, PriceSnapshot, FlipHistory, ModelMetrics,
+    get_db, PriceSnapshot, FlipHistory, ModelMetrics,
     get_price_history, get_item_flips, get_tracked_item_ids,
+    insert_model_metrics, get_model_metrics_latest,
 )
 from backend.ml.feature_engine import FeatureEngine, HORIZONS, HORIZON_SECONDS
 from backend.ml.forecaster import (
@@ -414,12 +415,10 @@ class ModelTrainer:
                 profit_accuracy=metrics.get("val_profit_accuracy"),
                 sample_count=int(metrics.get("sample_count", 0)),
             )
-            db.add(record)
-            db.commit()
+            insert_model_metrics(db, record)
             logger.info(f"[{horizon}] Metrics saved to DB")
         except Exception as e:
             logger.error(f"Failed to save metrics for {horizon}: {e}")
-            db.rollback()
         finally:
             db.close()
 
@@ -492,12 +491,7 @@ class ModelTrainer:
         """Check if a horizon's model is stale and should be retrained."""
         db = get_db()
         try:
-            latest = (
-                db.query(ModelMetrics)
-                .filter(ModelMetrics.horizon == horizon)
-                .order_by(ModelMetrics.timestamp.desc())
-                .first()
-            )
+            latest = get_model_metrics_latest(db, horizon)
             if latest is None:
                 return True
 

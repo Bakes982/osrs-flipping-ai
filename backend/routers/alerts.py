@@ -7,13 +7,12 @@ GET  /api/alerts/price-targets - list active price targets
 DELETE /api/alerts/price-target/{item_id} - remove a price target
 """
 
-from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
 
-from backend.database import get_db, Alert, get_setting, set_setting
+from backend.database import get_db, find_alerts, acknowledge_alerts as db_acknowledge_alerts, get_setting, set_setting
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -28,7 +27,7 @@ class PriceTargetCreate(BaseModel):
 
 class AcknowledgeRequest(BaseModel):
     """Body for acknowledging alerts."""
-    alert_ids: List[int] = []
+    alert_ids: List[str] = []
     acknowledge_all: bool = False
 
 
@@ -42,15 +41,8 @@ async def list_alerts(
     """Return recent alerts, newest first."""
     db = get_db()
     try:
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
-        q = db.query(Alert).filter(Alert.timestamp >= cutoff)
-
-        if alert_type:
-            q = q.filter(Alert.alert_type == alert_type)
-        if unacknowledged_only:
-            q = q.filter(Alert.acknowledged == False)
-
-        rows = q.order_by(Alert.timestamp.desc()).limit(limit).all()
+        rows = find_alerts(db, hours=hours, alert_type=alert_type,
+                           unacknowledged_only=unacknowledged_only, limit=limit)
 
         return {
             "alerts": [
@@ -76,24 +68,12 @@ async def list_alerts(
 @router.post("/acknowledge")
 async def acknowledge_alerts(body: AcknowledgeRequest):
     """Mark alerts as acknowledged (hides from notification badge)."""
+    if not body.acknowledge_all and not body.alert_ids:
+        raise HTTPException(status_code=400, detail="Provide alert_ids or acknowledge_all")
+
     db = get_db()
     try:
-        if body.acknowledge_all:
-            updated = (
-                db.query(Alert)
-                .filter(Alert.acknowledged == False)
-                .update({"acknowledged": True})
-            )
-        elif body.alert_ids:
-            updated = (
-                db.query(Alert)
-                .filter(Alert.id.in_(body.alert_ids))
-                .update({"acknowledged": True}, synchronize_session="fetch")
-            )
-        else:
-            raise HTTPException(status_code=400, detail="Provide alert_ids or acknowledge_all")
-
-        db.commit()
+        updated = db_acknowledge_alerts(db, alert_ids=body.alert_ids, all_unack=body.acknowledge_all)
         return {"status": "ok", "acknowledged": updated}
     finally:
         db.close()

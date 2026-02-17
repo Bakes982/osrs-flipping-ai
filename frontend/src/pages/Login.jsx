@@ -1,8 +1,12 @@
 import { LogIn } from 'lucide-react';
+import { API_BASE } from '../api/client';
 
 export default function Login() {
   const handleLogin = () => {
-    window.location.href = '/api/auth/login';
+    // Redirect to the backend's Discord OAuth login endpoint
+    // API_BASE ends with /api, so strip it and append the auth path
+    const backendBase = API_BASE.replace(/\/api$/, '');
+    window.location.href = `${backendBase}/api/auth/login`;
   };
 
   return (

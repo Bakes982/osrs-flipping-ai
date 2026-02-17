@@ -19,8 +19,8 @@ from backend.database import (
     get_db,
     get_price_history,
     get_latest_price,
-    Item,
-    ModelMetrics,
+    get_item,
+    get_model_metrics_latest,
     Prediction,
 )
 from backend.smart_pricer import SmartPricer
@@ -81,7 +81,7 @@ async def predict_item(
         rec = _pricer.price_item(item_id, snapshots=snapshots)
 
         # Item name
-        item_row = db.query(Item).filter(Item.id == item_id).first()
+        item_row = get_item(db, item_id)
         item_name = item_row.name if item_row else f"Item {item_id}"
 
         current_buy = rec.instant_buy
@@ -171,12 +171,7 @@ async def get_model_metrics():
         # Get the most recent metrics row for each horizon
         results = {}
         for h in ALL_HORIZONS:
-            row = (
-                db.query(ModelMetrics)
-                .filter(ModelMetrics.horizon == h)
-                .order_by(ModelMetrics.timestamp.desc())
-                .first()
-            )
+            row = get_model_metrics_latest(db, h)
             if row:
                 results[h] = {
                     "model_version": row.model_version,

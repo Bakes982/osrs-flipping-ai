@@ -3,25 +3,22 @@ Discord OAuth2 Authentication for OSRS Flipping AI.
 
 Flow:
   1. User visits /api/auth/login  -> redirected to Discord OAuth
-  2. Discord redirects back to /api/auth/callback  -> signed session cookie set
-  3. All /api/* routes (except /api/auth/* and /api/health) require valid cookie
+  2. Discord redirects back to /api/auth/callback  -> token issued
+  3. All /api/* routes (except /api/auth/* and /api/health) require valid token
   4. Frontend checks /api/auth/me to see if logged in
 
-Environment variables:
-  DISCORD_CLIENT_ID     - from Discord Developer Portal
-  DISCORD_CLIENT_SECRET - from Discord Developer Portal
-  DISCORD_REDIRECT_URI  - e.g. http://YOUR_HOST:8001/api/auth/callback
-  AUTH_SECRET            - random secret for signing cookies
-  ALLOWED_DISCORD_IDS   - comma-separated Discord user IDs (empty = allow all)
+Authentication supports two modes:
+  - Bearer token via Authorization header (cross-domain SPA deployment)
+  - Signed session cookie (same-origin dev / backward compatibility)
+
+Configuration is read from backend.config (see config.py).
 """
 
-import os
 import time
 import json
 import hmac
 import hashlib
 import base64
-import secrets
 import logging
 from typing import Optional
 
@@ -29,26 +26,18 @@ import httpx
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 
+from backend import config
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (from backend.config)
 # ---------------------------------------------------------------------------
 
-DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "")
-DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "")
-DISCORD_REDIRECT_URI = os.environ.get(
-    "DISCORD_REDIRECT_URI", "http://localhost:8001/api/auth/callback"
-)
-AUTH_SECRET = os.environ.get("AUTH_SECRET", "") or secrets.token_hex(32)
 SESSION_EXPIRY = 7 * 24 * 3600  # 1 week
 COOKIE_NAME = "flipping_ai_session"
-
-# Comma-separated list of allowed Discord user IDs. Empty = allow anyone.
-_allowed_raw = os.environ.get("ALLOWED_DISCORD_IDS", "")
-ALLOWED_DISCORD_IDS = {s.strip() for s in _allowed_raw.split(",") if s.strip()}
 
 DISCORD_AUTH_URL = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
@@ -57,7 +46,7 @@ DISCORD_USER_URL = "https://discord.com/api/users/@me"
 
 def is_configured() -> bool:
     """Return True if Discord OAuth credentials are set."""
-    return bool(DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
+    return bool(config.DISCORD_CLIENT_ID and config.DISCORD_CLIENT_SECRET)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +55,7 @@ def is_configured() -> bool:
 
 def _sign(payload_bytes: bytes) -> str:
     """Create HMAC-SHA256 signature."""
-    return hmac.new(AUTH_SECRET.encode(), payload_bytes, hashlib.sha256).hexdigest()
+    return hmac.new(config.AUTH_SECRET.encode(), payload_bytes, hashlib.sha256).hexdigest()
 
 
 def create_token(user: dict) -> str:
@@ -104,18 +93,26 @@ def decode_token(token: str) -> Optional[dict]:
 
 
 def get_current_user(request: Request) -> Optional[dict]:
-    """Extract the current user from the session cookie."""
+    """Extract the current user from Bearer token or session cookie."""
+    # Check Authorization: Bearer header first (cross-domain)
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        user = decode_token(token)
+        if user:
+            return user
+    # Fall back to cookie (same-origin)
     token = request.cookies.get(COOKIE_NAME)
-    if not token:
-        return None
-    return decode_token(token)
+    if token:
+        return decode_token(token)
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Auth middleware helpers
 # ---------------------------------------------------------------------------
 
-PUBLIC_PREFIXES = ("/api/auth/", "/api/health", "/docs", "/openapi.json", "/ws/")
+PUBLIC_PREFIXES = ("/api/auth/", "/api/health", "/api/dink", "/docs", "/openapi.json", "/ws/")
 
 
 def requires_auth(request: Request) -> bool:
@@ -140,8 +137,8 @@ async def login():
             detail="Discord OAuth not configured. Set DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET.",
         )
     params = {
-        "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
+        "client_id": config.DISCORD_CLIENT_ID,
+        "redirect_uri": config.DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
     }
@@ -151,7 +148,7 @@ async def login():
 
 @router.get("/callback")
 async def callback(code: str):
-    """Handle Discord OAuth2 callback. Exchange code for token, set cookie."""
+    """Handle Discord OAuth2 callback. Exchange code for token, redirect to frontend."""
     if not is_configured():
         raise HTTPException(status_code=503, detail="Discord OAuth not configured.")
 
@@ -160,11 +157,11 @@ async def callback(code: str):
         token_resp = await client.post(
             DISCORD_TOKEN_URL,
             data={
-                "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,
+                "client_id": config.DISCORD_CLIENT_ID,
+                "client_secret": config.DISCORD_CLIENT_SECRET,
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": DISCORD_REDIRECT_URI,
+                "redirect_uri": config.DISCORD_REDIRECT_URI,
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
@@ -185,15 +182,20 @@ async def callback(code: str):
         user = user_resp.json()
 
     # Check allowlist
-    if ALLOWED_DISCORD_IDS and user["id"] not in ALLOWED_DISCORD_IDS:
+    if config.ALLOWED_DISCORD_IDS and user["id"] not in config.ALLOWED_DISCORD_IDS:
         logger.warning("Denied login for Discord user %s (%s)", user["username"], user["id"])
         raise HTTPException(status_code=403, detail="You are not authorised to access this dashboard.")
 
     logger.info("User logged in: %s (%s)", user["username"], user["id"])
 
-    # Set signed session cookie and redirect to dashboard
+    # Create signed session token
     session_token = create_token(user)
-    response = RedirectResponse("/", status_code=302)
+
+    # Redirect to frontend with token in URL (for cross-domain SPA flow)
+    redirect_url = f"{config.FRONTEND_URL}?token={session_token}"
+    response = RedirectResponse(redirect_url, status_code=302)
+
+    # Also set cookie for same-origin fallback
     response.set_cookie(
         COOKIE_NAME,
         session_token,
