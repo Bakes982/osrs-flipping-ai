@@ -1,5 +1,10 @@
-const API_BASE = 'http://localhost:8001/api';
-const WS_BASE = 'ws://localhost:8001/ws';
+// Use relative URLs when served from the backend (production),
+// fall back to localhost:8001 during Vite dev server.
+const isDevServer = window.location.port === '5173';
+const API_BASE = isDevServer ? 'http://localhost:8001/api' : '/api';
+const WS_BASE = isDevServer
+  ? 'ws://localhost:8001/ws'
+  : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
 
 async function fetchJSON(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {

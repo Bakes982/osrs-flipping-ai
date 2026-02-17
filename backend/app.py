@@ -12,7 +12,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -28,6 +28,10 @@ from backend.database import init_db
 from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
 from backend.routers import opportunities, portfolio, analysis, settings
+from backend.auth import (
+    router as auth_router, is_configured as auth_configured,
+    requires_auth, get_current_user,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -79,9 +83,28 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Auth middleware – blocks unauthenticated access to /api/* when configured
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Protect API routes with Discord OAuth when configured."""
+    if auth_configured() and requires_auth(request):
+        user = get_current_user(request)
+        if user is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Not authenticated. Visit /api/auth/login to sign in."},
+            )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
+app.include_router(auth_router)
 app.include_router(opportunities.router)
 app.include_router(portfolio.router)
 app.include_router(analysis.router)

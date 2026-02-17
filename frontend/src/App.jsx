@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, Briefcase, BarChart3,
-  Brain, Settings,
+  Brain, Settings, LogOut,
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
@@ -11,6 +11,7 @@ import Portfolio from './pages/Portfolio';
 import Performance from './pages/Performance';
 import ModelDashboard from './pages/ModelDashboard';
 import SettingsPage from './pages/Settings';
+import Login from './pages/Login';
 import { createPriceSocket } from './api/client';
 import './App.css';
 
@@ -26,14 +27,61 @@ const NAV_ITEMS = [
 export default function App() {
   const [livePrices, setLivePrices] = useState({});
   const [wsConnected, setWsConnected] = useState(false);
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
 
+  // Check if user is logged in
   useEffect(() => {
+    fetch('/api/auth/me', { credentials: 'same-origin' })
+      .then((r) => {
+        if (r.ok) return r.json();
+        if (r.status === 401) {
+          setAuthRequired(true);
+          return null;
+        }
+        // Auth not configured or other error - allow open access
+        return null;
+      })
+      .then((data) => {
+        if (data) setUser(data);
+        setAuthChecked(true);
+      })
+      .catch(() => setAuthChecked(true));
+  }, []);
+
+  // Only connect WebSocket if authenticated (or auth not required)
+  useEffect(() => {
+    if (authRequired && !user) return;
     const socket = createPriceSocket((data) => {
       setLivePrices(data);
       setWsConnected(true);
     });
     return () => socket.close();
-  }, []);
+  }, [authRequired, user]);
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    setUser(null);
+    setAuthRequired(true);
+  };
+
+  // Still checking auth
+  if (!authChecked) {
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        minHeight: '100vh', background: '#0f1923', color: '#8899aa',
+      }}>
+        Loading...
+      </div>
+    );
+  }
+
+  // Auth required but not logged in
+  if (authRequired && !user) {
+    return <Login />;
+  }
 
   return (
     <BrowserRouter>
@@ -60,6 +108,15 @@ export default function App() {
             ))}
           </div>
           <div className="sidebar-footer">
+            {user && (
+              <button onClick={handleLogout} className="nav-link" style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                width: '100%', textAlign: 'left',
+              }}>
+                <LogOut size={18} />
+                <span>{user.username}</span>
+              </button>
+            )}
             <div className="version">v2.0 — AI Powered</div>
           </div>
         </nav>

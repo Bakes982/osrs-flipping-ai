@@ -9,6 +9,8 @@ venv/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 flipping_ai.db
 
 # Node

@@ -1,0 +1,23 @@
+[Unit]
+Description=OSRS Flipping AI Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/osrs-flipping-ai
+ExecStart=/usr/local/bin/uvicorn backend.app:app --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=5
+
+# Environment variables for Discord OAuth (set these to enable auth)
+# Get these from https://discord.com/developers/applications
+EnvironmentFile=-/home/user/osrs-flipping-ai/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=osrs-flipping-ai
+
+[Install]
+WantedBy=multi-user.target
