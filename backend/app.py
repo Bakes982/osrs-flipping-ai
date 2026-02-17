@@ -3,18 +3,16 @@ OSRS Flipping AI - FastAPI Application
 Main entry point for the backend server.
 
 Run with:
-    uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
+    uvicorn backend.app:app --reload --host 0.0.0.0 --port 8001
 """
 
 import sys
 import os
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
 # Ensure the project root is importable so that both ``backend.*`` and
@@ -24,10 +22,15 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from backend import config
 from backend.database import init_db
 from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
-from backend.routers import opportunities, portfolio, analysis, settings
+from backend.routers import opportunities, portfolio, analysis, settings, alerts
+from backend.auth import (
+    router as auth_router, is_configured as auth_configured,
+    requires_auth, get_current_user,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,23 +72,43 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS -- allow everything for local development
+# CORS -- allow the configured frontend origin + dev localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
+# Auth middleware -- blocks unauthenticated access to /api/* when configured
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Protect API routes with Discord OAuth when configured."""
+    if auth_configured() and requires_auth(request):
+        user = get_current_user(request)
+        if user is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Not authenticated. Visit /api/auth/login to sign in."},
+            )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
+app.include_router(auth_router)
 app.include_router(opportunities.router)
 app.include_router(portfolio.router)
 app.include_router(analysis.router)
 app.include_router(settings.router)
+app.include_router(alerts.router)
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +121,7 @@ async def websocket_prices(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep the connection alive; the client can send ping/pong or
-            # subscribe messages here if needed in the future.
             data = await websocket.receive_text()
-            # For now we just acknowledge; subscriptions can be added later
             await websocket.send_text('{"type":"ack"}')
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
@@ -124,18 +144,6 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Serve static frontend files (if built)
-# ---------------------------------------------------------------------------
-
-_frontend_dist = Path(_PROJECT_ROOT) / "frontend" / "dist"
-if _frontend_dist.is_dir():
-    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="frontend")
-    logger.info("Serving static frontend from %s", _frontend_dist)
-else:
-    logger.info("No frontend/dist directory found -- skipping static file mount")
-
-
-# ---------------------------------------------------------------------------
 # Development entry-point
 # ---------------------------------------------------------------------------
 
@@ -145,7 +153,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "backend.app:app",
         host="0.0.0.0",
-        port=8000,
+        port=config.PORT,
         reload=True,
         reload_dirs=[_PROJECT_ROOT],
     )

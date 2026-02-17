@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Any
 from backend.database import (
     get_db, PriceSnapshot, FlipHistory, Prediction,
     get_price_history, get_item_flips, get_latest_price,
+    insert_prediction, find_pending_predictions,
+    update_prediction_outcome, find_snapshot_near_time,
 )
 from backend.ml.feature_engine import FeatureEngine, HORIZONS, HORIZON_SECONDS
 from backend.ml.forecaster import MultiHorizonForecaster
@@ -231,12 +233,9 @@ class Predictor:
                     confidence=pred_data.get("confidence"),
                     model_version=f"{method}_v1",
                 )
-                db.add(record)
-
-            db.commit()
+                insert_prediction(db, record)
         except Exception as e:
             logger.error(f"Failed to save predictions for item {item_id}: {e}")
-            db.rollback()
         finally:
             db.close()
 
@@ -259,16 +258,8 @@ class Predictor:
 
                 # Find predictions that should have matured by now
                 cutoff = now - horizon_delta
-                pending = (
-                    db.query(Prediction)
-                    .filter(
-                        Prediction.item_id == item_id,
-                        Prediction.horizon == horizon,
-                        Prediction.outcome_recorded == False,
-                        Prediction.timestamp <= cutoff,
-                    )
-                    .limit(100)
-                    .all()
+                pending = find_pending_predictions(
+                    db, item_id, horizon, cutoff,
                 )
 
                 for pred in pending:
@@ -281,24 +272,24 @@ class Predictor:
                         continue
 
                     actual_buy, actual_sell = actual
-                    pred.actual_buy = actual_buy
-                    pred.actual_sell = actual_sell
 
                     # Determine actual direction
+                    actual_direction = None
                     if pred.predicted_buy and actual_buy:
                         # Compare predicted price to actual
                         # Use the feature's current_price at prediction time
                         # For simplicity, compare predicted_buy to actual_buy
                         if actual_buy > pred.predicted_buy * 1.003:
-                            pred.actual_direction = "up"
+                            actual_direction = "up"
                         elif actual_buy < pred.predicted_buy * 0.997:
-                            pred.actual_direction = "down"
+                            actual_direction = "down"
                         else:
-                            pred.actual_direction = "flat"
+                            actual_direction = "flat"
 
-                    pred.outcome_recorded = True
+                    update_prediction_outcome(
+                        db, pred.id, actual_buy, actual_sell, actual_direction,
+                    )
 
-                db.commit()
                 if pending:
                     logger.info(
                         f"[{item_id}][{horizon}] Recorded {len(pending)} outcomes"
@@ -306,7 +297,6 @@ class Predictor:
 
         except Exception as e:
             logger.error(f"Failed to record outcomes for item {item_id}: {e}")
-            db.rollback()
         finally:
             db.close()
 
@@ -317,18 +307,7 @@ class Predictor:
         target_time: datetime,
     ) -> Optional[tuple]:
         """Find the actual price closest to target_time."""
-        # Search within +/- 30 seconds
-        window = timedelta(seconds=30)
-        snap = (
-            db.query(PriceSnapshot)
-            .filter(
-                PriceSnapshot.item_id == item_id,
-                PriceSnapshot.timestamp >= target_time - window,
-                PriceSnapshot.timestamp <= target_time + window,
-            )
-            .order_by(PriceSnapshot.timestamp.asc())
-            .first()
-        )
+        snap = find_snapshot_near_time(db, item_id, target_time)
         if snap and snap.instant_buy and snap.instant_sell:
             return (snap.instant_buy, snap.instant_sell)
         return None

@@ -1,0 +1,31 @@
+# Render Blueprint for OSRS Flipping AI Backend
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: osrs-flipping-ai-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MONGODB_URL
+        sync: false  # Set manually in Render dashboard
+      - key: DATABASE_NAME
+        value: osrs_flipping_ai
+      - key: FRONTEND_URL
+        sync: false  # Set to your Vercel deployment URL
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: BACKEND_URL
+        sync: false  # Set to https://your-app.onrender.com
+      - key: DISCORD_REDIRECT_URI
+        sync: false  # Set to https://your-app.onrender.com/api/auth/callback
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: ALLOWED_DISCORD_IDS
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11"

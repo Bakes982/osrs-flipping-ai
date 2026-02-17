@@ -24,10 +24,14 @@ if _PROJECT_ROOT not in sys.path:
 
 from backend.database import (
     get_db,
-    SessionLocal,
     Trade,
     FlipHistory,
-    Item,
+    find_trades,
+    find_all_flips,
+    find_unmatched_buy_trades,
+    insert_trade,
+    insert_flip,
+    get_matched_buy_trade_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,18 +88,9 @@ async def get_portfolio():
     if not portfolio.get("holdings"):
         db = get_db()
         try:
-            # Find BUY trades that have no matching SELL in flip_history
-            matched_buy_ids = {
-                fh.buy_trade_id
-                for fh in db.query(FlipHistory.buy_trade_id).all()
-                if fh.buy_trade_id is not None
-            }
-            buys = (
-                db.query(Trade)
-                .filter(Trade.trade_type == "BUY", Trade.status == "BOUGHT")
-                .order_by(Trade.timestamp.desc())
-                .all()
-            )
+            matched_buy_ids = get_matched_buy_trade_ids(db)
+            all_trades = find_trades(db, limit=500)
+            buys = [t for t in all_trades if t.trade_type == "BUY" and t.status == "BOUGHT"]
             holdings = []
             for t in buys:
                 if t.id not in matched_buy_ids:
@@ -126,10 +121,7 @@ async def get_trades(
     """Return trade history from the trades table."""
     db = get_db()
     try:
-        q = db.query(Trade).order_by(Trade.timestamp.desc())
-        if item_id is not None:
-            q = q.filter(Trade.item_id == item_id)
-        rows = q.limit(limit).all()
+        rows = find_trades(db, item_id=item_id, limit=limit)
         return [
             {
                 "id": t.id,
@@ -162,7 +154,7 @@ async def get_performance():
     """Return overall performance metrics computed from flip_history."""
     db = get_db()
     try:
-        flips = db.query(FlipHistory).order_by(FlipHistory.sell_time.desc()).all()
+        flips = find_all_flips(db)
         if not flips:
             return {
                 "total_flips": 0,
