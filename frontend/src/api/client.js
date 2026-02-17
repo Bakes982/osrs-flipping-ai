@@ -48,6 +48,36 @@ export const api = {
     return fetchJSON('/model/metrics');
   },
 
+  // Alerts
+  getAlerts(params = {}) {
+    const qs = new URLSearchParams(params).toString();
+    return fetchJSON(`/alerts${qs ? '?' + qs : ''}`);
+  },
+  acknowledgeAlerts(data) {
+    return fetchJSON('/alerts/acknowledge', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+  createPriceTarget(data) {
+    return fetchJSON('/alerts/price-target', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  },
+  getPriceTargets() {
+    return fetchJSON('/alerts/price-targets');
+  },
+  deletePriceTarget(itemId, direction) {
+    const qs = direction ? `?direction=${direction}` : '';
+    return fetchJSON(`/alerts/price-target/${itemId}${qs}`, { method: 'DELETE' });
+  },
+
+  // Arbitrage
+  getArbitrage() {
+    return fetchJSON('/opportunities/arbitrage');
+  },
+
   // Settings
   getSettings() {
     return fetchJSON('/settings');

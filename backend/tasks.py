@@ -1,8 +1,10 @@
 """
 Background Tasks for OSRS Flipping AI
 - PriceCollector: fetches prices every 10s, 5m data every 60s
-- FeatureComputer: recomputes ML features every 60s (stub)
-- MLScorer: runs predictions every 60s (stub)
+- FeatureComputer: recomputes ML features every 60s
+- MLScorer: runs predictions every 60s
+- ModelRetrainer: retrains stale ML models every 6 hours
+- AlertMonitor: checks price alerts and generates notifications
 - DataPruner: aggregates old data once per day
 """
 
@@ -10,7 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import httpx
 from sqlalchemy import func
@@ -20,7 +22,11 @@ from backend.database import (
     PriceSnapshot,
     PriceAggregate,
     Item,
+    Alert,
     get_tracked_item_ids,
+    get_db,
+    get_setting,
+    get_latest_price,
 )
 from backend.websocket import manager
 
@@ -468,6 +474,308 @@ class DataPruner:
 
 
 # ---------------------------------------------------------------------------
+# ModelRetrainer
+# ---------------------------------------------------------------------------
+
+class ModelRetrainer:
+    """Checks if ML models are stale and retrains them automatically.
+
+    Runs every 6 hours. Uses the ModelTrainer to rebuild models when
+    the latest training metrics are older than max_age_hours.
+    """
+
+    RETRAIN_INTERVAL = 6 * 3600  # 6 hours between checks
+    MAX_MODEL_AGE_HOURS = 24     # Retrain if model older than this
+
+    def __init__(self):
+        self._trainer = None
+
+    def _get_trainer(self):
+        if self._trainer is None:
+            try:
+                from backend.ml.model_trainer import ModelTrainer
+                self._trainer = ModelTrainer()
+            except Exception as e:
+                logger.error("Failed to initialize ModelTrainer: %s", e)
+        return self._trainer
+
+    async def retrain_if_stale(self):
+        """Check each horizon and retrain if stale."""
+        trainer = self._get_trainer()
+        if trainer is None:
+            return
+
+        try:
+            from backend.ml.feature_engine import HORIZONS
+        except ImportError:
+            logger.error("Cannot import HORIZONS from feature_engine")
+            return
+
+        retrained = []
+        for horizon in HORIZONS:
+            try:
+                if trainer.should_retrain(horizon, max_age_hours=self.MAX_MODEL_AGE_HOURS):
+                    logger.info("ModelRetrainer: retraining horizon %s", horizon)
+                    # Run training in a thread to avoid blocking the event loop
+                    loop = asyncio.get_event_loop()
+                    metrics = await loop.run_in_executor(
+                        None, trainer.train_horizon, horizon, 168,
+                    )
+                    if metrics:
+                        retrained.append(horizon)
+                        logger.info(
+                            "ModelRetrainer: %s retrained - accuracy=%.1f%%",
+                            horizon,
+                            metrics.get("val_direction_accuracy", 0) * 100,
+                        )
+            except Exception as e:
+                logger.error("ModelRetrainer: failed to retrain %s: %s", horizon, e)
+
+        if retrained:
+            logger.info("ModelRetrainer: retrained %d horizons: %s", len(retrained), retrained)
+
+    async def run_forever(self):
+        logger.info("ModelRetrainer started (runs every %d hours)", self.RETRAIN_INTERVAL // 3600)
+        # Wait 5 minutes before first run to let price data accumulate
+        await asyncio.sleep(300)
+        while True:
+            try:
+                await self.retrain_if_stale()
+            except Exception as e:
+                logger.error("ModelRetrainer tick error: %s", e)
+            await asyncio.sleep(self.RETRAIN_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# AlertMonitor
+# ---------------------------------------------------------------------------
+
+class AlertMonitor:
+    """Monitors prices and generates alerts for significant events.
+
+    Checks every 30 seconds for:
+    - Price targets hit (user-configured)
+    - Dump detection (rapid price drops)
+    - High-score opportunity alerts
+    - ML signal alerts (strong directional predictions)
+    """
+
+    CHECK_INTERVAL = 30  # seconds
+
+    async def check_alerts(self):
+        """Run all alert checks."""
+        db = SessionLocal()
+        try:
+            await self._check_price_targets(db)
+            await self._check_dump_alerts(db)
+            await self._check_opportunity_alerts(db)
+        except Exception as e:
+            logger.error("AlertMonitor check error: %s", e)
+        finally:
+            db.close()
+
+    async def _check_price_targets(self, db):
+        """Check if any user-configured price targets have been hit."""
+        targets = get_setting(db, "price_alerts", default=[])
+        if not targets:
+            return
+
+        new_targets = []
+        for target in targets:
+            item_id = target.get("item_id")
+            target_price = target.get("target_price")
+            direction = target.get("direction", "below")  # "below" or "above"
+            item_name = target.get("item_name", f"Item {item_id}")
+
+            if not item_id or not target_price:
+                new_targets.append(target)
+                continue
+
+            snap = get_latest_price(db, item_id)
+            if not snap:
+                new_targets.append(target)
+                continue
+
+            current = snap.instant_buy or snap.instant_sell
+            if not current:
+                new_targets.append(target)
+                continue
+
+            triggered = False
+            if direction == "below" and current <= target_price:
+                triggered = True
+            elif direction == "above" and current >= target_price:
+                triggered = True
+
+            if triggered:
+                alert = Alert(
+                    item_id=item_id,
+                    item_name=item_name,
+                    alert_type="price_target",
+                    message=f"{item_name} hit {direction} target: {current:,} GP (target: {target_price:,} GP)",
+                    data={"current_price": current, "target_price": target_price, "direction": direction},
+                )
+                db.add(alert)
+                logger.info("Price alert triggered: %s", alert.message)
+                # Broadcast alert via WebSocket
+                await manager.broadcast_json({
+                    "type": "alert",
+                    "alert_type": "price_target",
+                    "item_id": item_id,
+                    "item_name": item_name,
+                    "message": alert.message,
+                })
+            else:
+                new_targets.append(target)
+
+        # Update remaining targets (remove triggered ones)
+        if len(new_targets) != len(targets):
+            from backend.database import set_setting
+            set_setting(db, "price_alerts", new_targets)
+
+    async def _check_dump_alerts(self, db):
+        """Detect items experiencing rapid price drops (>5% in 15 min)."""
+        item_ids = get_tracked_item_ids(db)
+        now = datetime.utcnow()
+        cutoff_15m = now - timedelta(minutes=15)
+
+        # Only check top-volume items to limit DB queries
+        for item_id in item_ids[:200]:
+            try:
+                snaps = (
+                    db.query(PriceSnapshot)
+                    .filter(
+                        PriceSnapshot.item_id == item_id,
+                        PriceSnapshot.timestamp >= cutoff_15m,
+                    )
+                    .order_by(PriceSnapshot.timestamp.asc())
+                    .all()
+                )
+                if len(snaps) < 5:
+                    continue
+
+                prices = [s.instant_buy for s in snaps if s.instant_buy and s.instant_buy > 0]
+                if len(prices) < 5:
+                    continue
+
+                first_price = prices[0]
+                last_price = prices[-1]
+                change_pct = (last_price - first_price) / first_price * 100
+
+                if change_pct < -5:
+                    # Check we haven't alerted for this item in last 30 min
+                    recent_alert = (
+                        db.query(Alert)
+                        .filter(
+                            Alert.item_id == item_id,
+                            Alert.alert_type == "dump",
+                            Alert.timestamp >= now - timedelta(minutes=30),
+                        )
+                        .first()
+                    )
+                    if recent_alert:
+                        continue
+
+                    item_row = db.query(Item).filter(Item.id == item_id).first()
+                    item_name = item_row.name if item_row else f"Item {item_id}"
+
+                    alert = Alert(
+                        item_id=item_id,
+                        item_name=item_name,
+                        alert_type="dump",
+                        message=f"{item_name} dropping {change_pct:.1f}% in 15min ({first_price:,} -> {last_price:,})",
+                        data={"change_pct": round(change_pct, 1), "from_price": first_price, "to_price": last_price},
+                    )
+                    db.add(alert)
+                    await manager.broadcast_json({
+                        "type": "alert",
+                        "alert_type": "dump",
+                        "item_id": item_id,
+                        "item_name": item_name,
+                        "message": alert.message,
+                    })
+            except Exception:
+                pass
+
+        db.commit()
+
+    async def _check_opportunity_alerts(self, db):
+        """Alert when a very high-score opportunity appears (score 75+)."""
+        # This runs less frequently - check last scored items
+        try:
+            from backend.flip_scorer import FlipScorer
+            scorer = FlipScorer()
+        except ImportError:
+            return
+
+        item_ids = get_tracked_item_ids(db)
+        now = datetime.utcnow()
+
+        for item_id in item_ids[:50]:
+            try:
+                from backend.database import get_price_history, get_item_flips
+                snapshots = get_price_history(db, item_id, hours=1)
+                if len(snapshots) < 10:
+                    continue
+
+                flips = get_item_flips(db, item_id, days=30)
+                fs = scorer.score_item(item_id, snapshots=snapshots, flips=flips)
+
+                if fs.vetoed or fs.total_score < 75:
+                    continue
+
+                # Check we haven't alerted recently
+                recent_alert = (
+                    db.query(Alert)
+                    .filter(
+                        Alert.item_id == item_id,
+                        Alert.alert_type == "opportunity",
+                        Alert.timestamp >= now - timedelta(minutes=15),
+                    )
+                    .first()
+                )
+                if recent_alert:
+                    continue
+
+                alert = Alert(
+                    item_id=item_id,
+                    item_name=fs.item_name or f"Item {item_id}",
+                    alert_type="opportunity",
+                    message=f"High-score opportunity: {fs.item_name} (score {fs.total_score:.0f}, +{fs.expected_profit:,} GP)" if fs.expected_profit else f"High-score opportunity: {fs.item_name} (score {fs.total_score:.0f})",
+                    data={
+                        "score": round(fs.total_score, 1),
+                        "profit": fs.expected_profit,
+                        "margin_pct": round(fs.spread_pct, 1) if fs.spread_pct else 0,
+                        "volume": fs.volume_5m,
+                    },
+                )
+                db.add(alert)
+                await manager.broadcast_json({
+                    "type": "alert",
+                    "alert_type": "opportunity",
+                    "item_id": item_id,
+                    "item_name": fs.item_name,
+                    "message": alert.message,
+                    "score": round(fs.total_score, 1),
+                })
+            except Exception:
+                pass
+
+        db.commit()
+
+    async def run_forever(self):
+        logger.info("AlertMonitor started (checks every %ds)", self.CHECK_INTERVAL)
+        # Wait 30 seconds for initial data
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await self.check_alerts()
+            except Exception as e:
+                logger.error("AlertMonitor tick error: %s", e)
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Task launcher (called from app.py on startup)
 # ---------------------------------------------------------------------------
 
@@ -481,12 +789,16 @@ async def start_background_tasks():
     collector = PriceCollector()
     feature_computer = FeatureComputer()
     scorer = MLScorer()
+    retrainer = ModelRetrainer()
+    alert_monitor = AlertMonitor()
     pruner = DataPruner()
 
     _tasks = [
         asyncio.create_task(collector.run_forever()),
         asyncio.create_task(feature_computer.run_forever()),
         asyncio.create_task(scorer.run_forever()),
+        asyncio.create_task(retrainer.run_forever()),
+        asyncio.create_task(alert_monitor.run_forever()),
         asyncio.create_task(pruner.run_forever()),
     ]
 

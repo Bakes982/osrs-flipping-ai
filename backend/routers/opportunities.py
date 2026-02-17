@@ -19,6 +19,7 @@ from backend.database import get_db, get_price_history, get_latest_price, get_it
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
 from backend.arbitrage_finder import ArbitrageFinder
+from backend.position_sizer import PositionSizer
 from ai_strategist import scan_all_items_for_flips, analyze_single_item
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
@@ -26,6 +27,7 @@ router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
 _pricer = SmartPricer()
 _scorer = FlipScorer()
 _arb_finder = ArbitrageFinder()
+_sizer = PositionSizer()
 
 
 @router.get("")
@@ -98,6 +100,9 @@ async def list_opportunities(
             "avg_profit": int(fs.avg_profit) if fs.avg_profit else None,
 
             "reason": fs.reason,
+
+            # Position sizing (lightweight for list view)
+            "position_sizing": _quick_sizing(fs),
         })
 
     # Sort
@@ -226,6 +231,90 @@ async def get_opportunity_detail(item_id: int):
 
             "quant_report": quant_report,
             "recent_flips": flip_data,
+
+            # Position sizing advice
+            "position_sizing": _get_position_sizing(
+                item_id, item_name, rec, fs,
+            ),
         }
     finally:
         db.close()
+
+
+def _get_position_sizing(item_id, item_name, rec, fs):
+    """Compute position sizing advice using Kelly Criterion."""
+    try:
+        if not rec.recommended_buy or not rec.recommended_sell:
+            return None
+
+        item_row_db = get_db()
+        try:
+            item_row = item_row_db.query(Item).filter(Item.id == item_id).first()
+            buy_limit = item_row.buy_limit if item_row and item_row.buy_limit else 10000
+        finally:
+            item_row_db.close()
+
+        advice = _sizer.size_position(
+            item_id=item_id,
+            buy_price=rec.recommended_buy,
+            sell_price=rec.recommended_sell,
+            score=fs.total_score,
+            win_rate=fs.win_rate,
+            volume_5m=rec.volume_5m,
+            item_name=item_name,
+            buy_limit=buy_limit,
+        )
+        return {
+            "kelly_fraction": round(advice.kelly_fraction, 4),
+            "half_kelly": round(advice.half_kelly, 4),
+            "recommended_fraction": round(advice.recommended_fraction, 4),
+            "max_investment": advice.max_investment,
+            "quantity": advice.quantity,
+            "stop_loss_price": advice.stop_loss_price,
+            "stop_loss_pct": round(advice.stop_loss_pct * 100, 1),
+            "take_profit_price": advice.take_profit_price,
+            "max_hold_minutes": advice.max_hold_minutes,
+            "portfolio_exposure_pct": round(advice.portfolio_exposure_pct, 1),
+            "within_limits": advice.within_limits,
+            "warnings": advice.limit_warnings,
+            "reason": advice.reason,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _quick_sizing(fs: FlipScore) -> dict:
+    """Lightweight position sizing for list view (no DB calls)."""
+    try:
+        if not fs.recommended_buy or not fs.recommended_sell or fs.recommended_buy <= 0:
+            return None
+
+        sizer = _sizer
+        bankroll = sizer.bankroll
+
+        # Quick Kelly estimate from available data
+        win_rate = fs.win_rate if fs.win_rate is not None else 0.55
+        spread_profit = fs.expected_profit or (fs.recommended_sell - fs.recommended_buy)
+        est_loss = fs.recommended_buy * 0.03  # 3% stop loss estimate
+
+        if est_loss > 0 and spread_profit > 0:
+            b = spread_profit / est_loss
+            p = max(0.01, min(0.99, win_rate))
+            q = 1 - p
+            kelly = max(0, (p * b - q) / b)
+        else:
+            kelly = 0
+
+        half_kelly = kelly / 2
+        fraction = min(half_kelly * max(0.3, fs.total_score / 80), sizer.MAX_SINGLE_POSITION_PCT)
+        max_invest = int(bankroll * fraction)
+        qty = max_invest // fs.recommended_buy if fs.recommended_buy > 0 else 0
+
+        return {
+            "kelly": round(kelly, 3),
+            "max_investment": max_invest,
+            "quantity": qty,
+            "stop_loss_pct": 3.0,
+        }
+    except Exception:
+        return None
