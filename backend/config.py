@@ -41,10 +41,7 @@ PORT = int(os.environ.get("PORT", "8001"))
 MODELS_DIR = os.environ.get("MODELS_DIR", "models")
 
 # ---------------------------------------------------------------------------
-# CORS — allow the frontend origin + localhost for dev
+# CORS — use wildcard so Starlette allows WebSocket upgrades from any origin.
+# Auth is enforced via Bearer tokens, not origin checks.
 # ---------------------------------------------------------------------------
-CORS_ORIGINS = [
-    FRONTEND_URL,
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
+CORS_ORIGINS = ["*"]
