@@ -212,6 +212,12 @@ def migrate_flips_csv():
     db = get_db()
     count = 0
     try:
+        # Check if we already imported from flips.csv using a setting flag
+        flag = db.query(Setting).filter(Setting.key == "_flips_csv_imported").first()
+        if flag:
+            print(f"  Already imported flips.csv, skipping.")
+            return 0
+
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -262,6 +268,8 @@ def migrate_flips_csv():
                 except Exception as e:
                     print(f"    Skipping flip row: {e}")
 
+        # Set flag so we don't re-import on next run
+        db.add(Setting(key="_flips_csv_imported", value=count))
         db.commit()
         print(f"  Imported {count} flips from {csv_path}")
     except Exception as e:
