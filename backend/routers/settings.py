@@ -62,10 +62,7 @@ async def update_settings(body: SettingUpdate):
         raise HTTPException(status_code=400, detail="No settings provided")
 
     db = get_db()
-    try:
-        for key, value in body.settings.items():
-            set_setting(db, key, value)
+    for key, value in body.settings.items():
+        set_setting(db, key, value)
 
-        return {"status": "ok", "updated": list(body.settings.keys())}
-    finally:
-        db.close()
+    return {"status": "ok", "updated": list(body.settings.keys())}
