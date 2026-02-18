@@ -52,28 +52,38 @@ function authHeaders() {
   return headers;
 }
 
-async function fetchJSON(path, options = {}, retries = 1) {
+async function fetchJSON(path, options = {}, retries = 3) {
   const url = `${API_BASE}${path}`;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, {
         headers: authHeaders(),
-        // NOTE: Do NOT use credentials: 'include' for cross-origin Bearer-token
-        // auth.  It forces the browser to require Access-Control-Allow-Credentials
-        // and a non-wildcard origin, which breaks with allow_origins=["*"].
         ...options,
       });
-      if (res.status === 503 && attempt < retries) {
-        // Render free-tier cold start – wait and retry
-        await new Promise((r) => setTimeout(r, 5000));
+
+      // Render free-tier cold start: may return 503, or an HTML "loading" page
+      // with a 200/302 status.  Detect both cases and retry with back-off.
+      const contentType = res.headers.get('content-type') || '';
+      const isHTML = contentType.includes('text/html');
+
+      if ((res.status === 503 || isHTML) && attempt < retries) {
+        // Wait longer on each attempt (8s, 16s, 24s) to give Render time to boot
+        const delay = 8000 * (attempt + 1);
+        console.log(`Backend not ready (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay / 1000}s...`);
+        await new Promise((r) => setTimeout(r, delay));
         continue;
+      }
+
+      if (isHTML) {
+        throw new Error('Backend is starting up (Render free tier cold start). Try again in ~60 seconds.');
       }
       if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
       return res.json();
     } catch (err) {
       if (attempt < retries && err instanceof TypeError) {
-        // Network error (CORS block, DNS, offline) – retry once
-        await new Promise((r) => setTimeout(r, 3000));
+        // Network error (CORS block, DNS, offline) – retry
+        const delay = 5000 * (attempt + 1);
+        await new Promise((r) => setTimeout(r, delay));
         continue;
       }
       throw err;
