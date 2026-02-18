@@ -60,8 +60,8 @@ async def list_opportunities(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch market data: {e}")
 
-    # Score all items through the composite scorer
-    scored = score_opportunities(raw, min_score=min_score, limit=limit * 2)
+    # Score all items through the composite scorer (has sync DB calls)
+    scored = await asyncio.to_thread(score_opportunities, raw, min_score, limit * 2)
 
     # Post-filter
     results = []
@@ -142,105 +142,108 @@ async def get_opportunity_detail(item_id: int):
 
     Combines FlipScorer, SmartPricer, quant analysis, and flip history.
     """
-    db = get_db()
-    try:
-        snapshots = get_price_history(db, item_id, hours=4)
-        flips = get_item_flips(db, item_id, days=30)
-
-        # Score the item
-        fs = _scorer.score_item(item_id, snapshots=snapshots, flips=flips)
-
-        # SmartPricer recommendation
-        rec = _pricer.price_item(item_id, snapshots=snapshots)
-
-        # Quant analysis (text report) — run in thread to avoid blocking event loop
+    def _sync_detail():
+        db = get_db()
         try:
-            quant_report = await asyncio.to_thread(analyze_single_item, item_id)
-        except Exception:
-            quant_report = None
+            snapshots = get_price_history(db, item_id, hours=4)
+            flips = get_item_flips(db, item_id, days=30)
 
-        # Recent flips
-        flip_data = [
-            {
-                "buy_price": f.buy_price,
-                "sell_price": f.sell_price,
-                "quantity": f.quantity,
-                "net_profit": f.net_profit,
-                "margin_pct": round(f.margin_pct, 2),
-                "duration_seconds": f.duration_seconds,
-                "sell_time": f.sell_time.isoformat() if f.sell_time else None,
+            # Score the item
+            fs = _scorer.score_item(item_id, snapshots=snapshots, flips=flips)
+
+            # SmartPricer recommendation
+            rec = _pricer.price_item(item_id, snapshots=snapshots)
+
+            # Quant analysis (text report)
+            try:
+                quant_report = analyze_single_item(item_id)
+            except Exception:
+                quant_report = None
+
+            # Recent flips
+            flip_data = [
+                {
+                    "buy_price": f.buy_price,
+                    "sell_price": f.sell_price,
+                    "quantity": f.quantity,
+                    "net_profit": f.net_profit,
+                    "margin_pct": round(f.margin_pct, 2),
+                    "duration_seconds": f.duration_seconds,
+                    "sell_time": f.sell_time.isoformat() if f.sell_time else None,
+                }
+                for f in flips[:20]
+            ]
+
+            # Item metadata
+            item_row = get_item(db, item_id)
+            item_name = item_row.name if item_row else f"Item {item_id}"
+
+            return {
+                "item_id": item_id,
+                "item_name": item_name,
+                "current_buy": rec.instant_buy,
+                "current_sell": rec.instant_sell,
+
+                # Flip score
+                "flip_score": {
+                    "total": round(fs.total_score, 1),
+                    "spread": round(fs.spread_score, 1),
+                    "volume": round(fs.volume_score, 1),
+                    "freshness": round(fs.freshness_score, 1),
+                    "trend": round(fs.trend_score, 1),
+                    "history": round(fs.history_score, 1),
+                    "stability": round(fs.stability_score, 1),
+                    "vetoed": fs.vetoed,
+                    "veto_reasons": fs.veto_reasons,
+                },
+
+                "recommendation": {
+                    "recommended_buy": rec.recommended_buy,
+                    "recommended_sell": rec.recommended_sell,
+                    "expected_profit": rec.expected_profit,
+                    "expected_profit_pct": round(rec.expected_profit_pct, 2) if rec.expected_profit_pct else None,
+                    "tax": rec.tax,
+                    "trend": rec.trend.value,
+                    "momentum": round(rec.momentum, 2),
+                    "confidence": round(rec.confidence, 3),
+                    "reason": rec.reason,
+                    "stale_data": rec.stale_data,
+                    "anomalous_spread": rec.anomalous_spread,
+                },
+
+                "vwap": {
+                    "1m": round(rec.vwap_1m, 2) if rec.vwap_1m else None,
+                    "5m": round(rec.vwap_5m, 2) if rec.vwap_5m else None,
+                    "30m": round(rec.vwap_30m, 2) if rec.vwap_30m else None,
+                    "2h": round(rec.vwap_2h, 2) if rec.vwap_2h else None,
+                },
+                "bollinger": {
+                    "upper": round(rec.bb_upper, 2) if rec.bb_upper else None,
+                    "middle": round(rec.bb_middle, 2) if rec.bb_middle else None,
+                    "lower": round(rec.bb_lower, 2) if rec.bb_lower else None,
+                    "position": round(rec.bb_position, 3) if rec.bb_position is not None else None,
+                },
+                "volume_5m": rec.volume_5m,
+
+                # Historical performance
+                "history": {
+                    "win_rate": round(fs.win_rate * 100, 1) if fs.win_rate is not None else None,
+                    "total_flips": fs.total_flips,
+                    "avg_profit": int(fs.avg_profit) if fs.avg_profit else None,
+                },
+
+                "quant_report": quant_report,
+                "recent_flips": flip_data,
+
+                # Position sizing advice
+                "position_sizing": _get_position_sizing(
+                    item_id, item_name, rec, fs,
+                ),
             }
-            for f in flips[:20]
-        ]
+        finally:
+            db.close()
 
-        # Item metadata
-        item_row = get_item(db, item_id)
-        item_name = item_row.name if item_row else f"Item {item_id}"
-
-        return {
-            "item_id": item_id,
-            "item_name": item_name,
-            "current_buy": rec.instant_buy,
-            "current_sell": rec.instant_sell,
-
-            # Flip score
-            "flip_score": {
-                "total": round(fs.total_score, 1),
-                "spread": round(fs.spread_score, 1),
-                "volume": round(fs.volume_score, 1),
-                "freshness": round(fs.freshness_score, 1),
-                "trend": round(fs.trend_score, 1),
-                "history": round(fs.history_score, 1),
-                "stability": round(fs.stability_score, 1),
-                "vetoed": fs.vetoed,
-                "veto_reasons": fs.veto_reasons,
-            },
-
-            "recommendation": {
-                "recommended_buy": rec.recommended_buy,
-                "recommended_sell": rec.recommended_sell,
-                "expected_profit": rec.expected_profit,
-                "expected_profit_pct": round(rec.expected_profit_pct, 2) if rec.expected_profit_pct else None,
-                "tax": rec.tax,
-                "trend": rec.trend.value,
-                "momentum": round(rec.momentum, 2),
-                "confidence": round(rec.confidence, 3),
-                "reason": rec.reason,
-                "stale_data": rec.stale_data,
-                "anomalous_spread": rec.anomalous_spread,
-            },
-
-            "vwap": {
-                "1m": round(rec.vwap_1m, 2) if rec.vwap_1m else None,
-                "5m": round(rec.vwap_5m, 2) if rec.vwap_5m else None,
-                "30m": round(rec.vwap_30m, 2) if rec.vwap_30m else None,
-                "2h": round(rec.vwap_2h, 2) if rec.vwap_2h else None,
-            },
-            "bollinger": {
-                "upper": round(rec.bb_upper, 2) if rec.bb_upper else None,
-                "middle": round(rec.bb_middle, 2) if rec.bb_middle else None,
-                "lower": round(rec.bb_lower, 2) if rec.bb_lower else None,
-                "position": round(rec.bb_position, 3) if rec.bb_position is not None else None,
-            },
-            "volume_5m": rec.volume_5m,
-
-            # Historical performance
-            "history": {
-                "win_rate": round(fs.win_rate * 100, 1) if fs.win_rate is not None else None,
-                "total_flips": fs.total_flips,
-                "avg_profit": int(fs.avg_profit) if fs.avg_profit else None,
-            },
-
-            "quant_report": quant_report,
-            "recent_flips": flip_data,
-
-            # Position sizing advice
-            "position_sizing": _get_position_sizing(
-                item_id, item_name, rec, fs,
-            ),
-        }
-    finally:
-        db.close()
+    return await asyncio.to_thread(_sync_detail)
 
 
 def _get_position_sizing(item_id, item_name, rec, fs):

@@ -472,6 +472,10 @@ def init_db():
         _client = MongoClient(
             MONGODB_URL,
             serverSelectionTimeoutMS=10_000,  # fail fast if unreachable
+            maxPoolSize=10,        # limit connection pool
+            minPoolSize=1,
+            connectTimeoutMS=5_000,
+            socketTimeoutMS=30_000,
         )
         # Force a connection test so errors surface at startup
         _client.admin.command("ping")

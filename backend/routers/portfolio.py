@@ -6,6 +6,7 @@ GET  /api/performance - performance metrics
 POST /api/dink        - DINK webhook receiver
 """
 
+import asyncio
 import sys
 import os
 import json
@@ -76,37 +77,35 @@ async def _fetch_live_price(item_id: int) -> dict:
 
 @router.get("/api/portfolio")
 async def get_portfolio():
-    """Return current holdings from portfolio.json or the database.
+    """Return current holdings from portfolio.json or the database."""
+    def _sync():
+        portfolio = _load_portfolio_file()
 
-    If portfolio.json exists it is treated as the source of truth.
-    Otherwise, open buy trades that have not been matched to a sell are
-    treated as current holdings.
-    """
-    portfolio = _load_portfolio_file()
+        # Fallback: derive holdings from unmatched BUY trades in DB
+        if not portfolio.get("holdings"):
+            db = get_db()
+            try:
+                matched_buy_ids = get_matched_buy_trade_ids(db)
+                all_trades = find_trades(db, limit=500)
+                buys = [t for t in all_trades if t.trade_type == "BUY" and t.status == "BOUGHT"]
+                holdings = []
+                for t in buys:
+                    if t.id not in matched_buy_ids:
+                        holdings.append({
+                            "item_id": t.item_id,
+                            "item_name": t.item_name,
+                            "quantity": t.quantity,
+                            "buy_price": t.price,
+                            "total_cost": t.total_value,
+                            "bought_at": t.timestamp.isoformat() if t.timestamp else None,
+                        })
+                portfolio["holdings"] = holdings
+            finally:
+                db.close()
 
-    # Fallback: derive holdings from unmatched BUY trades in DB
-    if not portfolio.get("holdings"):
-        db = get_db()
-        try:
-            matched_buy_ids = get_matched_buy_trade_ids(db)
-            all_trades = find_trades(db, limit=500)
-            buys = [t for t in all_trades if t.trade_type == "BUY" and t.status == "BOUGHT"]
-            holdings = []
-            for t in buys:
-                if t.id not in matched_buy_ids:
-                    holdings.append({
-                        "item_id": t.item_id,
-                        "item_name": t.item_name,
-                        "quantity": t.quantity,
-                        "buy_price": t.price,
-                        "total_cost": t.total_value,
-                        "bought_at": t.timestamp.isoformat() if t.timestamp else None,
-                    })
-            portfolio["holdings"] = holdings
-        finally:
-            db.close()
+        return portfolio
 
-    return portfolio
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------
@@ -119,30 +118,33 @@ async def get_trades(
     item_id: Optional[int] = Query(None),
 ):
     """Return trade history from the trades table."""
-    db = get_db()
-    try:
-        rows = find_trades(db, item_id=item_id, limit=limit)
-        return [
-            {
-                "id": t.id,
-                "timestamp": t.timestamp.isoformat() if t.timestamp else None,
-                "player": t.player,
-                "item_id": t.item_id,
-                "item_name": t.item_name,
-                "trade_type": t.trade_type,
-                "status": t.status,
-                "quantity": t.quantity,
-                "price": t.price,
-                "total_value": t.total_value,
-                "slot": t.slot,
-                "market_price": t.market_price,
-                "seller_tax": t.seller_tax,
-                "source": t.source,
-            }
-            for t in rows
-        ]
-    finally:
-        db.close()
+    def _sync():
+        db = get_db()
+        try:
+            rows = find_trades(db, item_id=item_id, limit=limit)
+            return [
+                {
+                    "id": t.id,
+                    "timestamp": t.timestamp.isoformat() if t.timestamp else None,
+                    "player": t.player,
+                    "item_id": t.item_id,
+                    "item_name": t.item_name,
+                    "trade_type": t.trade_type,
+                    "status": t.status,
+                    "quantity": t.quantity,
+                    "price": t.price,
+                    "total_value": t.total_value,
+                    "slot": t.slot,
+                    "market_price": t.market_price,
+                    "seller_tax": t.seller_tax,
+                    "source": t.source,
+                }
+                for t in rows
+            ]
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------
@@ -152,55 +154,58 @@ async def get_trades(
 @router.get("/api/performance")
 async def get_performance():
     """Return overall performance metrics computed from flip_history."""
-    db = get_db()
-    try:
-        flips = find_all_flips(db)
-        if not flips:
+    def _sync():
+        db = get_db()
+        try:
+            flips = find_all_flips(db)
+            if not flips:
+                return {
+                    "total_flips": 0,
+                    "total_profit": 0,
+                    "total_tax_paid": 0,
+                    "win_rate": 0.0,
+                    "avg_profit_per_flip": 0,
+                    "gp_per_hour": 0,
+                    "best_flip": None,
+                    "worst_flip": None,
+                }
+
+            total_profit = sum(f.net_profit for f in flips)
+            total_tax = sum(f.tax for f in flips)
+            wins = sum(1 for f in flips if f.net_profit > 0)
+            win_rate = wins / len(flips) * 100 if flips else 0
+
+            # GP/hour calculation
+            total_seconds = sum(f.duration_seconds for f in flips if f.duration_seconds > 0)
+            gp_per_hour = int(total_profit / (total_seconds / 3600)) if total_seconds > 0 else 0
+
+            best = max(flips, key=lambda f: f.net_profit)
+            worst = min(flips, key=lambda f: f.net_profit)
+
+            def _flip_summary(f):
+                return {
+                    "item_id": f.item_id,
+                    "item_name": f.item_name,
+                    "net_profit": f.net_profit,
+                    "margin_pct": round(f.margin_pct, 2),
+                    "quantity": f.quantity,
+                    "sell_time": f.sell_time.isoformat() if f.sell_time else None,
+                }
+
             return {
-                "total_flips": 0,
-                "total_profit": 0,
-                "total_tax_paid": 0,
-                "win_rate": 0.0,
-                "avg_profit_per_flip": 0,
-                "gp_per_hour": 0,
-                "best_flip": None,
-                "worst_flip": None,
+                "total_flips": len(flips),
+                "total_profit": total_profit,
+                "total_tax_paid": total_tax,
+                "win_rate": round(win_rate, 1),
+                "avg_profit_per_flip": int(total_profit / len(flips)),
+                "gp_per_hour": gp_per_hour,
+                "best_flip": _flip_summary(best),
+                "worst_flip": _flip_summary(worst),
             }
+        finally:
+            db.close()
 
-        total_profit = sum(f.net_profit for f in flips)
-        total_tax = sum(f.tax for f in flips)
-        wins = sum(1 for f in flips if f.net_profit > 0)
-        win_rate = wins / len(flips) * 100 if flips else 0
-
-        # GP/hour calculation
-        total_seconds = sum(f.duration_seconds for f in flips if f.duration_seconds > 0)
-        gp_per_hour = int(total_profit / (total_seconds / 3600)) if total_seconds > 0 else 0
-
-        best = max(flips, key=lambda f: f.net_profit)
-        worst = min(flips, key=lambda f: f.net_profit)
-
-        def _flip_summary(f):
-            return {
-                "item_id": f.item_id,
-                "item_name": f.item_name,
-                "net_profit": f.net_profit,
-                "margin_pct": round(f.margin_pct, 2),
-                "quantity": f.quantity,
-                "sell_time": f.sell_time.isoformat() if f.sell_time else None,
-            }
-
-        return {
-            "total_flips": len(flips),
-            "total_profit": total_profit,
-            "total_tax_paid": total_tax,
-            "win_rate": round(win_rate, 1),
-            "avg_profit_per_flip": int(total_profit / len(flips)),
-            "gp_per_hour": gp_per_hour,
-            "best_flip": _flip_summary(best),
-            "worst_flip": _flip_summary(worst),
-        }
-    finally:
-        db.close()
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------

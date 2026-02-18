@@ -4,6 +4,8 @@ GET  /api/settings  - return all settings
 POST /api/settings  - update settings
 """
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
@@ -37,32 +39,31 @@ DEFAULTS: Dict[str, Any] = {
 @router.get("")
 async def get_settings_endpoint():
     """Return every stored setting, merged with defaults for any missing keys."""
-    db = get_db()
-    try:
-        stored = get_all_settings(db)
-        merged = {**DEFAULTS, **stored}
-        return merged
-    finally:
-        db.close()
+    def _sync():
+        db = get_db()
+        try:
+            stored = get_all_settings(db)
+            merged = {**DEFAULTS, **stored}
+            return merged
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 @router.post("")
 async def update_settings(body: SettingUpdate):
-    """Create or update one or more settings.
-
-    Request body example:
-    {
-        "settings": {
-            "min_profit": 100000,
-            "discord_alerts_enabled": true
-        }
-    }
-    """
+    """Create or update one or more settings."""
     if not body.settings:
         raise HTTPException(status_code=400, detail="No settings provided")
 
-    db = get_db()
-    for key, value in body.settings.items():
-        set_setting(db, key, value)
+    def _sync():
+        db = get_db()
+        try:
+            for key, value in body.settings.items():
+                set_setting(db, key, value)
+            return {"status": "ok", "updated": list(body.settings.keys())}
+        finally:
+            db.close()
 
-    return {"status": "ok", "updated": list(body.settings.keys())}
+    return await asyncio.to_thread(_sync)

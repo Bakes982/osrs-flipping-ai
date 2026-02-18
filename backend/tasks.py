@@ -88,7 +88,7 @@ class PriceCollector:
     async def store_snapshots(self) -> int:
         """Store current price data as PriceSnapshot rows.
 
-        Only stores the top ~500 items by volume to avoid filling MongoDB.
+        Only stores the top ~200 items by volume to avoid filling MongoDB.
         Returns the number of rows inserted.
         """
         if not self._latest_data:
@@ -99,7 +99,7 @@ class PriceCollector:
             db = get_db()
             count = 0
             try:
-                # Filter to items with meaningful volume (top ~500)
+                # Filter to items with meaningful volume (top ~200)
                 items_with_volume = []
                 for item_id_str, instant in self._latest_data.items():
                     avg = self._5m_data.get(item_id_str, {})
@@ -107,9 +107,9 @@ class PriceCollector:
                     if vol > 0 and instant.get("high") and instant.get("low"):
                         items_with_volume.append((item_id_str, instant, avg, vol))
 
-                # Sort by volume descending, keep top 500
+                # Sort by volume descending, keep top 200
                 items_with_volume.sort(key=lambda x: x[3], reverse=True)
-                items_with_volume = items_with_volume[:500]
+                items_with_volume = items_with_volume[:200]
 
                 snapshots_list = []
                 for item_id_str, instant, avg, vol in items_with_volume:
@@ -747,7 +747,8 @@ _tasks = []
 
 
 async def start_background_tasks():
-    """Create and start all background asyncio tasks."""
+    """Create and start all background asyncio tasks, staggered to avoid
+    overloading MongoDB with simultaneous queries."""
     global _tasks
 
     collector = PriceCollector()
@@ -757,16 +758,28 @@ async def start_background_tasks():
     alert_monitor = AlertMonitor()
     pruner = DataPruner()
 
-    _tasks = [
-        asyncio.create_task(collector.run_forever()),
-        asyncio.create_task(feature_computer.run_forever()),
-        asyncio.create_task(scorer.run_forever()),
-        asyncio.create_task(retrainer.run_forever()),
-        asyncio.create_task(alert_monitor.run_forever()),
-        asyncio.create_task(pruner.run_forever()),
-    ]
+    # Start PriceCollector first (it feeds data to everything else)
+    _tasks.append(asyncio.create_task(collector.run_forever()))
+    logger.info("PriceCollector task created")
 
-    logger.info("All background tasks started (%d tasks)", len(_tasks))
+    # Stagger the remaining tasks so they don't all hit MongoDB at once
+    await asyncio.sleep(15)  # Let collector gather some data first
+    _tasks.append(asyncio.create_task(feature_computer.run_forever()))
+    logger.info("FeatureComputer task created")
+
+    await asyncio.sleep(10)
+    _tasks.append(asyncio.create_task(scorer.run_forever()))
+    logger.info("MLScorer task created")
+
+    await asyncio.sleep(10)
+    _tasks.append(asyncio.create_task(alert_monitor.run_forever()))
+    logger.info("AlertMonitor task created")
+
+    # These run infrequently, start them last
+    _tasks.append(asyncio.create_task(retrainer.run_forever()))
+    _tasks.append(asyncio.create_task(pruner.run_forever()))
+
+    logger.info("All %d background tasks started", len(_tasks))
 
 
 async def stop_background_tasks():

@@ -4,6 +4,7 @@ GET /api/predict/{item_id}  - multi-horizon price predictions
 GET /api/model/metrics      - model accuracy metrics per horizon
 """
 
+import asyncio
 import sys
 import os
 from typing import Optional
@@ -53,80 +54,65 @@ async def predict_item(
     item_id: int,
     horizon: Optional[str] = Query(None, description="Specific horizon e.g. 5m, 30m. Omit for all."),
 ):
-    """Return multi-horizon price predictions for an item.
+    """Return multi-horizon price predictions for an item."""
+    def _sync():
+        db = get_db()
+        try:
+            snapshots = get_price_history(db, item_id, hours=4)
+            if not snapshots:
+                return None  # signal 404
 
-    Currently powered by SmartPricer trend analysis.  Once ML models are
-    trained, this endpoint will switch to model inference.
+            rec = _pricer.price_item(item_id, snapshots=snapshots)
 
-    Response format:
-    {
-        "item_id": 13652,
-        "item_name": "Dragon claws",
-        "current_buy": 58000000,
-        "current_sell": 57500000,
-        "predictions": {
-            "1m":  {"buy": ..., "sell": ..., "direction": "up", "confidence": 0.72},
-            "5m":  {...},
-            ...
-        },
-        "suggested_action": {"buy_at": ..., "sell_at": ..., ...}
-    }
-    """
-    db = get_db()
-    try:
-        snapshots = get_price_history(db, item_id, hours=4)
-        if not snapshots:
-            raise HTTPException(status_code=404, detail=f"No price data for item {item_id}")
+            # Item name
+            item_row = get_item(db, item_id)
+            item_name = item_row.name if item_row else f"Item {item_id}"
 
-        rec = _pricer.price_item(item_id, snapshots=snapshots)
+            current_buy = rec.instant_buy
+            current_sell = rec.instant_sell
 
-        # Item name
-        item_row = get_item(db, item_id)
-        item_name = item_row.name if item_row else f"Item {item_id}"
+            # Build predictions per horizon
+            horizons_to_compute = [horizon] if horizon and horizon in ALL_HORIZONS else ALL_HORIZONS
 
-        current_buy = rec.instant_buy
-        current_sell = rec.instant_sell
+            predictions = {}
+            for h in horizons_to_compute:
+                scale = _horizon_scale(h)
+                momentum_offset = int(rec.momentum * _horizon_minutes(h))
 
-        # Build predictions per horizon using SmartPricer extrapolations
-        horizons_to_compute = [horizon] if horizon and horizon in ALL_HORIZONS else ALL_HORIZONS
+                pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
+                pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
 
-        predictions = {}
-        for h in horizons_to_compute:
-            # Scale the SmartPricer recommendation by horizon length
-            # Shorter horizons stay closer to current price; longer horizons
-            # extrapolate further along the detected trend.
-            scale = _horizon_scale(h)
-            momentum_offset = int(rec.momentum * _horizon_minutes(h))
+                predictions[h] = {
+                    "buy": pred_buy,
+                    "sell": pred_sell,
+                    "direction": _direction(current_buy, pred_buy),
+                    "confidence": round(max(0.1, rec.confidence * (1.0 - scale * 0.15)), 3),
+                }
 
-            pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
-            pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
-
-            predictions[h] = {
-                "buy": pred_buy,
-                "sell": pred_sell,
-                "direction": _direction(current_buy, pred_buy),
-                "confidence": round(max(0.1, rec.confidence * (1.0 - scale * 0.15)), 3),
+            return {
+                "item_id": item_id,
+                "item_name": item_name,
+                "current_buy": current_buy,
+                "current_sell": current_sell,
+                "predictions": predictions,
+                "suggested_action": {
+                    "buy_at": rec.recommended_buy,
+                    "sell_at": rec.recommended_sell,
+                    "expected_profit": rec.expected_profit,
+                    "expected_profit_pct": round(rec.expected_profit_pct, 2) if rec.expected_profit_pct else None,
+                    "tax": rec.tax,
+                    "trend": rec.trend.value,
+                    "confidence": round(rec.confidence, 3),
+                    "reason": rec.reason,
+                },
             }
+        finally:
+            db.close()
 
-        return {
-            "item_id": item_id,
-            "item_name": item_name,
-            "current_buy": current_buy,
-            "current_sell": current_sell,
-            "predictions": predictions,
-            "suggested_action": {
-                "buy_at": rec.recommended_buy,
-                "sell_at": rec.recommended_sell,
-                "expected_profit": rec.expected_profit,
-                "expected_profit_pct": round(rec.expected_profit_pct, 2) if rec.expected_profit_pct else None,
-                "tax": rec.tax,
-                "trend": rec.trend.value,
-                "confidence": round(rec.confidence, 3),
-                "reason": rec.reason,
-            },
-        }
-    finally:
-        db.close()
+    result = await asyncio.to_thread(_sync)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No price data for item {item_id}")
+    return result
 
 
 def _horizon_minutes(h: str) -> float:
@@ -161,38 +147,36 @@ def _horizon_scale(h: str) -> float:
 
 @router.get("/api/model/metrics")
 async def get_model_metrics():
-    """Return the latest model accuracy metrics per horizon.
+    """Return the latest model accuracy metrics per horizon."""
+    def _sync():
+        db = get_db()
+        try:
+            results = {}
+            for h in ALL_HORIZONS:
+                row = get_model_metrics_latest(db, h)
+                if row:
+                    results[h] = {
+                        "model_version": row.model_version,
+                        "direction_accuracy": row.direction_accuracy,
+                        "price_mae": row.price_mae,
+                        "price_mape": row.price_mape,
+                        "profit_accuracy": row.profit_accuracy,
+                        "sample_count": row.sample_count,
+                        "last_evaluated": row.timestamp.isoformat() if row.timestamp else None,
+                    }
+                else:
+                    results[h] = {
+                        "model_version": None,
+                        "direction_accuracy": None,
+                        "price_mae": None,
+                        "price_mape": None,
+                        "profit_accuracy": None,
+                        "sample_count": 0,
+                        "last_evaluated": None,
+                    }
 
-    Each horizon has: direction_accuracy, price_mae, price_mape,
-    profit_accuracy, sample_count.
-    """
-    db = get_db()
-    try:
-        # Get the most recent metrics row for each horizon
-        results = {}
-        for h in ALL_HORIZONS:
-            row = get_model_metrics_latest(db, h)
-            if row:
-                results[h] = {
-                    "model_version": row.model_version,
-                    "direction_accuracy": row.direction_accuracy,
-                    "price_mae": row.price_mae,
-                    "price_mape": row.price_mape,
-                    "profit_accuracy": row.profit_accuracy,
-                    "sample_count": row.sample_count,
-                    "last_evaluated": row.timestamp.isoformat() if row.timestamp else None,
-                }
-            else:
-                results[h] = {
-                    "model_version": None,
-                    "direction_accuracy": None,
-                    "price_mae": None,
-                    "price_mape": None,
-                    "profit_accuracy": None,
-                    "sample_count": 0,
-                    "last_evaluated": None,
-                }
+            return {"horizons": results}
+        finally:
+            db.close()
 
-        return {"horizons": results}
-    finally:
-        db.close()
+    return await asyncio.to_thread(_sync)

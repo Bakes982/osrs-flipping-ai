@@ -7,6 +7,7 @@ GET  /api/alerts/price-targets - list active price targets
 DELETE /api/alerts/price-target/{item_id} - remove a price target
 """
 
+import asyncio
 from typing import Optional, List
 
 from fastapi import APIRouter, Query, HTTPException
@@ -39,30 +40,33 @@ async def list_alerts(
     hours: int = Query(24, ge=1, le=168),
 ):
     """Return recent alerts, newest first."""
-    db = get_db()
-    try:
-        rows = find_alerts(db, hours=hours, alert_type=alert_type,
-                           unacknowledged_only=unacknowledged_only, limit=limit)
+    def _sync():
+        db = get_db()
+        try:
+            rows = find_alerts(db, hours=hours, alert_type=alert_type,
+                               unacknowledged_only=unacknowledged_only, limit=limit)
 
-        return {
-            "alerts": [
-                {
-                    "id": a.id,
-                    "item_id": a.item_id,
-                    "item_name": a.item_name,
-                    "alert_type": a.alert_type,
-                    "message": a.message,
-                    "data": a.data,
-                    "timestamp": a.timestamp.isoformat() if a.timestamp else None,
-                    "acknowledged": a.acknowledged,
-                }
-                for a in rows
-            ],
-            "total": len(rows),
-            "unacknowledged": sum(1 for a in rows if not a.acknowledged),
-        }
-    finally:
-        db.close()
+            return {
+                "alerts": [
+                    {
+                        "id": a.id,
+                        "item_id": a.item_id,
+                        "item_name": a.item_name,
+                        "alert_type": a.alert_type,
+                        "message": a.message,
+                        "data": a.data,
+                        "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+                        "acknowledged": a.acknowledged,
+                    }
+                    for a in rows
+                ],
+                "total": len(rows),
+                "unacknowledged": sum(1 for a in rows if not a.acknowledged),
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 @router.post("/acknowledge")
@@ -71,12 +75,15 @@ async def acknowledge_alerts(body: AcknowledgeRequest):
     if not body.acknowledge_all and not body.alert_ids:
         raise HTTPException(status_code=400, detail="Provide alert_ids or acknowledge_all")
 
-    db = get_db()
-    try:
-        updated = db_acknowledge_alerts(db, alert_ids=body.alert_ids, all_unack=body.acknowledge_all)
-        return {"status": "ok", "acknowledged": updated}
-    finally:
-        db.close()
+    def _sync():
+        db = get_db()
+        try:
+            updated = db_acknowledge_alerts(db, alert_ids=body.alert_ids, all_unack=body.acknowledge_all)
+            return {"status": "ok", "acknowledged": updated}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 @router.post("/price-target")
@@ -87,58 +94,67 @@ async def create_price_target(body: PriceTargetCreate):
     if body.target_price <= 0:
         raise HTTPException(status_code=400, detail="target_price must be positive")
 
-    db = get_db()
-    try:
-        targets = get_setting(db, "price_alerts", default=[])
+    def _sync():
+        db = get_db()
+        try:
+            targets = get_setting(db, "price_alerts", default=[])
 
-        # Prevent duplicate targets for same item + direction
-        for t in targets:
-            if t.get("item_id") == body.item_id and t.get("direction") == body.direction:
-                # Update existing target
-                t["target_price"] = body.target_price
-                t["item_name"] = body.item_name
-                set_setting(db, "price_alerts", targets)
-                return {"status": "updated", "target": t}
+            # Prevent duplicate targets for same item + direction
+            for t in targets:
+                if t.get("item_id") == body.item_id and t.get("direction") == body.direction:
+                    # Update existing target
+                    t["target_price"] = body.target_price
+                    t["item_name"] = body.item_name
+                    set_setting(db, "price_alerts", targets)
+                    return {"status": "updated", "target": t}
 
-        new_target = {
-            "item_id": body.item_id,
-            "item_name": body.item_name,
-            "target_price": body.target_price,
-            "direction": body.direction,
-        }
-        targets.append(new_target)
-        set_setting(db, "price_alerts", targets)
+            new_target = {
+                "item_id": body.item_id,
+                "item_name": body.item_name,
+                "target_price": body.target_price,
+                "direction": body.direction,
+            }
+            targets.append(new_target)
+            set_setting(db, "price_alerts", targets)
 
-        return {"status": "created", "target": new_target}
-    finally:
-        db.close()
+            return {"status": "created", "target": new_target}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 @router.get("/price-targets")
 async def list_price_targets():
     """Return all active price target alerts."""
-    db = get_db()
-    try:
-        targets = get_setting(db, "price_alerts", default=[])
-        return {"targets": targets, "total": len(targets)}
-    finally:
-        db.close()
+    def _sync():
+        db = get_db()
+        try:
+            targets = get_setting(db, "price_alerts", default=[])
+            return {"targets": targets, "total": len(targets)}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 @router.delete("/price-target/{item_id}")
 async def delete_price_target(item_id: int, direction: Optional[str] = Query(None)):
     """Remove a price target alert."""
-    db = get_db()
-    try:
-        targets = get_setting(db, "price_alerts", default=[])
-        before = len(targets)
-        if direction:
-            targets = [t for t in targets if not (t.get("item_id") == item_id and t.get("direction") == direction)]
-        else:
-            targets = [t for t in targets if t.get("item_id") != item_id]
+    def _sync():
+        db = get_db()
+        try:
+            targets = get_setting(db, "price_alerts", default=[])
+            before = len(targets)
+            if direction:
+                targets = [t for t in targets if not (t.get("item_id") == item_id and t.get("direction") == direction)]
+            else:
+                targets = [t for t in targets if t.get("item_id") != item_id]
 
-        set_setting(db, "price_alerts", targets)
-        removed = before - len(targets)
-        return {"status": "ok", "removed": removed}
-    finally:
-        db.close()
+            set_setting(db, "price_alerts", targets)
+            removed = before - len(targets)
+            return {"status": "ok", "removed": removed}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)

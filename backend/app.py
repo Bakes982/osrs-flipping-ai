@@ -54,11 +54,10 @@ async def lifespan(app: FastAPI):
     init_db()
 
     # Schedule background tasks to start AFTER uvicorn is fully listening.
-    # Starting them before yield can block the event loop with sync MongoDB
-    # operations, preventing uvicorn from completing startup.
+    # Tasks are staggered to avoid all hammering MongoDB simultaneously.
     async def _delayed_start():
-        await asyncio.sleep(3)
-        logger.info("Starting background tasks...")
+        await asyncio.sleep(5)
+        logger.info("Starting background tasks (staggered)...")
         await start_background_tasks()
 
     asyncio.create_task(_delayed_start())
