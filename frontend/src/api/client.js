@@ -195,7 +195,7 @@ export const api = {
   updateSettings(data) {
     return fetchJSON('/settings', {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({ settings: data }),
     });
   },
 };
