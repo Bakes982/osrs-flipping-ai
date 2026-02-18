@@ -20,28 +20,6 @@ COPY flip_predictor.py .
 COPY quant_analyzer.py .
 COPY user_config.py .
 
-# Copy frontend build if available
-COPY frontend/dist/ frontend/dist/
-
-EXPOSE 8001
-
-CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8001"]
-
-# ---
-FROM node:20-slim AS frontend-builder
-
-WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
-COPY frontend/ .
-RUN npm run build
-
-# ---
-FROM backend AS production
-
-# Copy built frontend from builder stage
-COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
-
 EXPOSE 8001
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
