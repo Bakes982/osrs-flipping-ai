@@ -13,6 +13,7 @@ pymongo[srv]>=4.6.0
 # ML Pipeline
 scikit-learn>=1.3.0
 joblib>=1.3.0
+matplotlib>=3.7.0
 # lightgbm is optional — backend/ml/forecaster.py falls back to sklearn
 
 # Auth (python-multipart needed for form parsing)
