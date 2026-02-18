@@ -1,4 +1,5 @@
 import { RefreshCw } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -10,8 +11,13 @@ function formatGP(n) {
 }
 
 export default function Portfolio({ prices }) {
-  const { data: portfolio, loading, reload } = useApi(() => api.getPortfolio(), [], 30000);
-  const { data: trades } = useApi(() => api.getTrades({ limit: 50 }), [], 30000);
+  const nav = useNavigate();
+  const { data: portfolio, loading, reload } = useApi(() => api.getPortfolio(), [], 120000);
+  const { data: trades } = useApi(() => api.getTrades({ limit: 50 }), [], 120000);
+
+  // Holdings come from backend as "holdings" array
+  const holdings = portfolio?.holdings || portfolio?.investments || [];
+  const totalInvested = holdings.reduce((s, h) => s + (h.total_cost || (h.buy_price * h.quantity) || 0), 0);
 
   return (
     <div>
@@ -20,38 +26,37 @@ export default function Portfolio({ prices }) {
           <h2 className="page-title">Portfolio</h2>
           <p className="page-subtitle">Track holdings and trade history</p>
         </div>
-        <button className="btn" onClick={reload}><RefreshCw size={14} /> Refresh</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn" onClick={() => nav('/import')}>Import CSV</button>
+          <button className="btn" onClick={reload}><RefreshCw size={14} /> Refresh</button>
+        </div>
       </div>
 
       <div className="stats-grid">
         <div className="card">
+          <div className="card-title">Active Holdings</div>
+          <div className="card-value">{holdings.length}</div>
+        </div>
+        <div className="card">
           <div className="card-title">Total Invested</div>
-          <div className="card-value">{formatGP(portfolio?.total_invested || 0)}</div>
+          <div className="card-value text-cyan">{formatGP(totalInvested)}</div>
         </div>
         <div className="card">
-          <div className="card-title">Current Value</div>
-          <div className="card-value text-cyan">{formatGP(portfolio?.current_value || 0)}</div>
+          <div className="card-title">Cash</div>
+          <div className="card-value text-green">{formatGP(portfolio?.cash || 0)}</div>
         </div>
         <div className="card">
-          <div className="card-title">Unrealized P/L</div>
-          <div className={`card-value ${(portfolio?.unrealized_pl || 0) >= 0 ? 'text-green' : 'text-red'}`}>
-            {formatGP(portfolio?.unrealized_pl || 0)}
-          </div>
-        </div>
-        <div className="card">
-          <div className="card-title">Realized P/L</div>
-          <div className={`card-value ${(portfolio?.realized_pl || 0) >= 0 ? 'text-green' : 'text-red'}`}>
-            {formatGP(portfolio?.realized_pl || 0)}
-          </div>
+          <div className="card-title">Trades Recorded</div>
+          <div className="card-value">{trades?.length || 0}</div>
         </div>
       </div>
 
       {/* Holdings */}
       <div className="card" style={{ marginBottom: 24 }}>
-        <h3 style={{ fontSize: 14, marginBottom: 16 }}>Holdings</h3>
+        <h3 style={{ fontSize: 14, marginBottom: 16 }}>Active Holdings</h3>
         {loading ? <div className="loading">Loading...</div> : (
-          !portfolio?.investments?.length ? (
-            <div className="empty">No active holdings</div>
+          !holdings.length ? (
+            <div className="empty">No active holdings — import your trades CSV to populate</div>
           ) : (
             <table className="data-table">
               <thead>
@@ -59,23 +64,34 @@ export default function Portfolio({ prices }) {
                   <th>Item</th>
                   <th>Qty</th>
                   <th>Buy Price</th>
-                  <th>Current</th>
-                  <th>P/L</th>
+                  <th>Total Cost</th>
+                  <th>Account</th>
+                  <th>Bought At</th>
                 </tr>
               </thead>
               <tbody>
-                {portfolio.investments.map((inv, i) => {
-                  const pl = ((inv.current_price || inv.buy_price) - inv.buy_price) * inv.quantity;
-                  return (
-                    <tr key={i}>
-                      <td style={{ fontWeight: 500 }}>{inv.item_name}</td>
-                      <td>{inv.quantity?.toLocaleString()}</td>
-                      <td className="gp">{formatGP(inv.buy_price)}</td>
-                      <td className="gp">{formatGP(inv.current_price || inv.buy_price)}</td>
-                      <td className={pl >= 0 ? 'text-green' : 'text-red'}>{formatGP(pl)}</td>
-                    </tr>
-                  );
-                })}
+                {holdings.map((h, i) => (
+                  <tr key={i}>
+                    <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {h.item_id > 0 && (
+                        <img
+                          src={`https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${h.item_id}`}
+                          alt="" width={24} height={24}
+                          style={{ imageRendering: 'pixelated' }}
+                          onError={e => { e.target.style.display = 'none'; }}
+                        />
+                      )}
+                      {h.item_name}
+                    </td>
+                    <td>{h.quantity?.toLocaleString()}</td>
+                    <td className="gp">{formatGP(h.buy_price)}</td>
+                    <td className="gp">{formatGP(h.total_cost || (h.buy_price * h.quantity))}</td>
+                    <td className="text-muted">{h.player || '—'}</td>
+                    <td className="text-muted">
+                      {h.bought_at ? new Date(h.bought_at).toLocaleString() : '—'}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           )
@@ -85,7 +101,9 @@ export default function Portfolio({ prices }) {
       {/* Recent Trades */}
       <div className="card">
         <h3 style={{ fontSize: 14, marginBottom: 16 }}>Recent Trades</h3>
-        {!trades?.length ? <div className="empty">No trades recorded yet</div> : (
+        {!trades?.length ? (
+          <div className="empty">No trades recorded — <a href="/import" style={{ color: 'var(--cyan)' }}>import your CSV</a></div>
+        ) : (
           <table className="data-table">
             <thead>
               <tr>
@@ -95,12 +113,13 @@ export default function Portfolio({ prices }) {
                 <th>Qty</th>
                 <th>Price</th>
                 <th>Total</th>
+                <th>Source</th>
               </tr>
             </thead>
             <tbody>
               {trades.slice(0, 30).map((t, i) => (
                 <tr key={i}>
-                  <td className="text-muted">{new Date(t.timestamp).toLocaleTimeString()}</td>
+                  <td className="text-muted">{t.timestamp ? new Date(t.timestamp).toLocaleString() : '—'}</td>
                   <td style={{ fontWeight: 500 }}>{t.item_name}</td>
                   <td>
                     <span className={`badge ${t.trade_type === 'BUY' ? 'badge-green' : 'badge-red'}`}>
@@ -110,6 +129,7 @@ export default function Portfolio({ prices }) {
                   <td>{t.quantity?.toLocaleString()}</td>
                   <td className="gp">{formatGP(t.price)}</td>
                   <td className="gp">{formatGP(t.total_value)}</td>
+                  <td className="text-muted" style={{ fontSize: 11 }}>{t.source || '—'}</td>
                 </tr>
               ))}
             </tbody>

@@ -129,6 +129,22 @@ export const api = {
     return fetchJSON('/performance');
   },
 
+  // Trade Import
+  async uploadTradesCSV(file) {
+    const url = `${API_BASE}/trades/import`;
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers = {};
+    const token = getToken();
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await fetch(url, { method: 'POST', headers, body: formData });
+    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+    return res.json();
+  },
+  clearTradeHistory() {
+    return fetchJSON('/trades/clear', { method: 'POST' });
+  },
+
   // Model
   getModelMetrics() {
     return fetchJSON('/model/metrics');

@@ -1,22 +1,26 @@
 """
 Portfolio & Trade Endpoints for OSRS Flipping AI
-GET  /api/portfolio   - current holdings
-GET  /api/trades      - trade history
-GET  /api/performance - performance metrics
-POST /api/dink        - DINK webhook receiver
+GET  /api/portfolio         - current holdings
+GET  /api/trades            - trade history
+GET  /api/performance       - performance metrics
+POST /api/trades/import     - import trades from CSV
+POST /api/dink              - DINK webhook receiver
 """
 
 import asyncio
+import csv
+import io
 import sys
 import os
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+from collections import defaultdict
 
 import httpx
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException, Query, UploadFile, File
 
 # Ensure project root is on sys.path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +46,36 @@ router = APIRouter(tags=["portfolio"])
 PORTFOLIO_FILE = os.path.join(_PROJECT_ROOT, "portfolio.json")
 WIKI_LATEST_URL = "https://prices.runescape.wiki/api/v1/osrs/latest"
 USER_AGENT = "OSRS-AI-Flipper v2.0 - Discord: bakes982"
+
+
+# ---------------------------------------------------------------------------
+# Wiki mapping cache (item name → item_id)
+# ---------------------------------------------------------------------------
+
+_wiki_name_to_id: dict = {}
+_wiki_id_to_name: dict = {}
+
+
+def _ensure_wiki_mapping():
+    """Load Wiki item mapping into cache if not already loaded."""
+    if _wiki_name_to_id:
+        return
+    import requests
+    try:
+        resp = requests.get(
+            "https://prices.runescape.wiki/api/v1/osrs/mapping",
+            headers={"User-Agent": USER_AGENT}, timeout=15,
+        )
+        resp.raise_for_status()
+        for item in resp.json():
+            name = item.get("name", "").strip()
+            item_id = item.get("id")
+            if name and item_id is not None:
+                _wiki_name_to_id[name.lower()] = item_id
+                _wiki_id_to_name[item_id] = name
+        logger.info("Wiki mapping loaded: %d items", len(_wiki_name_to_id))
+    except Exception as e:
+        logger.error("Failed to load Wiki mapping: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +131,7 @@ async def get_portfolio():
                             "quantity": t.quantity,
                             "buy_price": t.price,
                             "total_cost": t.total_value,
+                            "player": t.player,
                             "bought_at": t.timestamp.isoformat() if t.timestamp else None,
                         })
                 portfolio["holdings"] = holdings
@@ -201,6 +236,228 @@ async def get_performance():
                 "gp_per_hour": gp_per_hour,
                 "best_flip": _flip_summary(best),
                 "worst_flip": _flip_summary(worst),
+                # Per-item breakdown for Performance page
+                "item_performance": _item_performance(flips),
+                # Profit history for chart
+                "profit_history": _profit_history(flips),
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
+
+
+def _item_performance(flips):
+    """Build per-item performance breakdown from flip history."""
+    items = defaultdict(lambda: {"flips": [], "name": ""})
+    for f in flips:
+        items[f.item_id]["flips"].append(f)
+        items[f.item_id]["name"] = f.item_name
+
+    result = []
+    for item_id, data in items.items():
+        flip_list = data["flips"]
+        total = sum(f.net_profit for f in flip_list)
+        wins = sum(1 for f in flip_list if f.net_profit > 0)
+        avg_dur = sum(f.duration_seconds for f in flip_list) / len(flip_list) if flip_list else 0
+        result.append({
+            "item_id": item_id,
+            "item_name": data["name"],
+            "flip_count": len(flip_list),
+            "total_profit": total,
+            "avg_profit": int(total / len(flip_list)),
+            "win_rate": round(wins / len(flip_list) * 100, 1) if flip_list else 0,
+            "avg_duration_min": round(avg_dur / 60, 1),
+        })
+    result.sort(key=lambda x: x["total_profit"], reverse=True)
+    return result
+
+
+def _profit_history(flips):
+    """Build cumulative profit time-series from flip history (oldest→newest)."""
+    sorted_flips = sorted(flips, key=lambda f: f.sell_time or datetime.min)
+    cumulative = 0
+    history = []
+    for f in sorted_flips:
+        cumulative += f.net_profit
+        history.append({
+            "time": f.sell_time.isoformat() if f.sell_time else None,
+            "profit": cumulative,
+            "item": f.item_name,
+            "flip_profit": f.net_profit,
+        })
+    return history
+
+
+# ---------------------------------------------------------------------------
+# POST /api/trades/import  -  CSV Import
+# ---------------------------------------------------------------------------
+
+@router.post("/api/trades/import")
+async def import_trades_csv(file: UploadFile = File(...)):
+    """Import trade history from a CSV file (e.g. from RuneLite flipping plugins).
+
+    Expected CSV columns:
+      First buy time, Last sell time, Account, Item, Status,
+      Bought, Sold, Avg. buy price, Avg. sell price, Tax, Profit, Profit ea.
+
+    Status values: BUYING, SELLING, FINISHED
+    - FINISHED rows with both buy and sell data create FlipHistory records
+    - BUYING rows create active BUY trade records (portfolio holdings)
+    - SELLING rows create active SELL trade records
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be a .csv")
+
+    content = await file.read()
+    text = content.decode("utf-8-sig")  # handle BOM
+
+    def _sync_import():
+        _ensure_wiki_mapping()
+        db = get_db()
+
+        reader = csv.DictReader(io.StringIO(text))
+        stats = {
+            "total_rows": 0,
+            "flips_imported": 0,
+            "active_trades_imported": 0,
+            "skipped": 0,
+            "errors": [],
+            "items_not_found": [],
+        }
+
+        try:
+            for row in reader:
+                stats["total_rows"] += 1
+                try:
+                    _import_csv_row(db, row, stats)
+                except Exception as e:
+                    stats["errors"].append(f"Row {stats['total_rows']}: {e}")
+                    if len(stats["errors"]) > 20:
+                        stats["errors"].append("... (truncated)")
+                        break
+        finally:
+            db.close()
+
+        # Deduplicate items_not_found
+        stats["items_not_found"] = list(set(stats["items_not_found"]))
+        return stats
+
+    result = await asyncio.to_thread(_sync_import)
+    return result
+
+
+def _parse_csv_datetime(s: str) -> Optional[datetime]:
+    """Parse ISO datetime string from CSV, return None if empty."""
+    if not s or not s.strip():
+        return None
+    s = s.strip()
+    try:
+        # Handle ISO format: 2026-02-18T16:14:58Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _import_csv_row(db, row: dict, stats: dict):
+    """Process a single CSV row and insert into the database."""
+    item_name = row.get("Item", "").strip()
+    if not item_name:
+        stats["skipped"] += 1
+        return
+
+    # Resolve item_id from Wiki mapping
+    item_id = _wiki_name_to_id.get(item_name.lower())
+    if item_id is None:
+        stats["items_not_found"].append(item_name)
+        # Still import with id=0 so data isn't lost
+        item_id = 0
+
+    status = row.get("Status", "").strip().upper()
+    account = row.get("Account", "").strip() or "Unknown"
+    buy_time = _parse_csv_datetime(row.get("First buy time", ""))
+    sell_time = _parse_csv_datetime(row.get("Last sell time", ""))
+
+    bought = int(row.get("Bought", 0) or 0)
+    sold = int(row.get("Sold", 0) or 0)
+    avg_buy = int(row.get("Avg. buy price", 0) or 0)
+    avg_sell = int(row.get("Avg. sell price", 0) or 0)
+    tax = int(row.get("Tax", 0) or 0)
+    profit = int(row.get("Profit", 0) or 0)
+
+    if status == "FINISHED" and bought > 0 and sold > 0 and avg_buy > 0 and avg_sell > 0:
+        # Create a completed flip record
+        quantity = min(bought, sold)
+        gross = (avg_sell - avg_buy) * quantity
+        margin_pct = (profit / (avg_buy * quantity) * 100) if (avg_buy * quantity) > 0 else 0.0
+        duration = int((sell_time - buy_time).total_seconds()) if (buy_time and sell_time) else 0
+
+        flip = FlipHistory(
+            item_id=item_id,
+            item_name=item_name,
+            player=account,
+            buy_price=avg_buy,
+            sell_price=avg_sell,
+            quantity=quantity,
+            gross_profit=gross,
+            tax=tax,
+            net_profit=profit,
+            margin_pct=round(margin_pct, 2),
+            buy_time=buy_time or datetime.now(timezone.utc),
+            sell_time=sell_time or datetime.now(timezone.utc),
+            duration_seconds=duration,
+        )
+        insert_flip(db, flip)
+        stats["flips_imported"] += 1
+
+    elif status in ("BUYING", "SELLING"):
+        # Active trade — goes into holdings/portfolio
+        trade_type = "BUY" if status == "BUYING" else "SELL"
+        quantity = bought if status == "BUYING" else sold
+        price = avg_buy if status == "BUYING" else avg_sell
+        if quantity <= 0:
+            stats["skipped"] += 1
+            return
+
+        trade = Trade(
+            item_id=item_id,
+            item_name=item_name,
+            trade_type=trade_type,
+            status="BOUGHT" if status == "BUYING" else "SOLD",
+            quantity=quantity,
+            price=price,
+            total_value=quantity * price,
+            timestamp=buy_time or sell_time or datetime.now(timezone.utc),
+            player=account,
+            source="csv_import",
+        )
+        insert_trade(db, trade)
+        stats["active_trades_imported"] += 1
+
+    else:
+        stats["skipped"] += 1
+
+
+# ---------------------------------------------------------------------------
+# POST /api/trades/clear  -  Clear imported trade data
+# ---------------------------------------------------------------------------
+
+@router.post("/api/trades/clear")
+async def clear_trade_history():
+    """Delete all trades and flip history from the database.
+
+    Used before re-importing CSV data to avoid duplicates.
+    """
+    def _sync():
+        db = get_db()
+        try:
+            trades_result = db.trades.delete_many({})
+            flips_result = db.flip_history.delete_many({})
+            return {
+                "trades_deleted": trades_result.deleted_count,
+                "flips_deleted": flips_result.deleted_count,
             }
         finally:
             db.close()
@@ -291,10 +548,10 @@ async def _handle_ge_trade(data: dict):
     # Fetch current market prices for context
     live = await _fetch_live_price(item_id)
 
-    db = SessionLocal()
+    db = get_db()
     try:
         trade = Trade(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             player=player_name,
             item_id=item_id,
             item_name=item_name,
@@ -310,53 +567,32 @@ async def _handle_ge_trade(data: dict):
             market_low=live.get("low"),
             source="dink",
         )
-        db.add(trade)
-        db.flush()  # get trade.id
+        trade_id = insert_trade(db, trade)
 
         # Attempt flip matching on completed sells
         if status == "SOLD":
-            _try_match_flip(db, trade)
+            _try_match_flip_mongo(db, trade)
 
-        db.commit()
         logger.info(
             "DINK trade stored: %s %s x%d @ %s GP (%s)",
             trade_type, item_name, quantity, f"{price:,}", status,
         )
     except Exception as e:
-        db.rollback()
         logger.error("Error storing DINK trade: %s", e)
     finally:
         db.close()
 
 
-def _try_match_flip(db, sell_trade: Trade):
-    """Try to match a SELL trade to an earlier BUY for the same item/player.
+def _try_match_flip_mongo(db, sell_trade: Trade):
+    """Try to match a SELL trade to an earlier BUY for the same item/player (MongoDB).
 
-    Uses FIFO matching. Creates a FlipHistory row on success.
+    Uses FIFO matching. Creates a FlipHistory record on success.
     """
-    # Find unmatched BUY trades for this item + player
-    matched_buy_ids = {
-        fh.buy_trade_id
-        for fh in db.query(FlipHistory.buy_trade_id).all()
-        if fh.buy_trade_id is not None
-    }
-
-    buy = (
-        db.query(Trade)
-        .filter(
-            Trade.item_id == sell_trade.item_id,
-            Trade.player == sell_trade.player,
-            Trade.trade_type == "BUY",
-            Trade.status == "BOUGHT",
-            ~Trade.id.in_(matched_buy_ids) if matched_buy_ids else True,
-        )
-        .order_by(Trade.timestamp.asc())
-        .first()
-    )
-
-    if not buy:
+    buys = find_unmatched_buy_trades(db, sell_trade.item_id, sell_trade.player)
+    if not buys:
         return
 
+    buy = buys[0]  # FIFO — oldest first
     quantity = min(buy.quantity, sell_trade.quantity)
     gross = (sell_trade.price - buy.price) * quantity
     tax_per_item = min(int(sell_trade.price * 0.02), 5_000_000)
@@ -377,12 +613,12 @@ def _try_match_flip(db, sell_trade: Trade):
         gross_profit=gross,
         tax=total_tax,
         net_profit=net,
-        margin_pct=margin_pct,
+        margin_pct=round(margin_pct, 2),
         buy_time=buy.timestamp,
         sell_time=sell_trade.timestamp,
         duration_seconds=duration,
     )
-    db.add(flip)
+    insert_flip(db, flip)
     logger.info(
         "Flip matched: %s x%d  profit=%s GP (%.1f%%)",
         sell_trade.item_name, quantity, f"{net:,}", margin_pct,

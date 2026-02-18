@@ -1,4 +1,5 @@
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from 'recharts';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -10,12 +11,28 @@ function formatGP(n) {
 }
 
 export default function Performance() {
-  const { data: perf, loading } = useApi(() => api.getPerformance(), [], 60000);
+  const nav = useNavigate();
+  const { data: perf, loading } = useApi(() => api.getPerformance(), [], 120000);
 
   if (loading) return <div className="loading">Loading performance data...</div>;
-  if (!perf) return <div className="empty">No performance data available yet. Start flipping!</div>;
+  if (!perf || perf.total_flips === 0) return (
+    <div className="empty">
+      No performance data available yet.
+      <br /><br />
+      <button className="btn" onClick={() => nav('/import')} style={{ background: 'var(--cyan)', color: '#000', padding: '10px 20px' }}>
+        Import Your Trade History
+      </button>
+    </div>
+  );
 
-  const profitHistory = perf.profit_history || [];
+  // Map backend profit_history (time, profit) to chart format
+  const profitHistory = (perf.profit_history || []).map((p, i) => ({
+    idx: i + 1,
+    date: p.time ? new Date(p.time).toLocaleDateString() : `#${i + 1}`,
+    profit: p.profit,
+    item: p.item,
+    flip_profit: p.flip_profit,
+  }));
   const itemPerf = perf.item_performance || [];
 
   return (
@@ -23,7 +40,7 @@ export default function Performance() {
       <div className="page-header">
         <div>
           <h2 className="page-title">Performance</h2>
-          <p className="page-subtitle">Track your flipping performance over time</p>
+          <p className="page-subtitle">Your flipping performance from {perf.total_flips} completed flips</p>
         </div>
       </div>
 
@@ -48,23 +65,54 @@ export default function Performance() {
         </div>
         <div className="card">
           <div className="card-title">Avg Profit/Flip</div>
-          <div className="card-value">{formatGP(perf.avg_profit || 0)}</div>
+          <div className="card-value">{formatGP(perf.avg_profit_per_flip || 0)}</div>
+        </div>
+        <div className="card">
+          <div className="card-title">Tax Paid</div>
+          <div className="card-value text-red">{formatGP(perf.total_tax_paid || 0)}</div>
         </div>
       </div>
 
+      {/* Best / Worst Flip */}
+      {(perf.best_flip || perf.worst_flip) && (
+        <div className="stats-grid" style={{ marginBottom: 24 }}>
+          {perf.best_flip && (
+            <div className="card" style={{ borderColor: 'rgba(16,185,129,0.3)' }}>
+              <div className="card-title" style={{ color: 'var(--green)' }}>Best Flip</div>
+              <div style={{ fontWeight: 500, fontSize: 14 }}>{perf.best_flip.item_name}</div>
+              <div className="text-green" style={{ fontSize: 18, fontWeight: 600 }}>+{formatGP(perf.best_flip.net_profit)}</div>
+              <div className="text-muted" style={{ fontSize: 11 }}>x{perf.best_flip.quantity} @ {perf.best_flip.margin_pct}% margin</div>
+            </div>
+          )}
+          {perf.worst_flip && (
+            <div className="card" style={{ borderColor: 'rgba(239,68,68,0.3)' }}>
+              <div className="card-title" style={{ color: 'var(--red)' }}>Worst Flip</div>
+              <div style={{ fontWeight: 500, fontSize: 14 }}>{perf.worst_flip.item_name}</div>
+              <div className="text-red" style={{ fontSize: 18, fontWeight: 600 }}>{formatGP(perf.worst_flip.net_profit)}</div>
+              <div className="text-muted" style={{ fontSize: 11 }}>x{perf.worst_flip.quantity} @ {perf.worst_flip.margin_pct}% margin</div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Profit Over Time */}
-      {profitHistory.length > 0 && (
+      {profitHistory.length > 2 && (
         <div className="card" style={{ marginBottom: 24 }}>
           <h3 style={{ fontSize: 14, marginBottom: 16 }}>Cumulative Profit</h3>
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={profitHistory}>
-              <XAxis dataKey="date" stroke="#6b7280" />
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(107,114,128,0.2)" />
+              <XAxis dataKey="idx" stroke="#6b7280" label={{ value: 'Flip #', fill: '#6b7280', fontSize: 10, position: 'insideBottom', offset: -5 }} />
               <YAxis stroke="#6b7280" tickFormatter={formatGP} />
               <Tooltip
                 contentStyle={{ background: '#1a1f35', border: '1px solid #2d3748', borderRadius: 8 }}
-                formatter={(v) => [formatGP(v) + ' GP']}
+                formatter={(v, name) => [formatGP(v) + ' GP', name === 'profit' ? 'Cumulative' : name]}
+                labelFormatter={(idx) => {
+                  const p = profitHistory[idx - 1];
+                  return p ? `${p.item} (${p.date}) — ${formatGP(p.flip_profit)} GP` : '';
+                }}
               />
-              <Line type="monotone" dataKey="cumulative_profit" stroke="#10b981" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="profit" stroke="#10b981" strokeWidth={2} dot={false} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -73,33 +121,49 @@ export default function Performance() {
       {/* Item Performance */}
       {itemPerf.length > 0 && (
         <div className="card">
-          <h3 style={{ fontSize: 14, marginBottom: 16 }}>Item Performance</h3>
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Item</th>
-                <th>Flips</th>
-                <th>Win Rate</th>
-                <th>Total Profit</th>
-                <th>Avg Profit</th>
-                <th>Avg Duration</th>
-              </tr>
-            </thead>
-            <tbody>
-              {itemPerf.map((item, i) => (
-                <tr key={i}>
-                  <td style={{ fontWeight: 500 }}>{item.item_name}</td>
-                  <td>{item.flip_count}</td>
-                  <td>{(item.win_rate || 0).toFixed(0)}%</td>
-                  <td className={item.total_profit >= 0 ? 'text-green' : 'text-red'}>
-                    {formatGP(item.total_profit)}
-                  </td>
-                  <td className="gp">{formatGP(item.avg_profit)}</td>
-                  <td className="text-muted">{item.avg_duration_min?.toFixed(0) || '?'}min</td>
+          <h3 style={{ fontSize: 14, marginBottom: 16 }}>Performance by Item</h3>
+          <div style={{ overflowX: 'auto' }}>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Item</th>
+                  <th>Flips</th>
+                  <th>Win Rate</th>
+                  <th>Total Profit</th>
+                  <th>Avg Profit</th>
+                  <th>Avg Duration</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {itemPerf.map((item, i) => (
+                  <tr key={i}>
+                    <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {item.item_id > 0 && (
+                        <img
+                          src={`https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${item.item_id}`}
+                          alt="" width={24} height={24}
+                          style={{ imageRendering: 'pixelated' }}
+                          onError={e => { e.target.style.display = 'none'; }}
+                        />
+                      )}
+                      {item.item_name}
+                    </td>
+                    <td>{item.flip_count}</td>
+                    <td>
+                      <span className={`badge ${item.win_rate >= 60 ? 'badge-green' : item.win_rate >= 40 ? 'badge-yellow' : 'badge-red'}`}>
+                        {(item.win_rate || 0).toFixed(0)}%
+                      </span>
+                    </td>
+                    <td className={item.total_profit >= 0 ? 'text-green' : 'text-red'}>
+                      {formatGP(item.total_profit)}
+                    </td>
+                    <td className="gp">{formatGP(item.avg_profit)}</td>
+                    <td className="text-muted">{item.avg_duration_min?.toFixed(0) || '—'}min</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>

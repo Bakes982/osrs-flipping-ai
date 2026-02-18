@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, Briefcase, BarChart3,
-  Brain, Settings, LogOut, Bell,
+  Brain, Settings, LogOut, Bell, Upload,
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
@@ -12,6 +12,7 @@ import Performance from './pages/Performance';
 import ModelDashboard from './pages/ModelDashboard';
 import Alerts from './pages/Alerts';
 import SettingsPage from './pages/Settings';
+import Import from './pages/Import';
 import Login from './pages/Login';
 import { createPriceSocket, api, clearToken } from './api/client';
 import './App.css';
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { path: '/alerts', label: 'Alerts', icon: Bell },
   { path: '/portfolio', label: 'Portfolio', icon: Briefcase },
   { path: '/performance', label: 'Performance', icon: BarChart3 },
+  { path: '/import', label: 'Import', icon: Upload },
   { path: '/models', label: 'ML Models', icon: Brain },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
@@ -144,6 +146,7 @@ export default function App() {
             <Route path="/portfolio" element={<Portfolio prices={livePrices} />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/performance" element={<Performance />} />
+            <Route path="/import" element={<Import />} />
             <Route path="/models" element={<ModelDashboard />} />
             <Route path="/settings" element={<SettingsPage />} />
           </Routes>

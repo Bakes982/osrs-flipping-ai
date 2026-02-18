@@ -50,13 +50,13 @@ export default function Dashboard({ prices }) {
           <div className="card-value text-green">{formatGP(portfolio?.cash || 0)}</div>
         </div>
         <div className="card">
-          <div className="card-title">Total Profit (24h)</div>
+          <div className="card-title">Total Profit</div>
           <div className={`card-value ${(perf?.total_profit || 0) >= 0 ? 'text-green' : 'text-red'}`}>
             {formatGP(perf?.total_profit || 0)}
           </div>
         </div>
         <div className="card">
-          <div className="card-title">Flips Today</div>
+          <div className="card-title">Completed Flips</div>
           <div className="card-value">{perf?.total_flips || 0}</div>
         </div>
         <div className="card">
