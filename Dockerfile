@@ -22,4 +22,4 @@ COPY user_config.py .
 
 EXPOSE 8001
 
-CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["python", "-c", "import os; port = os.environ.get('PORT', '8001'); os.execvp('uvicorn', ['uvicorn', 'backend.app:app', '--host', '0.0.0.0', '--port', port])"]
