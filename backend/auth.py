@@ -208,7 +208,17 @@ async def callback(code: str):
 
 @router.get("/me")
 async def me(request: Request):
-    """Return the current logged-in user, or 401 if not authenticated."""
+    """Return the current logged-in user, or 401 if not authenticated.
+    
+    When Discord OAuth is not configured, return an anonymous user so the
+    frontend can load without requiring login.
+    """
+    if not is_configured():
+        return {
+            "id": "anonymous",
+            "username": "Player",
+            "avatar": None,
+        }
     user = get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated.")
