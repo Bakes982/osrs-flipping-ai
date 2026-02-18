@@ -185,6 +185,9 @@ export const api = {
   sendTop5Now() {
     return fetchJSON('/alerts/send-top5', { method: 'POST' });
   },
+  getSendTop5Status() {
+    return fetchJSON('/alerts/send-top5/status');
+  },
   testWebhook() {
     return fetchJSON('/alerts/test-webhook', { method: 'POST' });
   },

@@ -59,13 +59,31 @@ export default function SettingsPage() {
   const sendTop5 = async () => {
     setSending(true);
     try {
-      const res = await api.sendTop5Now();
-      showMsg(`✅ Sent ${res.items_sent} opportunities to Discord!`, 4000);
+      await api.sendTop5Now();
+      showMsg('⏳ Scanning & generating charts… this takes ~1-2 min', 6000);
+      // Poll for completion
+      const poll = setInterval(async () => {
+        try {
+          const s = await api.getSendTop5Status();
+          if (s.status === 'sending') {
+            showMsg('📤 Sending to Discord…', 3000);
+          } else if (s.status === 'done') {
+            clearInterval(poll);
+            setSending(false);
+            showMsg(`✅ Sent ${s.items_sent} opportunities to Discord!`, 5000);
+          } else if (s.status === 'error') {
+            clearInterval(poll);
+            setSending(false);
+            showMsg('❌ ' + (s.error || 'Send failed'), 5000);
+          }
+        } catch { /* keep polling */ }
+      }, 3000);
+      // Safety timeout after 5 minutes
+      setTimeout(() => { clearInterval(poll); setSending(false); }, 300000);
     } catch (e) {
-      const detail = e.message || 'Unknown error';
-      showMsg('Error: ' + detail, 4000);
+      setSending(false);
+      showMsg('Error: ' + (e.message || 'Unknown error'), 4000);
     }
-    setSending(false);
   };
 
   const saveRisk = async (value) => {

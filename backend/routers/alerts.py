@@ -167,10 +167,10 @@ async def delete_price_target(item_id: int, direction: Optional[str] = Query(Non
 
 @router.post("/send-top5")
 async def send_top5_now():
-    """Manually trigger a Discord notification with the current top 5 opportunities.
+    """Kick off a Discord notification with the current top 5 opportunities.
 
-    Uses the webhook URL stored in settings (``discord_webhook``).
-    Returns a summary of what was sent.
+    Returns immediately — scanning + chart generation + posting runs in
+    the background.  Poll GET /api/alerts/send-top5/status to track progress.
     """
     from backend.tasks import get_opportunity_notifier
     notifier = get_opportunity_notifier()
@@ -178,6 +178,17 @@ async def send_top5_now():
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
     return result
+
+
+@router.get("/send-top5/status")
+async def send_top5_status():
+    """Poll the status of the background send-top5 job.
+
+    Returns status: idle | scanning | sending | done | error
+    """
+    from backend.tasks import get_opportunity_notifier
+    notifier = get_opportunity_notifier()
+    return notifier.get_send_status()
 
 
 @router.post("/test-webhook")

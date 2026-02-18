@@ -864,34 +864,72 @@ class OpportunityNotifier:
         else:
             logger.warning("OpportunityNotifier: sending failed")
 
-    async def send_now(self) -> dict:
-        """Force-send immediately (called by the manual trigger endpoint).
+    # Status tracking for the frontend
+    _send_status: str = "idle"  # idle | scanning | sending | done | error
+    _send_result: Optional[dict] = None
 
-        Returns a summary dict.
+    async def send_now(self) -> dict:
+        """Kick off a top-5 digest in the background (non-blocking).
+
+        Returns immediately with {"ok": True, "status": "scanning"}.
+        The frontend can poll /api/alerts/send-top5/status for progress.
         """
+        if self._send_status in ("scanning", "sending"):
+            return {"ok": True, "status": self._send_status, "message": "Already in progress"}
+
         webhook_url = await self._get_webhook_url()
         if not webhook_url:
             return {"ok": False, "error": "Discord webhook not configured or disabled"}
 
-        top = await self._get_top_opportunities(limit=5)
-        if not top:
-            return {"ok": False, "error": "No qualifying opportunities found"}
+        # Launch background work
+        self._send_status = "scanning"
+        self._send_result = None
+        asyncio.create_task(self._do_send_background(webhook_url))
+        return {"ok": True, "status": "scanning", "message": "Scanning for opportunities…"}
 
-        from backend.discord_notifier import DiscordOpportunityNotifier
-        notifier = DiscordOpportunityNotifier(webhook_url)
-        ok = await asyncio.to_thread(
-            notifier.send_top_opportunities, top, max_items=5, include_charts=True
-        )
-        if ok:
-            self._last_sent = datetime.utcnow()
-        return {
-            "ok": ok,
-            "items_sent": len(top) if ok else 0,
-            "items": [
-                {"name": o["name"], "score": o["flip_score"], "profit": o["potential_profit"]}
-                for o in top
-            ],
+    async def _do_send_background(self, webhook_url: str):
+        """Heavy lifting: scan → score → chart → Discord. Runs as a task."""
+        try:
+            top = await self._get_top_opportunities(limit=5)
+            if not top:
+                self._send_status = "error"
+                self._send_result = {"ok": False, "error": "No qualifying opportunities found"}
+                return
+
+            self._send_status = "sending"
+            from backend.discord_notifier import DiscordOpportunityNotifier
+            notifier = DiscordOpportunityNotifier(webhook_url)
+            ok = await asyncio.to_thread(
+                notifier.send_top_opportunities, top, max_items=5, include_charts=True
+            )
+            if ok:
+                self._last_sent = datetime.utcnow()
+            self._send_status = "done" if ok else "error"
+            self._send_result = {
+                "ok": ok,
+                "items_sent": len(top) if ok else 0,
+                "items": [
+                    {"name": o["name"], "score": o["flip_score"], "profit": o["potential_profit"]}
+                    for o in top
+                ],
+            }
+        except Exception as e:
+            logger.error("OpportunityNotifier background send error: %s", e)
+            self._send_status = "error"
+            self._send_result = {"ok": False, "error": str(e)}
+
+    def get_send_status(self) -> dict:
+        """Return current send status for polling."""
+        result = {
+            "status": self._send_status,
+            "last_sent": self._last_sent.isoformat() if self._last_sent else None,
         }
+        if self._send_result:
+            result.update(self._send_result)
+        # Auto-reset to idle after frontend reads a terminal state
+        if self._send_status in ("done", "error"):
+            self._send_status = "idle"
+        return result
 
     async def run_forever(self):
         logger.info("OpportunityNotifier started (default interval: %dm)", self.DEFAULT_INTERVAL_MIN)
