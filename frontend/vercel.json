@@ -4,5 +4,9 @@
   "framework": "vite",
   "rewrites": [
     { "source": "/(.*)", "destination": "/index.html" }
-  ]
+  ],
+  "env": {
+    "VITE_API_URL": "https://osrs-flipping-ai.onrender.com/api",
+    "VITE_WS_URL": "wss://osrs-flipping-ai.onrender.com/ws"
+  }
 }

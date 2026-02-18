@@ -20,7 +20,7 @@ function scoreColor(score) {
 
 export default function Dashboard({ prices }) {
   const nav = useNavigate();
-  const { data: raw, loading: oppsLoading, reload: reloadOpps } = useApi(
+  const { data: raw, loading: oppsLoading, error: oppsError, reload: reloadOpps } = useApi(
     () => api.getOpportunities({ limit: 10, sort_by: 'total_score' }),
     [],
     30000,
@@ -78,6 +78,13 @@ export default function Dashboard({ prices }) {
 
         {oppsLoading ? (
           <div className="loading">Loading opportunities...</div>
+        ) : oppsError ? (
+          <div className="empty" style={{ color: '#ef4444' }}>
+            <strong>Backend connection failed:</strong> {oppsError}<br />
+            <small style={{ color: '#94a3b8' }}>
+              Render free tier can take 30-60s to cold-start. Try refreshing in a minute.
+            </small>
+          </div>
         ) : !opps?.length ? (
           <div className="empty">No opportunities found. Backend may be starting up.</div>
         ) : (

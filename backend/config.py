@@ -41,7 +41,8 @@ PORT = int(os.environ.get("PORT", "8001"))
 MODELS_DIR = os.environ.get("MODELS_DIR", "models")
 
 # ---------------------------------------------------------------------------
-# CORS — use wildcard so Starlette allows WebSocket upgrades from any origin.
-# Auth is enforced via Bearer tokens, not origin checks.
+# CORS — Starlette mirrors the request Origin when credentials=True + "*",
+# so this effectively allows any origin while still supporting Bearer tokens
+# in cross-domain preflight requests.
 # ---------------------------------------------------------------------------
 CORS_ORIGINS = ["*"]

@@ -468,7 +468,17 @@ def init_db():
     """Initialize MongoDB connection, create indexes."""
     global _client, _wrapper
 
-    _client = MongoClient(MONGODB_URL)
+    try:
+        _client = MongoClient(
+            MONGODB_URL,
+            serverSelectionTimeoutMS=10_000,  # fail fast if unreachable
+        )
+        # Force a connection test so errors surface at startup
+        _client.admin.command("ping")
+    except Exception as exc:
+        logger.error("MongoDB connection FAILED (%s). Is MONGODB_URL set correctly?", exc)
+        raise
+
     db = _client[DATABASE_NAME]
     _wrapper = Database(db)
 

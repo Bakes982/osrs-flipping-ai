@@ -72,13 +72,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS -- allow the configured frontend origin + dev localhost
+# CORS -- allow the configured frontend origin + dev localhost.
+# allow_credentials=True is needed so the browser's preflight (OPTIONS)
+# permits the Authorization header on requests from different origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -140,6 +143,8 @@ async def health():
         "status": "ok",
         "version": "2.0.0",
         "websocket_clients": manager.client_count,
+        "frontend_url": config.FRONTEND_URL,
+        "cors_origins": config.CORS_ORIGINS,
     }
 
 
