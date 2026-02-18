@@ -3,7 +3,7 @@
 const API_BASE = import.meta.env.VITE_API_URL
   || (window.location.port === '5173'
     ? 'http://localhost:8001/api'
-    : '/api');  // fallback — should be overridden by VITE_API_URL in production
+    : 'https://osrs-flipping-ai-backend-production.up.railway.app/api');
 
 // WebSocket base: derive from API_BASE
 const _apiUrl = new URL(API_BASE, window.location.origin);

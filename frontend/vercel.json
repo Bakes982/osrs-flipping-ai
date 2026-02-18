@@ -6,7 +6,7 @@
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "env": {
-    "VITE_API_URL": "https://RAILWAY_URL_HERE/api",
-    "VITE_WS_URL": "wss://RAILWAY_URL_HERE/ws"
+    "VITE_API_URL": "https://osrs-flipping-ai-backend-production.up.railway.app/api",
+    "VITE_WS_URL": "wss://osrs-flipping-ai-backend-production.up.railway.app/ws"
   }
 }
