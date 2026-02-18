@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Tuple
 
 from backend.database import (
-    get_db, SessionLocal, PriceSnapshot, FlipHistory,
+    get_db, PriceSnapshot, FlipHistory,
     get_price_history, get_item_flips,
 )
 from backend.smart_pricer import SmartPricer, PriceRecommendation, Trend, GE_TAX_RATE, GE_TAX_CAP

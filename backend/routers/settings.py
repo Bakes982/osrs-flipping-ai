@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
 
-from backend.database import get_db, Setting, get_setting, set_setting
+from backend.database import get_db, get_setting, set_setting
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -38,15 +38,13 @@ DEFAULTS: Dict[str, Any] = {
 async def get_all_settings():
     """Return every stored setting, merged with defaults for any missing keys."""
     db = get_db()
-    try:
-        rows = db.query(Setting).all()
-        stored = {row.key: row.value for row in rows}
-
-        # Merge defaults under stored values
-        merged = {**DEFAULTS, **stored}
-        return merged
-    finally:
-        db.close()
+    stored = {}
+    for key in DEFAULTS:
+        val = get_setting(db, key, default=None)
+        if val is not None:
+            stored[key] = val
+    merged = {**DEFAULTS, **stored}
+    return merged
 
 
 @router.post("")
@@ -65,10 +63,7 @@ async def update_settings(body: SettingUpdate):
         raise HTTPException(status_code=400, detail="No settings provided")
 
     db = get_db()
-    try:
-        for key, value in body.settings.items():
-            set_setting(db, key, value)
+    for key, value in body.settings.items():
+        set_setting(db, key, value)
 
-        return {"status": "ok", "updated": list(body.settings.keys())}
-    finally:
-        db.close()
+    return {"status": "ok", "updated": list(body.settings.keys())}
