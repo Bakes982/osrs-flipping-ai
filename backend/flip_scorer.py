@@ -499,17 +499,20 @@ def score_opportunities(
 
             # Build a synthetic snapshot from the live scan data so that
             # score_item doesn't veto items that simply lack DB history.
+            # NOTE: scan dict uses "instant_buy" = buyer's bid (low),
+            # but PriceSnapshot uses "instant_buy" = insta-buy price (high).
+            # We must swap them.
             now = datetime.utcnow()
             ts = int(time.time())
             snap = PriceSnapshot(
                 item_id=item_id,
                 timestamp=now,
-                instant_buy=item.get("instant_buy") or item.get("buy_at"),
-                instant_sell=item.get("instant_sell") or item.get("sell_at"),
+                instant_buy=item.get("instant_sell") or item.get("sell_at"),
+                instant_sell=item.get("instant_buy") or item.get("buy_at"),
                 buy_time=ts,
                 sell_time=ts,
-                avg_buy=item.get("buy_at"),
-                avg_sell=item.get("sell_at"),
+                avg_buy=item.get("sell_at"),
+                avg_sell=item.get("buy_at"),
                 buy_volume=item.get("high_volume", 0),
                 sell_volume=item.get("low_volume", 0),
             )
