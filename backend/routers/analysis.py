@@ -94,6 +94,86 @@ def _fetch_wiki_item_name(item_id: int) -> str:
     return f"Item {item_id}"
 
 
+def _fetch_wiki_timeseries(item_id: int, timestep: str = "1h"):
+    """Fetch historical timeseries data from the OSRS Wiki API.
+
+    Returns up to 365 data points with avgHighPrice, avgLowPrice, volumes.
+    Valid timesteps: 5m, 1h, 6h, 24h
+    """
+    import requests
+
+    valid = {"5m", "1h", "6h", "24h"}
+    if timestep not in valid:
+        timestep = "1h"
+
+    try:
+        url = f"https://prices.runescape.wiki/api/v1/osrs/timeseries?timestep={timestep}&id={item_id}"
+        headers = {"User-Agent": "osrs-flipping-ai"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/prices/{item_id}/history  –  GE price history from Wiki API
+# ---------------------------------------------------------------------------
+
+VALID_TIMESTEPS = ["5m", "1h", "6h", "24h"]
+
+
+@router.get("/api/prices/{item_id}/history")
+async def get_price_history_endpoint(
+    item_id: int,
+    timestep: str = Query("1h", description="Timestep: 5m, 1h, 6h, 24h"),
+):
+    """Return GE price history for an item from the OSRS Wiki timeseries API.
+
+    This is global Grand Exchange data — not user-specific trades.
+    """
+    if timestep not in VALID_TIMESTEPS:
+        raise HTTPException(400, f"Invalid timestep. Choose from: {VALID_TIMESTEPS}")
+
+    def _sync():
+        raw = _fetch_wiki_timeseries(item_id, timestep)
+        if not raw:
+            return None
+
+        # Get item name
+        item_name = _fetch_wiki_item_name(item_id)
+
+        # Clean up data points — filter out entries where both prices are null
+        points = []
+        for pt in raw:
+            high = pt.get("avgHighPrice")
+            low = pt.get("avgLowPrice")
+            if high is None and low is None:
+                continue
+            points.append({
+                "timestamp": pt["timestamp"],
+                "high": high,      # avg instant-buy price for this period
+                "low": low,        # avg instant-sell price for this period
+                "highVol": pt.get("highPriceVolume", 0),
+                "lowVol": pt.get("lowPriceVolume", 0),
+            })
+
+        if not points:
+            return None
+
+        return {
+            "item_id": item_id,
+            "item_name": item_name,
+            "timestep": timestep,
+            "data": points,
+        }
+
+    result = await asyncio.to_thread(_sync)
+    if result is None:
+        raise HTTPException(404, f"No price history for item {item_id}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # GET /api/predict/{item_id}
 # ---------------------------------------------------------------------------

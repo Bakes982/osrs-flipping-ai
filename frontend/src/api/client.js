@@ -117,6 +117,11 @@ export const api = {
     return fetchJSON(`/predict/${itemId}${qs}`);
   },
 
+  // Price History (GE timeseries from Wiki API)
+  getPriceHistory(itemId, timestep = '1h') {
+    return fetchJSON(`/prices/${itemId}/history?timestep=${timestep}`);
+  },
+
   // Portfolio
   getPortfolio() {
     return fetchJSON('/portfolio');

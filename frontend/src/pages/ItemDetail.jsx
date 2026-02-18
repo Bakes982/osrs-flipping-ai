@@ -1,9 +1,15 @@
 import { useParams, useNavigate } from 'react-router-dom';
 import { useState } from 'react';
-import { ArrowLeft, TrendingUp, TrendingDown, Minus } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid, Legend } from 'recharts';
+import { ArrowLeft, TrendingUp, TrendingDown, Minus, BarChart3 } from 'lucide-react';
+import {
+  LineChart, Line, BarChart, Bar, Area,
+  XAxis, YAxis, Tooltip, ResponsiveContainer,
+  ReferenceLine, CartesianGrid, Legend, ComposedChart,
+} from 'recharts';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
+
+/* ── Helpers ─────────────────────────────────────────────────────────────── */
 
 function formatGP(n) {
   if (n == null) return '—';
@@ -13,7 +19,20 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
+function formatTime(ts, timestep) {
+  const d = new Date(ts * 1000);
+  if (timestep === '5m') return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (timestep === '1h') return d.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
 const HORIZONS = ['1m', '5m', '30m', '2h', '8h', '24h'];
+const GE_TIMESTEPS = [
+  { key: '5m',  label: '30h',  desc: '5-min intervals' },
+  { key: '1h',  label: '15d',  desc: '1-hour intervals' },
+  { key: '6h',  label: '3mo',  desc: '6-hour intervals' },
+  { key: '24h', label: '1yr',  desc: 'Daily intervals' },
+];
 
 function TrendIcon({ trend }) {
   if (!trend) return <Minus size={14} />;
@@ -22,11 +41,45 @@ function TrendIcon({ trend }) {
   return <Minus size={14} style={{ color: 'var(--cyan)' }} />;
 }
 
-export default function ItemDetail({ prices }) {
+/* ── Custom Tooltip ──────────────────────────────────────────────────────── */
+
+function PriceTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+
+  return (
+    <div style={{
+      background: '#1a1f35', border: '1px solid #2d3748', borderRadius: 8,
+      padding: '10px 14px', fontSize: 12, lineHeight: 1.6,
+    }}>
+      <div style={{ color: '#9ca3af', marginBottom: 4 }}>
+        {new Date(d.timestamp * 1000).toLocaleString()}
+      </div>
+      {d.high != null && <div><span style={{ color: '#ef4444' }}>Buy (High): </span><span style={{ color: '#f9fafb' }}>{formatGP(d.high)} GP</span></div>}
+      {d.low != null && <div><span style={{ color: '#10b981' }}>Sell (Low): </span><span style={{ color: '#f9fafb' }}>{formatGP(d.low)} GP</span></div>}
+      {d.high != null && d.low != null && (
+        <div><span style={{ color: '#06b6d4' }}>Spread: </span><span style={{ color: '#f9fafb' }}>{formatGP(d.high - d.low)} GP ({((d.high - d.low) / d.low * 100).toFixed(2)}%)</span></div>
+      )}
+      {(d.highVol > 0 || d.lowVol > 0) && (
+        <div style={{ marginTop: 4, borderTop: '1px solid #374151', paddingTop: 4 }}>
+          <div><span style={{ color: '#9ca3af' }}>Buy vol: </span>{d.highVol ?? 0}</div>
+          <div><span style={{ color: '#9ca3af' }}>Sell vol: </span>{d.lowVol ?? 0}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Main Component ──────────────────────────────────────────────────────── */
+
+export default function ItemDetail() {
   const { itemId } = useParams();
   const nav = useNavigate();
   const [horizon, setHorizon] = useState('5m');
+  const [geTimestep, setGeTimestep] = useState('1h');
 
+  // Fetch item detail, predictions, and GE price history
   const { data: detail, loading } = useApi(
     () => api.getOpportunityDetail(itemId),
     [itemId],
@@ -36,6 +89,11 @@ export default function ItemDetail({ prices }) {
     () => api.getPredictions(itemId),
     [itemId],
     60000,
+  );
+  const { data: priceHistory, loading: histLoading } = useApi(
+    () => api.getPriceHistory(itemId, geTimestep),
+    [itemId, geTimestep],
+    120000,
   );
 
   if (loading) return <div className="loading">Loading item analysis...</div>;
@@ -48,17 +106,30 @@ export default function ItemDetail({ prices }) {
   const hist = detail.history || {};
   const vwap = detail.vwap || {};
   const boll = detail.bollinger || {};
-  const pred = predictions?.predictions?.[horizon];
   const suggested = predictions?.suggested_action;
   const posSize = detail.position_sizing;
 
-  // Build VWAP chart data from available VWAP values
-  const vwapData = [
-    { period: '1m', vwap: vwap['1m'] },
-    { period: '5m', vwap: vwap['5m'] },
-    { period: '30m', vwap: vwap['30m'] },
-    { period: '2h', vwap: vwap['2h'] },
-  ].filter(d => d.vwap != null);
+  // Format GE history chart data
+  const chartData = (priceHistory?.data || []).map(pt => ({
+    ...pt,
+    spread: pt.high != null && pt.low != null ? pt.high - pt.low : null,
+    totalVol: (pt.highVol || 0) + (pt.lowVol || 0),
+    label: formatTime(pt.timestamp, geTimestep),
+  }));
+
+  // Compute stats from chart data
+  const lastPrice = chartData.length > 0 ? chartData[chartData.length - 1] : null;
+  const firstPrice = chartData.length > 0 ? chartData[0] : null;
+  const priceChange = (lastPrice?.high && firstPrice?.high)
+    ? lastPrice.high - firstPrice.high : null;
+  const pctChange = (priceChange != null && firstPrice?.high)
+    ? (priceChange / firstPrice.high * 100) : null;
+  const avgSpread = chartData.length > 0
+    ? chartData.filter(d => d.spread != null).reduce((s, d) => s + d.spread, 0) / (chartData.filter(d => d.spread != null).length || 1)
+    : null;
+  const totalVol = chartData.reduce((s, d) => s + d.totalVol, 0);
+  const maxHigh = chartData.reduce((m, d) => d.high != null ? Math.max(m, d.high) : m, 0);
+  const minLow = chartData.reduce((m, d) => d.low != null ? Math.min(m, d.low) : m, Infinity);
 
   // Build flip history chart
   const flipChart = (detail.recent_flips || []).map((f, i) => ({
@@ -86,6 +157,11 @@ export default function ItemDetail({ prices }) {
             <p className="page-subtitle">
               ID: {itemId}
               {rec.trend && <> — <TrendIcon trend={rec.trend} /> {rec.trend}</>}
+              {pctChange != null && (
+                <span style={{ marginLeft: 8, color: pctChange >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {pctChange >= 0 ? '▲' : '▼'} {Math.abs(pctChange).toFixed(2)}%
+                </span>
+              )}
             </p>
           </div>
         </div>
@@ -102,13 +178,16 @@ export default function ItemDetail({ prices }) {
           <div className="card-value text-cyan">{formatGP(rec.recommended_sell || detail.current_buy)}</div>
         </div>
         <div className="card">
-          <div className="card-title">Profit</div>
-          <div className="card-value text-green">+{formatGP(rec.expected_profit)}</div>
+          <div className="card-title">Spread</div>
+          <div className="card-value">{formatGP(detail.current_buy && detail.current_sell ? detail.current_buy - detail.current_sell : null)}</div>
           <div className="text-muted" style={{ fontSize: 11 }}>Tax: {formatGP(rec.tax)}</div>
         </div>
         <div className="card">
-          <div className="card-title">ROI</div>
-          <div className="card-value">{rec.expected_profit_pct != null ? rec.expected_profit_pct.toFixed(2) + '%' : '—'}</div>
+          <div className="card-title">Profit</div>
+          <div className="card-value" style={{ color: rec.expected_profit >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {rec.expected_profit >= 0 ? '+' : ''}{formatGP(rec.expected_profit)}
+          </div>
+          <div className="text-muted" style={{ fontSize: 11 }}>{rec.expected_profit_pct != null ? rec.expected_profit_pct.toFixed(2) + '% ROI' : ''}</div>
         </div>
         <div className="card">
           <div className="card-title">Volume (5m)</div>
@@ -118,6 +197,148 @@ export default function ItemDetail({ prices }) {
           <div className="card-title">Score</div>
           <div className="card-value">{fs.total ? `${fs.total}/100` : '—'}</div>
         </div>
+      </div>
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          GRAND EXCHANGE PRICE HISTORY
+          ═══════════════════════════════════════════════════════════════════ */}
+      <div className="card" style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <BarChart3 size={16} style={{ color: 'var(--cyan)' }} />
+            <h3 style={{ fontSize: 14, margin: 0 }}>GE Price History</h3>
+          </div>
+          <div className="horizon-tabs">
+            {GE_TIMESTEPS.map(ts => (
+              <button
+                key={ts.key}
+                className={`horizon-tab ${geTimestep === ts.key ? 'active' : ''}`}
+                onClick={() => setGeTimestep(ts.key)}
+                title={ts.desc}
+              >
+                {ts.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Stats bar */}
+        {chartData.length > 0 && (
+          <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap', marginBottom: 16, fontSize: 12 }}>
+            <div><span className="text-muted">Period High: </span><span className="text-red">{formatGP(maxHigh)}</span></div>
+            <div><span className="text-muted">Period Low: </span><span className="text-green">{formatGP(minLow === Infinity ? null : minLow)}</span></div>
+            <div><span className="text-muted">Avg Spread: </span><span className="text-cyan">{formatGP(avgSpread)}</span></div>
+            <div><span className="text-muted">Total Volume: </span><span>{totalVol.toLocaleString()}</span></div>
+            {priceChange != null && (
+              <div>
+                <span className="text-muted">Change: </span>
+                <span style={{ color: priceChange >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {priceChange >= 0 ? '+' : ''}{formatGP(priceChange)}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {histLoading ? (
+          <div className="loading" style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            Loading GE history...
+          </div>
+        ) : chartData.length > 0 ? (
+          <>
+            {/* Price chart */}
+            <ResponsiveContainer width="100%" height={320}>
+              <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 10, bottom: 5 }}>
+                <defs>
+                  <linearGradient id="spreadFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#06b6d4" stopOpacity={0.15} />
+                    <stop offset="100%" stopColor="#06b6d4" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(107,114,128,0.15)" />
+                <XAxis
+                  dataKey="label"
+                  stroke="#6b7280"
+                  fontSize={10}
+                  interval="preserveStartEnd"
+                  tick={{ fill: '#6b7280' }}
+                />
+                <YAxis
+                  stroke="#6b7280"
+                  fontSize={10}
+                  tickFormatter={formatGP}
+                  domain={['auto', 'auto']}
+                  tick={{ fill: '#6b7280' }}
+                />
+                <Tooltip content={<PriceTooltip />} />
+                <Legend
+                  wrapperStyle={{ fontSize: 11, paddingTop: 8 }}
+                  iconType="line"
+                />
+
+                {/* Spread area between high and low */}
+                <Area
+                  type="monotone"
+                  dataKey="high"
+                  stroke="none"
+                  fill="url(#spreadFill)"
+                  name="Spread Zone"
+                  connectNulls
+                  legendType="none"
+                />
+
+                {/* Buy price line (instant-buy / high) */}
+                <Line
+                  type="monotone"
+                  dataKey="high"
+                  stroke="#ef4444"
+                  strokeWidth={2}
+                  dot={false}
+                  name="Buy (High)"
+                  connectNulls
+                />
+
+                {/* Sell price line (instant-sell / low) */}
+                <Line
+                  type="monotone"
+                  dataKey="low"
+                  stroke="#10b981"
+                  strokeWidth={2}
+                  dot={false}
+                  name="Sell (Low)"
+                  connectNulls
+                />
+
+                {/* Bollinger bands if available */}
+                {boll.upper && <ReferenceLine y={boll.upper} stroke="rgba(239,68,68,0.3)" strokeDasharray="5 5" />}
+                {boll.lower && <ReferenceLine y={boll.lower} stroke="rgba(16,185,129,0.3)" strokeDasharray="5 5" />}
+              </ComposedChart>
+            </ResponsiveContainer>
+
+            {/* Volume chart */}
+            <div style={{ marginTop: 8 }}>
+              <div className="text-muted" style={{ fontSize: 11, marginBottom: 4 }}>Volume</div>
+              <ResponsiveContainer width="100%" height={100}>
+                <BarChart data={chartData} margin={{ top: 0, right: 10, left: 10, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(107,114,128,0.1)" />
+                  <XAxis dataKey="label" hide />
+                  <YAxis stroke="#6b7280" fontSize={10} tick={{ fill: '#6b7280' }} />
+                  <Tooltip
+                    contentStyle={{ background: '#1a1f35', border: '1px solid #2d3748', borderRadius: 8, fontSize: 12 }}
+                    formatter={(v, name) => [v.toLocaleString(), name === 'highVol' ? 'Buy Vol' : 'Sell Vol']}
+                    labelFormatter={(_, payload) => payload?.[0]?.payload ? new Date(payload[0].payload.timestamp * 1000).toLocaleString() : ''}
+                  />
+                  <Bar dataKey="highVol" fill="rgba(239,68,68,0.5)" stackId="vol" name="Buy Vol" />
+                  <Bar dataKey="lowVol" fill="rgba(16,185,129,0.5)" stackId="vol" name="Sell Vol" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </>
+        ) : (
+          <div className="empty" style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            No GE price history available for this timestep.
+          </div>
+        )}
       </div>
 
       {/* Score Breakdown */}
@@ -151,10 +372,10 @@ export default function ItemDetail({ prices }) {
       )}
 
       {/* VWAP & Bollinger */}
-      {(vwapData.length > 0 || boll.upper) && (
+      {(vwap['1m'] || vwap['5m'] || vwap['30m'] || vwap['2h'] || boll.upper) && (
         <div className="card" style={{ marginBottom: 24 }}>
           <h3 style={{ fontSize: 14, marginBottom: 16 }}>Technical Indicators</h3>
-          <div className="stats-grid" style={{ marginBottom: 16 }}>
+          <div className="stats-grid" style={{ marginBottom: boll.upper ? 16 : 0 }}>
             {vwap['1m'] && <div><div className="card-title">VWAP 1m</div><div style={{ fontSize: 16 }}>{formatGP(vwap['1m'])}</div></div>}
             {vwap['5m'] && <div><div className="card-title">VWAP 5m</div><div style={{ fontSize: 16 }}>{formatGP(vwap['5m'])}</div></div>}
             {vwap['30m'] && <div><div className="card-title">VWAP 30m</div><div style={{ fontSize: 16 }}>{formatGP(vwap['30m'])}</div></div>}
@@ -180,31 +401,10 @@ export default function ItemDetail({ prices }) {
         </div>
       )}
 
-      {/* VWAP Chart */}
-      {vwapData.length > 1 && (
-        <div className="card" style={{ marginBottom: 24 }}>
-          <h3 style={{ fontSize: 14, marginBottom: 16 }}>VWAP Trend</h3>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={vwapData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(107,114,128,0.2)" />
-              <XAxis dataKey="period" stroke="#6b7280" />
-              <YAxis stroke="#6b7280" tickFormatter={formatGP} domain={['auto', 'auto']} />
-              <Tooltip
-                contentStyle={{ background: '#1a1f35', border: '1px solid #2d3748', borderRadius: 8 }}
-                formatter={(v) => [formatGP(v) + ' GP', 'VWAP']}
-              />
-              <Line type="monotone" dataKey="vwap" stroke="#06b6d4" dot strokeWidth={2} />
-              {boll.upper && <ReferenceLine y={boll.upper} stroke="rgba(239,68,68,0.5)" strokeDasharray="5 5" label={{ value: 'BB Upper', fill: '#ef4444', fontSize: 10 }} />}
-              {boll.lower && <ReferenceLine y={boll.lower} stroke="rgba(16,185,129,0.5)" strokeDasharray="5 5" label={{ value: 'BB Lower', fill: '#10b981', fontSize: 10 }} />}
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-
       {/* Flip History Chart */}
       {flipChart.length > 0 && (
         <div className="card" style={{ marginBottom: 24 }}>
-          <h3 style={{ fontSize: 14, marginBottom: 16 }}>Recent Flip Performance</h3>
+          <h3 style={{ fontSize: 14, marginBottom: 16 }}>Your Flip Performance</h3>
           <ResponsiveContainer width="100%" height={220}>
             <LineChart data={flipChart}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(107,114,128,0.2)" />
@@ -300,6 +500,7 @@ export default function ItemDetail({ prices }) {
       {/* Suggested Action */}
       {suggested && (
         <div className="card" style={{
+          marginBottom: 24,
           borderColor: 'rgba(6,182,212,0.3)',
           background: 'linear-gradient(135deg, rgba(6,182,212,0.05), rgba(139,92,246,0.05))',
         }}>
@@ -334,7 +535,7 @@ export default function ItemDetail({ prices }) {
 
       {/* Historical Performance */}
       {hist.total_flips > 0 && (
-        <div className="card" style={{ marginTop: 24 }}>
+        <div className="card" style={{ marginBottom: 24 }}>
           <h3 style={{ fontSize: 14, marginBottom: 12 }}>Historical Performance</h3>
           <div className="stats-grid" style={{ marginBottom: 0 }}>
             <div><div className="card-title">Total Flips</div><div className="card-value">{hist.total_flips}</div></div>
@@ -346,9 +547,9 @@ export default function ItemDetail({ prices }) {
 
       {/* Recent Flips Table */}
       {detail.recent_flips?.length > 0 && (
-        <div className="card" style={{ marginTop: 24, padding: 0, overflow: 'auto' }}>
+        <div className="card" style={{ padding: 0, overflow: 'auto' }}>
           <div style={{ padding: '16px 16px 0' }}>
-            <h3 style={{ fontSize: 14 }}>Recent Flips</h3>
+            <h3 style={{ fontSize: 14 }}>Your Recent Flips</h3>
           </div>
           <table className="data-table">
             <thead>
