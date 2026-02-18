@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -7,15 +7,48 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
 
-  const handleSave = async (key, value) => {
+  // Local state for discord webhook (controlled inputs)
+  const [webhookUrl, setWebhookUrl] = useState('');
+  const [webhookEnabled, setWebhookEnabled] = useState(false);
+  const [riskTolerance, setRiskTolerance] = useState('MEDIUM');
+
+  // Sync local state when settings load
+  useEffect(() => {
+    if (settings) {
+      setWebhookUrl(settings.discord_webhook?.url || settings.discord_webhook_url || '');
+      setWebhookEnabled(settings.discord_webhook?.enabled ?? settings.discord_alerts_enabled ?? false);
+      setRiskTolerance(settings.risk_tolerance || 'MEDIUM');
+    }
+  }, [settings]);
+
+  const showMsg = (text, duration = 2500) => {
+    setMsg(text);
+    setTimeout(() => setMsg(''), duration);
+  };
+
+  const saveDiscord = async () => {
     setSaving(true);
     try {
-      await api.updateSettings({ [key]: value });
-      setMsg('Saved!');
-      setTimeout(() => setMsg(''), 2000);
+      await api.updateSettings({
+        discord_webhook: { url: webhookUrl, enabled: webhookEnabled },
+      });
+      showMsg('Discord settings saved!');
       reload();
     } catch (e) {
-      setMsg('Error: ' + e.message);
+      showMsg('Error: ' + e.message, 4000);
+    }
+    setSaving(false);
+  };
+
+  const saveRisk = async (value) => {
+    setRiskTolerance(value);
+    setSaving(true);
+    try {
+      await api.updateSettings({ risk_tolerance: value });
+      showMsg('Risk setting saved!');
+      reload();
+    } catch (e) {
+      showMsg('Error: ' + e.message, 4000);
     }
     setSaving(false);
   };
@@ -29,7 +62,7 @@ export default function SettingsPage() {
           <h2 className="page-title">Settings</h2>
           <p className="page-subtitle">Configure your flipping AI</p>
         </div>
-        {msg && <span className="badge badge-green">{msg}</span>}
+        {msg && <span className={`badge ${msg.startsWith('Error') ? 'badge-red' : 'badge-green'}`}>{msg}</span>}
       </div>
 
       <div className="card" style={{ marginBottom: 24 }}>
@@ -39,8 +72,10 @@ export default function SettingsPage() {
             Webhook URL
             <input
               type="password"
-              defaultValue={settings?.discord_webhook?.url || ''}
-              onBlur={e => handleSave('discord_webhook', { ...settings?.discord_webhook, url: e.target.value })}
+              value={webhookUrl}
+              onChange={e => setWebhookUrl(e.target.value)}
+              onBlur={saveDiscord}
+              placeholder="https://discord.com/api/webhooks/..."
               style={{
                 display: 'block', width: '100%', marginTop: 4, padding: '8px 12px',
                 background: 'var(--bg-secondary)', border: '1px solid var(--border)',
@@ -51,8 +86,19 @@ export default function SettingsPage() {
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
             <input
               type="checkbox"
-              defaultChecked={settings?.discord_webhook?.enabled}
-              onChange={e => handleSave('discord_webhook', { ...settings?.discord_webhook, enabled: e.target.checked })}
+              checked={webhookEnabled}
+              onChange={e => {
+                setWebhookEnabled(e.target.checked);
+                // Save immediately with current URL
+                setSaving(true);
+                api.updateSettings({
+                  discord_webhook: { url: webhookUrl, enabled: e.target.checked },
+                }).then(() => {
+                  showMsg('Discord settings saved!');
+                  reload();
+                }).catch(err => showMsg('Error: ' + err.message, 4000))
+                  .finally(() => setSaving(false));
+              }}
             />
             Enable Discord notifications
           </label>
@@ -64,8 +110,8 @@ export default function SettingsPage() {
         <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
           Risk Tolerance
           <select
-            defaultValue={settings?.risk_tolerance || 'MEDIUM'}
-            onChange={e => handleSave('risk_tolerance', e.target.value)}
+            value={riskTolerance}
+            onChange={e => saveRisk(e.target.value)}
             style={{
               display: 'block', marginTop: 4, padding: '8px 12px',
               background: 'var(--bg-secondary)', border: '1px solid var(--border)',
