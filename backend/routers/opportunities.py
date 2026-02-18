@@ -34,7 +34,7 @@ _sizer = PositionSizer()
 @router.get("")
 async def list_opportunities(
     min_profit: int = Query(0, description="Minimum net profit in GP"),
-    min_score: float = Query(45, ge=0, le=100, description="Minimum flip score (0-100)"),
+    min_score: float = Query(20, ge=0, le=100, description="Minimum flip score (0-100)"),
     max_risk: int = Query(7, description="Maximum risk score (1-10) for initial scan"),
     min_volume: int = Query(1, description="Minimum 5-minute volume"),
     sort_by: str = Query("total_score", description="Sort field: total_score, expected_profit, spread_pct, volume_5m"),
