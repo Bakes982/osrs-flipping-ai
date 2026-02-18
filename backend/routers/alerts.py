@@ -158,3 +158,63 @@ async def delete_price_target(item_id: int, direction: Optional[str] = Query(Non
             db.close()
 
     return await asyncio.to_thread(_sync)
+
+
+# ---------------------------------------------------------------------------
+# Discord top-5 opportunity digest
+# ---------------------------------------------------------------------------
+
+
+@router.post("/send-top5")
+async def send_top5_now():
+    """Manually trigger a Discord notification with the current top 5 opportunities.
+
+    Uses the webhook URL stored in settings (``discord_webhook``).
+    Returns a summary of what was sent.
+    """
+    from backend.tasks import get_opportunity_notifier
+    notifier = get_opportunity_notifier()
+    result = await notifier.send_now()
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
+    return result
+
+
+@router.post("/test-webhook")
+async def test_webhook():
+    """Send a short test message to the configured Discord webhook.
+
+    Useful for verifying the webhook URL works before enabling auto-notifications.
+    """
+    import requests as _requests
+    from datetime import datetime as _dt
+
+    def _sync():
+        db = get_db()
+        try:
+            wh = get_setting(db, "discord_webhook")
+            url = None
+            if isinstance(wh, dict):
+                url = wh.get("url")
+            elif isinstance(wh, str):
+                url = wh
+            if not url:
+                url = get_setting(db, "discord_webhook_url")
+            if not url:
+                return {"ok": False, "error": "No webhook URL configured"}
+
+            payload = {
+                "embeds": [{
+                    "title": "✅ Webhook Test — OSRS AI Flipper",
+                    "description": "Your webhook is connected and working!",
+                    "color": 0x00FF00,
+                    "timestamp": _dt.utcnow().isoformat(),
+                    "footer": {"text": "OSRS AI Flipper"}
+                }]
+            }
+            r = _requests.post(url, json=payload, timeout=10)
+            return {"ok": r.status_code in (200, 204), "status_code": r.status_code}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)

@@ -182,6 +182,12 @@ export const api = {
     const qs = direction ? `?direction=${direction}` : '';
     return fetchJSON(`/alerts/price-target/${itemId}${qs}`, { method: 'DELETE' });
   },
+  sendTop5Now() {
+    return fetchJSON('/alerts/send-top5', { method: 'POST' });
+  },
+  testWebhook() {
+    return fetchJSON('/alerts/test-webhook', { method: 'POST' });
+  },
 
   // Arbitrage
   getArbitrage() {

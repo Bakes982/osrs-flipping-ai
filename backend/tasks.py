@@ -740,6 +740,184 @@ class AlertMonitor:
 
 
 # ---------------------------------------------------------------------------
+# OpportunityNotifier
+# ---------------------------------------------------------------------------
+
+class OpportunityNotifier:
+    """Periodically sends a top-5 opportunity digest to Discord.
+
+    Reads the webhook URL and interval from the settings collection.
+    Settings keys:
+        discord_webhook  → { url: "...", enabled: true/false }
+        discord_top5_interval_minutes → int  (default 30)
+    """
+
+    DEFAULT_INTERVAL_MIN = 30  # minutes between digests
+    _last_sent: Optional[datetime] = None
+
+    async def _get_webhook_url(self) -> Optional[str]:
+        """Read webhook URL from DB settings. Returns None if disabled."""
+        def _sync():
+            db = get_db()
+            try:
+                wh = get_setting(db, "discord_webhook")
+                if not wh:
+                    # Also try the flat key used by settings page
+                    url = get_setting(db, "discord_webhook_url")
+                    enabled = get_setting(db, "discord_alerts_enabled", False)
+                    if url and enabled:
+                        return url
+                    return None
+                if isinstance(wh, dict):
+                    if not wh.get("enabled", False):
+                        return None
+                    return wh.get("url") or None
+                # Plain string
+                return wh if wh else None
+            finally:
+                db.close()
+        return await asyncio.to_thread(_sync)
+
+    async def _get_interval_minutes(self) -> int:
+        def _sync():
+            db = get_db()
+            try:
+                val = get_setting(db, "discord_top5_interval_minutes")
+                return int(val) if val else self.DEFAULT_INTERVAL_MIN
+            finally:
+                db.close()
+        return await asyncio.to_thread(_sync)
+
+    async def _get_top_opportunities(self, limit: int = 5):
+        """Score tracked items and return the top N dicts."""
+        def _sync():
+            from backend.flip_scorer import FlipScorer, score_opportunities
+            from ai_strategist import scan_all_items_for_flips
+
+            try:
+                raw = scan_all_items_for_flips(
+                    min_price=10_000,
+                    max_price=500_000_000,
+                    min_margin_pct=0.3,
+                    max_risk=7,
+                    limit=200,
+                )
+            except Exception as e:
+                logger.error("OpportunityNotifier: scan failed: %s", e)
+                return []
+
+            scored = score_opportunities(raw, min_score=30, limit=limit * 3)
+
+            results = []
+            for fs in scored:
+                if fs.expected_profit is not None and fs.expected_profit < 10_000:
+                    continue
+                results.append({
+                    "item_id": fs.item_id,
+                    "name": fs.item_name,
+                    "buy_price": fs.recommended_buy,
+                    "sell_price": fs.recommended_sell,
+                    "potential_profit": fs.expected_profit,
+                    "flip_score": round(fs.total_score, 1),
+                    "margin_pct": round(fs.spread_pct, 2) if fs.spread_pct else 0,
+                    "volume": fs.volume_5m,
+                    "trend": fs.trend,
+                    "ml_direction": fs.ml_direction,
+                    "ml_prediction_confidence": round(fs.ml_confidence, 3) if fs.ml_confidence else None,
+                    "ml_method": fs.ml_method,
+                    "win_rate": round(fs.win_rate * 100, 1) if fs.win_rate is not None else None,
+                    "reason": fs.reason,
+                })
+            results.sort(key=lambda x: x.get("flip_score", 0), reverse=True)
+            return results[:limit]
+
+        return await asyncio.to_thread(_sync)
+
+    async def maybe_send(self):
+        """Check if it's time to send, and send if so."""
+        webhook_url = await self._get_webhook_url()
+        if not webhook_url:
+            return  # webhook not configured or disabled
+
+        interval = await self._get_interval_minutes()
+        now = datetime.utcnow()
+
+        # Skip if we sent recently
+        if self._last_sent and (now - self._last_sent).total_seconds() < interval * 60:
+            return
+
+        logger.info("OpportunityNotifier: building top-5 digest…")
+        top = await self._get_top_opportunities(limit=5)
+        if not top:
+            logger.info("OpportunityNotifier: no qualifying opportunities right now")
+            return
+
+        from backend.discord_notifier import DiscordOpportunityNotifier
+        notifier = DiscordOpportunityNotifier(webhook_url)
+
+        ok = await asyncio.to_thread(
+            notifier.send_top_opportunities, top, max_items=5, include_charts=True
+        )
+        if ok:
+            self._last_sent = now
+            logger.info("OpportunityNotifier: digest sent (%d items)", len(top))
+        else:
+            logger.warning("OpportunityNotifier: sending failed")
+
+    async def send_now(self) -> dict:
+        """Force-send immediately (called by the manual trigger endpoint).
+
+        Returns a summary dict.
+        """
+        webhook_url = await self._get_webhook_url()
+        if not webhook_url:
+            return {"ok": False, "error": "Discord webhook not configured or disabled"}
+
+        top = await self._get_top_opportunities(limit=5)
+        if not top:
+            return {"ok": False, "error": "No qualifying opportunities found"}
+
+        from backend.discord_notifier import DiscordOpportunityNotifier
+        notifier = DiscordOpportunityNotifier(webhook_url)
+        ok = await asyncio.to_thread(
+            notifier.send_top_opportunities, top, max_items=5, include_charts=True
+        )
+        if ok:
+            self._last_sent = datetime.utcnow()
+        return {
+            "ok": ok,
+            "items_sent": len(top) if ok else 0,
+            "items": [
+                {"name": o["name"], "score": o["flip_score"], "profit": o["potential_profit"]}
+                for o in top
+            ],
+        }
+
+    async def run_forever(self):
+        logger.info("OpportunityNotifier started (default interval: %dm)", self.DEFAULT_INTERVAL_MIN)
+        # Wait 60s for initial data collection
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await self.maybe_send()
+            except Exception as e:
+                logger.error("OpportunityNotifier tick error: %s", e)
+            # Check every 60 seconds whether it's time to send
+            await asyncio.sleep(60)
+
+
+# Singleton for manual-trigger access
+_opportunity_notifier: Optional[OpportunityNotifier] = None
+
+
+def get_opportunity_notifier() -> OpportunityNotifier:
+    global _opportunity_notifier
+    if _opportunity_notifier is None:
+        _opportunity_notifier = OpportunityNotifier()
+    return _opportunity_notifier
+
+
+# ---------------------------------------------------------------------------
 # Task launcher (called from app.py on startup)
 # ---------------------------------------------------------------------------
 
@@ -757,6 +935,7 @@ async def start_background_tasks():
     retrainer = ModelRetrainer()
     alert_monitor = AlertMonitor()
     pruner = DataPruner()
+    opp_notifier = get_opportunity_notifier()
 
     # Start PriceCollector first (it feeds data to everything else)
     _tasks.append(asyncio.create_task(collector.run_forever()))
@@ -778,6 +957,7 @@ async def start_background_tasks():
     # These run infrequently, start them last
     _tasks.append(asyncio.create_task(retrainer.run_forever()))
     _tasks.append(asyncio.create_task(pruner.run_forever()))
+    _tasks.append(asyncio.create_task(opp_notifier.run_forever()))
 
     logger.info("All %d background tasks started", len(_tasks))
 
