@@ -20,9 +20,6 @@ COPY flip_predictor.py .
 COPY quant_analyzer.py .
 COPY user_config.py .
 
-EXPOSE 8001
+EXPOSE ${PORT:-8001}
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8001/api/health || exit 1
-
-CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8001}
