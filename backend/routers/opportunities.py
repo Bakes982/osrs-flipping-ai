@@ -4,6 +4,7 @@ GET /api/opportunities       - list flip opportunities (scored and filtered)
 GET /api/opportunities/{id}  - detailed analysis for a single item
 """
 
+import asyncio
 import sys
 import os
 from typing import Optional
@@ -48,7 +49,8 @@ async def list_opportunities(
     4. Return sorted results
     """
     try:
-        raw = scan_all_items_for_flips(
+        raw = await asyncio.to_thread(
+            scan_all_items_for_flips,
             min_price=10_000,
             max_price=500_000_000,
             min_margin_pct=0.3,
@@ -128,7 +130,7 @@ async def list_arbitrage():
     - Buy 3-dose potions -> Decant at Bob Barter -> Sell 4-dose
     """
     try:
-        results = _arb_finder.find_all_arbitrage()
+        results = await asyncio.to_thread(_arb_finder.find_all_arbitrage)
         return {"items": results, "total": len(results)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Arbitrage scan failed: {e}")
@@ -151,9 +153,9 @@ async def get_opportunity_detail(item_id: int):
         # SmartPricer recommendation
         rec = _pricer.price_item(item_id, snapshots=snapshots)
 
-        # Quant analysis (text report)
+        # Quant analysis (text report) — run in thread to avoid blocking event loop
         try:
-            quant_report = analyze_single_item(item_id)
+            quant_report = await asyncio.to_thread(analyze_single_item, item_id)
         except Exception:
             quant_report = None
 

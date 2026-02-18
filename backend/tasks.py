@@ -88,39 +88,54 @@ class PriceCollector:
     async def store_snapshots(self) -> int:
         """Store current price data as PriceSnapshot rows.
 
+        Only stores the top ~500 items by volume to avoid filling MongoDB.
         Returns the number of rows inserted.
         """
         if not self._latest_data:
             return 0
 
-        now = datetime.utcnow()
-        db = get_db()
-        count = 0
-        try:
-            snapshots_list = []
-            for item_id_str, instant in self._latest_data.items():
-                item_id = int(item_id_str)
-                avg = self._5m_data.get(item_id_str, {})
+        def _sync_store():
+            now = datetime.utcnow()
+            db = get_db()
+            count = 0
+            try:
+                # Filter to items with meaningful volume (top ~500)
+                items_with_volume = []
+                for item_id_str, instant in self._latest_data.items():
+                    avg = self._5m_data.get(item_id_str, {})
+                    vol = (avg.get("highPriceVolume", 0) or 0) + (avg.get("lowPriceVolume", 0) or 0)
+                    if vol > 0 and instant.get("high") and instant.get("low"):
+                        items_with_volume.append((item_id_str, instant, avg, vol))
 
-                snap = PriceSnapshot(
-                    item_id=item_id,
-                    timestamp=now,
-                    instant_buy=instant.get("high"),
-                    instant_sell=instant.get("low"),
-                    buy_time=instant.get("highTime"),
-                    sell_time=instant.get("lowTime"),
-                    avg_buy=avg.get("avgHighPrice"),
-                    avg_sell=avg.get("avgLowPrice"),
-                    buy_volume=avg.get("highPriceVolume", 0),
-                    sell_volume=avg.get("lowPriceVolume", 0),
-                )
-                snapshots_list.append(snap)
+                # Sort by volume descending, keep top 500
+                items_with_volume.sort(key=lambda x: x[3], reverse=True)
+                items_with_volume = items_with_volume[:500]
 
-            count = insert_price_snapshots(db, snapshots_list)
-        except Exception as e:
-            logger.error("Error storing snapshots: %s", e)
+                snapshots_list = []
+                for item_id_str, instant, avg, vol in items_with_volume:
+                    item_id = int(item_id_str)
+                    snap = PriceSnapshot(
+                        item_id=item_id,
+                        timestamp=now,
+                        instant_buy=instant.get("high"),
+                        instant_sell=instant.get("low"),
+                        buy_time=instant.get("highTime"),
+                        sell_time=instant.get("lowTime"),
+                        avg_buy=avg.get("avgHighPrice"),
+                        avg_sell=avg.get("avgLowPrice"),
+                        buy_volume=avg.get("highPriceVolume", 0),
+                        sell_volume=avg.get("lowPriceVolume", 0),
+                    )
+                    snapshots_list.append(snap)
 
-        return count
+                count = insert_price_snapshots(db, snapshots_list)
+            except Exception as e:
+                logger.error("Error storing snapshots: %s", e)
+            finally:
+                db.close()
+            return count
+
+        return await asyncio.to_thread(_sync_store)
 
     async def broadcast(self):
         """Push latest prices to all connected WebSocket clients."""
@@ -196,30 +211,33 @@ class FeatureComputer:
         if engine is None:
             return
 
-        db = get_db()
-        try:
-            from backend.database import get_price_history, get_item_flips
-            item_ids = get_tracked_item_ids(db)
-            computed = 0
+        def _sync_compute():
+            db = get_db()
+            try:
+                from backend.database import get_price_history, get_item_flips
+                item_ids = get_tracked_item_ids(db)
+                computed = 0
 
-            for item_id in item_ids:
-                try:
-                    snapshots = get_price_history(db, item_id, hours=4)
-                    flips = get_item_flips(db, item_id, days=30)
-                    features = engine.compute_features(item_id, snapshots, flips)
+                for item_id in item_ids[:200]:  # Cap to avoid excessive processing
+                    try:
+                        snapshots = get_price_history(db, item_id, hours=4)
+                        flips = get_item_flips(db, item_id, days=30)
+                        features = engine.compute_features(item_id, snapshots, flips)
 
-                    if features:
-                        import json
-                        now = datetime.utcnow()
-                        upsert_item_feature(db, item_id, json.dumps(features), now)
-                        computed += 1
-                except Exception as e:
-                    logger.debug("Feature compute failed for %d: %s", item_id, e)
+                        if features:
+                            import json
+                            now = datetime.utcnow()
+                            upsert_item_feature(db, item_id, json.dumps(features), now)
+                            computed += 1
+                    except Exception as e:
+                        logger.debug("Feature compute failed for %d: %s", item_id, e)
 
-            if computed > 0:
-                logger.info("FeatureComputer: computed features for %d/%d items", computed, len(item_ids))
-        finally:
-            db.close()
+                if computed > 0:
+                    logger.info("FeatureComputer: computed features for %d/%d items", computed, len(item_ids))
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_sync_compute)
 
     async def run_forever(self):
         logger.info("FeatureComputer started")
@@ -261,27 +279,30 @@ class MLScorer:
         if predictor is None:
             return
 
-        db = get_db()
-        try:
-            item_ids = get_tracked_item_ids(db)
-            if not item_ids:
-                return
+        def _sync_score():
+            db = get_db()
+            try:
+                item_ids = get_tracked_item_ids(db)
+                if not item_ids:
+                    return
 
-            # Batch predict (saves to DB internally)
-            results = predictor.predict_batch(item_ids[:100], save_to_db=True)
-            logger.info("MLScorer: scored %d items (%s method)",
-                len(results),
-                "ml" if predictor._models_loaded else "statistical"
-            )
+                # Batch predict (saves to DB internally)
+                results = predictor.predict_batch(item_ids[:100], save_to_db=True)
+                logger.info("MLScorer: scored %d items (%s method)",
+                    len(results),
+                    "ml" if predictor._models_loaded else "statistical"
+                )
 
-            # Also record outcomes for past predictions (accuracy tracking)
-            for item_id in item_ids[:50]:
-                try:
-                    predictor.record_outcomes(item_id)
-                except Exception:
-                    pass
-        finally:
-            db.close()
+                # Also record outcomes for past predictions (accuracy tracking)
+                for item_id in item_ids[:50]:
+                    try:
+                        predictor.record_outcomes(item_id)
+                    except Exception:
+                        pass
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_sync_score)
 
     async def run_forever(self):
         logger.info("MLScorer started")
@@ -305,7 +326,7 @@ class DataPruner:
     - Deletes raw snapshots older than 7 days after aggregation
     """
 
-    async def _aggregate_snapshots_to_5m(self, db):
+    def _aggregate_snapshots_to_5m(self, db):
         """Aggregate raw snapshots older than 7 days into 5-minute candles."""
         cutoff = datetime.utcnow() - timedelta(days=7)
 
@@ -314,9 +335,10 @@ class DataPruner:
 
         total_created = 0
         for item_id in item_ids:
-            docs = db.price_snapshots.find(
+            # Process in batches of 5000 to limit memory
+            docs = list(db.price_snapshots.find(
                 {"item_id": item_id, "timestamp": {"$lt": cutoff}}
-            ).sort("timestamp", 1)
+            ).sort("timestamp", 1).limit(5000))
             snapshots = [PriceSnapshot.from_doc(d) for d in docs]
 
             if not snapshots:
@@ -360,70 +382,79 @@ class DataPruner:
         logger.info("Created %d 5m aggregate candles", total_created)
         return total_created
 
-    async def _aggregate_5m_to_1h(self, db):
+    def _aggregate_5m_to_1h(self, db):
         """Roll up 5m candles older than 30 days into 1h candles."""
         cutoff = datetime.utcnow() - timedelta(days=30)
 
-        docs = db.price_aggregates.find(
-            {"interval": "5m", "timestamp": {"$lt": cutoff}}
-        ).sort([("item_id", 1), ("timestamp", 1)])
-        rows = [doc for doc in docs]
-
-        # Group by (item_id, hour)
-        buckets: Dict[tuple, list] = {}
-        for row in rows:
-            hour_ts = row["timestamp"].replace(minute=0, second=0, microsecond=0)
-            key = (row["item_id"], hour_ts)
-            buckets.setdefault(key, []).append(row)
+        # Get distinct item_ids with old 5m data
+        item_ids = db.price_aggregates.distinct(
+            "item_id", {"interval": "5m", "timestamp": {"$lt": cutoff}}
+        )
 
         total_created = 0
-        for (item_id, hour_ts), group in buckets.items():
-            buys = [r["high_buy"] for r in group if r.get("high_buy") is not None]
-            sells = [r["high_sell"] for r in group if r.get("high_sell") is not None]
+        total_deleted = 0
+        for item_id in item_ids:
+            docs = list(db.price_aggregates.find(
+                {"item_id": item_id, "interval": "5m", "timestamp": {"$lt": cutoff}}
+            ).sort("timestamp", 1).limit(5000))  # process in batches
 
-            agg = PriceAggregate(
-                item_id=item_id,
-                timestamp=hour_ts,
-                interval="1h",
-                open_buy=group[0].get("open_buy"),
-                close_buy=group[-1].get("close_buy"),
-                high_buy=max(buys) if buys else None,
-                low_buy=min([r["low_buy"] for r in group if r.get("low_buy") is not None]) if any(r.get("low_buy") for r in group) else None,
-                open_sell=group[0].get("open_sell"),
-                close_sell=group[-1].get("close_sell"),
-                high_sell=max(sells) if sells else None,
-                low_sell=min([r["low_sell"] for r in group if r.get("low_sell") is not None]) if any(r.get("low_sell") for r in group) else None,
-                total_buy_volume=sum(r.get("total_buy_volume", 0) or 0 for r in group),
-                total_sell_volume=sum(r.get("total_sell_volume", 0) or 0 for r in group),
-                snapshot_count=sum(r.get("snapshot_count", 0) or 0 for r in group),
-            )
-            db.price_aggregates.insert_one(agg.to_doc())
-            total_created += 1
+            # Group by hour
+            buckets: Dict[datetime, list] = {}
+            for row in docs:
+                hour_ts = row["timestamp"].replace(minute=0, second=0, microsecond=0)
+                buckets.setdefault(hour_ts, []).append(row)
 
-        # Delete old 5m rows
-        if rows:
-            old_ids = [r["_id"] for r in rows]
-            db.price_aggregates.delete_many({"_id": {"$in": old_ids}})
+            for hour_ts, group in buckets.items():
+                buys = [r["high_buy"] for r in group if r.get("high_buy") is not None]
+                sells = [r["high_sell"] for r in group if r.get("high_sell") is not None]
 
-        logger.info("Created %d 1h aggregate candles, deleted %d old 5m candles", total_created, len(rows))
+                agg = PriceAggregate(
+                    item_id=item_id,
+                    timestamp=hour_ts,
+                    interval="1h",
+                    open_buy=group[0].get("open_buy"),
+                    close_buy=group[-1].get("close_buy"),
+                    high_buy=max(buys) if buys else None,
+                    low_buy=min([r["low_buy"] for r in group if r.get("low_buy") is not None]) if any(r.get("low_buy") for r in group) else None,
+                    open_sell=group[0].get("open_sell"),
+                    close_sell=group[-1].get("close_sell"),
+                    high_sell=max(sells) if sells else None,
+                    low_sell=min([r["low_sell"] for r in group if r.get("low_sell") is not None]) if any(r.get("low_sell") for r in group) else None,
+                    total_buy_volume=sum(r.get("total_buy_volume", 0) or 0 for r in group),
+                    total_sell_volume=sum(r.get("total_sell_volume", 0) or 0 for r in group),
+                    snapshot_count=sum(r.get("snapshot_count", 0) or 0 for r in group),
+                )
+                db.price_aggregates.insert_one(agg.to_doc())
+                total_created += 1
 
-    async def _delete_old_snapshots(self, db):
+            # Delete old 5m rows for this item
+            if docs:
+                old_ids = [r["_id"] for r in docs]
+                db.price_aggregates.delete_many({"_id": {"$in": old_ids}})
+                total_deleted += len(old_ids)
+
+        logger.info("Created %d 1h aggregate candles, deleted %d old 5m candles", total_created, total_deleted)
+
+    def _delete_old_snapshots(self, db):
         """Delete raw snapshots older than 7 days (already aggregated)."""
         cutoff = datetime.utcnow() - timedelta(days=7)
         result = db.price_snapshots.delete_many({"timestamp": {"$lt": cutoff}})
         logger.info("Deleted %d old raw snapshots", result.deleted_count)
 
     async def prune(self):
-        """Run the full pruning cycle."""
-        db = get_db()
-        try:
-            await self._aggregate_snapshots_to_5m(db)
-            await self._aggregate_5m_to_1h(db)
-            await self._delete_old_snapshots(db)
-        except Exception as e:
-            logger.error("DataPruner error: %s", e)
-        finally:
-            db.close()
+        """Run the full pruning cycle in a background thread."""
+        def _sync_prune():
+            db = get_db()
+            try:
+                self._aggregate_snapshots_to_5m(db)
+                self._aggregate_5m_to_1h(db)
+                self._delete_old_snapshots(db)
+            except Exception as e:
+                logger.error("DataPruner error: %s", e)
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_sync_prune)
 
     async def run_forever(self):
         logger.info("DataPruner started (runs once per day)")
@@ -530,8 +561,8 @@ class AlertMonitor:
         db = get_db()
         try:
             await self._check_price_targets(db)
-            await self._check_dump_alerts(db)
-            await self._check_opportunity_alerts(db)
+            await asyncio.to_thread(self._check_dump_alerts_sync, db)
+            await asyncio.to_thread(self._check_opportunity_alerts_sync, db)
         except Exception as e:
             logger.error("AlertMonitor check error: %s", e)
         finally:
@@ -596,14 +627,14 @@ class AlertMonitor:
             from backend.database import set_setting
             set_setting(db, "price_alerts", new_targets)
 
-    async def _check_dump_alerts(self, db):
-        """Detect items experiencing rapid price drops (>5% in 15 min)."""
+    def _check_dump_alerts_sync(self, db):
+        """Detect items experiencing rapid price drops (>5% in 15 min). Sync version."""
         item_ids = get_tracked_item_ids(db)
         now = datetime.utcnow()
         cutoff_15m = now - timedelta(minutes=15)
 
-        # Only check top-volume items to limit DB queries
-        for item_id in item_ids[:200]:
+        # Only check top 50 items to limit DB load
+        for item_id in item_ids[:50]:
             try:
                 docs = db.price_snapshots.find(
                     {"item_id": item_id, "timestamp": {"$gte": cutoff_15m}}
@@ -642,19 +673,12 @@ class AlertMonitor:
                         data={"change_pct": round(change_pct, 1), "from_price": first_price, "to_price": last_price},
                     )
                     insert_alert(db, alert)
-                    await manager.broadcast_json({
-                        "type": "alert",
-                        "alert_type": "dump",
-                        "item_id": item_id,
-                        "item_name": item_name,
-                        "message": alert.message,
-                    })
+                    logger.info("Dump alert: %s", alert.message)
             except Exception:
                 pass
 
-    async def _check_opportunity_alerts(self, db):
-        """Alert when a very high-score opportunity appears (score 75+)."""
-        # This runs less frequently - check last scored items
+    def _check_opportunity_alerts_sync(self, db):
+        """Alert when a very high-score opportunity appears (score 75+). Sync version."""
         try:
             from backend.flip_scorer import FlipScorer
             scorer = FlipScorer()
@@ -699,14 +723,7 @@ class AlertMonitor:
                     },
                 )
                 insert_alert(db, alert)
-                await manager.broadcast_json({
-                    "type": "alert",
-                    "alert_type": "opportunity",
-                    "item_id": item_id,
-                    "item_name": fs.item_name,
-                    "message": alert.message,
-                    "score": round(fs.total_score, 1),
-                })
+                logger.info("Opportunity alert: %s", alert.message)
             except Exception:
                 pass
 

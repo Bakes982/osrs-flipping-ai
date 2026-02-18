@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
 
-from backend.database import get_db, Setting, get_setting, set_setting
+from backend.database import get_db, get_setting, set_setting, get_all_settings
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -35,14 +35,11 @@ DEFAULTS: Dict[str, Any] = {
 
 
 @router.get("")
-async def get_all_settings():
+async def get_settings_endpoint():
     """Return every stored setting, merged with defaults for any missing keys."""
     db = get_db()
     try:
-        rows = db.query(Setting).all()
-        stored = {row.key: row.value for row in rows}
-
-        # Merge defaults under stored values
+        stored = get_all_settings(db)
         merged = {**DEFAULTS, **stored}
         return merged
     finally:
