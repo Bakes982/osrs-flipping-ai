@@ -20,6 +20,6 @@ COPY flip_predictor.py .
 COPY quant_analyzer.py .
 COPY user_config.py .
 
-EXPOSE ${PORT:-8001}
+EXPOSE 8001
 
-CMD uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8001}
+CMD ["sh", "-c", "uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8001}"]
