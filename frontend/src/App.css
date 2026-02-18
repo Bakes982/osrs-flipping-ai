@@ -282,3 +282,47 @@
   padding: 60px;
   color: var(--text-muted);
 }
+
+/* KPI Cards */
+.kpi-card {
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.kpi-card:hover {
+  border-color: rgba(6, 182, 212, 0.3);
+  box-shadow: 0 0 20px rgba(6, 182, 212, 0.05);
+}
+.kpi-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.kpi-icon-green { background: rgba(16, 185, 129, 0.12); color: var(--green); }
+.kpi-icon-cyan { background: rgba(6, 182, 212, 0.12); color: var(--cyan); }
+.kpi-icon-purple { background: rgba(139, 92, 246, 0.12); color: var(--purple); }
+.kpi-icon-yellow { background: rgba(245, 158, 11, 0.12); color: var(--yellow); }
+.kpi-icon-red { background: rgba(239, 68, 68, 0.12); color: var(--red); }
+.kpi-sub {
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+/* Hover row for lists */
+.hover-row:hover {
+  background: rgba(6, 182, 212, 0.04) !important;
+}
+
+/* Responsive grid fixes */
+@media (max-width: 900px) {
+  .content { margin-left: 0; padding: 16px; }
+  .sidebar { display: none; }
+  div[style*="grid-template-columns: 2fr 1fr"],
+  div[style*="grid-template-columns: 1fr 1fr"] {
+    grid-template-columns: 1fr !important;
+  }
+}
