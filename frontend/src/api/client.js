@@ -61,21 +61,19 @@ async function fetchJSON(path, options = {}, retries = 3) {
         ...options,
       });
 
-      // Render free-tier cold start: may return 503, or an HTML "loading" page
-      // with a 200/302 status.  Detect both cases and retry with back-off.
+      // If the backend returns HTML instead of JSON, something is wrong.
       const contentType = res.headers.get('content-type') || '';
       const isHTML = contentType.includes('text/html');
 
       if ((res.status === 503 || isHTML) && attempt < retries) {
-        // Wait longer on each attempt (8s, 16s, 24s) to give Render time to boot
-        const delay = 8000 * (attempt + 1);
+        const delay = 3000 * (attempt + 1);
         console.log(`Backend not ready (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay / 1000}s...`);
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
 
       if (isHTML) {
-        throw new Error('Backend is starting up (Render free tier cold start). Try again in ~60 seconds.');
+        throw new Error('Backend returned unexpected HTML. It may be restarting.');
       }
       if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
       return res.json();

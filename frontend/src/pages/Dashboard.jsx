@@ -82,8 +82,7 @@ export default function Dashboard({ prices }) {
           <div className="empty" style={{ color: '#ef4444' }}>
             <strong>Backend connection failed:</strong> {oppsError}<br />
             <small style={{ color: '#94a3b8' }}>
-              Render free tier spins down after 15 min of no traffic. First request wakes it up (takes ~60s).
-              <br />The page will auto-retry every 30 seconds — just wait.
+              The page will auto-retry every 30 seconds.
             </small>
           </div>
         ) : !opps?.length ? (
