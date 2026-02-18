@@ -486,15 +486,38 @@ def score_opportunities(
     """
     Take raw opportunity dicts (from ai_strategist or similar) and
     score them through the FlipScorer. Returns sorted by total_score desc.
+
+    Builds synthetic PriceSnapshot from the Wiki API data so items can
+    be scored even when they have no DB history yet.
     """
     scorer = FlipScorer()
     scored = []
 
     for item in items:
         try:
+            item_id = item.get("item_id") or item.get("id", 0)
+
+            # Build a synthetic snapshot from the live scan data so that
+            # score_item doesn't veto items that simply lack DB history.
+            now = datetime.utcnow()
+            ts = int(time.time())
+            snap = PriceSnapshot(
+                item_id=item_id,
+                timestamp=now,
+                instant_buy=item.get("instant_buy") or item.get("buy_at"),
+                instant_sell=item.get("instant_sell") or item.get("sell_at"),
+                buy_time=ts,
+                sell_time=ts,
+                avg_buy=item.get("buy_at"),
+                avg_sell=item.get("sell_at"),
+                buy_volume=item.get("high_volume", 0),
+                sell_volume=item.get("low_volume", 0),
+            )
+
             fs = scorer.score_item(
-                item_id=item.get("item_id") or item.get("id", 0),
+                item_id=item_id,
                 item_name=item.get("name", ""),
+                snapshots=[snap],
             )
             if fs.vetoed:
                 logger.debug(
