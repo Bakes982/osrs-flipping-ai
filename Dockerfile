@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS backend
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -19,7 +19,8 @@ COPY flip_finder.py .
 COPY flip_predictor.py .
 COPY quant_analyzer.py .
 COPY user_config.py .
+COPY start_server.py .
 
 EXPOSE 8001
 
-CMD ["python", "-c", "import os; port = os.environ.get('PORT', '8001'); os.execvp('uvicorn', ['uvicorn', 'backend.app:app', '--host', '0.0.0.0', '--port', port])"]
+CMD ["python", "start_server.py"]
