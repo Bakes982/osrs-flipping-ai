@@ -783,7 +783,7 @@ def find_trades(
     return [Trade.from_doc(d) for d in docs]
 
 
-def find_all_flips(db: Database, limit: int = 500) -> List[FlipHistory]:
+def find_all_flips(db: Database, limit: int = 5000) -> List[FlipHistory]:
     """Find all flips, newest first."""
     docs = (
         db.flip_history.find()
