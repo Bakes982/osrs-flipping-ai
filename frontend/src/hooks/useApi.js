@@ -5,14 +5,20 @@ export function useApi(fetchFn, deps = [], interval = null) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const mountedRef = useRef(true);
+  const initialLoadDone = useRef(false);
 
   const load = useCallback(async () => {
     try {
-      setLoading(true);
+      // Only show loading spinner on the very first fetch.
+      // Subsequent refreshes update data silently in the background.
+      if (!initialLoadDone.current) {
+        setLoading(true);
+      }
       const result = await fetchFn();
       if (mountedRef.current) {
         setData(result);
         setError(null);
+        initialLoadDone.current = true;
       }
     } catch (e) {
       if (mountedRef.current) setError(e.message);
@@ -23,6 +29,7 @@ export function useApi(fetchFn, deps = [], interval = null) {
 
   useEffect(() => {
     mountedRef.current = true;
+    initialLoadDone.current = false;
     load();
 
     let timer;

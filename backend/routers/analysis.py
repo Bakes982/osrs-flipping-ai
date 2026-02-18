@@ -23,6 +23,7 @@ from backend.database import (
     get_item,
     get_model_metrics_latest,
     Prediction,
+    PriceSnapshot,
 )
 from backend.smart_pricer import SmartPricer
 
@@ -45,6 +46,54 @@ def _direction(current: Optional[int], predicted: Optional[int]) -> str:
     return "flat"
 
 
+def _fetch_wiki_snapshot(item_id: int):
+    """Fetch current prices from the OSRS Wiki API and return a synthetic PriceSnapshot."""
+    import requests
+    from datetime import datetime, timezone
+
+    try:
+        url = "https://prices.runescape.wiki/api/v1/osrs/latest"
+        headers = {"User-Agent": "osrs-flipping-ai"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("data", {}).get(str(item_id))
+        if not data:
+            return None
+
+        high = data.get("high")  # instant-buy price (what buyers pay)
+        low = data.get("low")    # instant-sell price (what sellers receive)
+        if not high or not low:
+            return None
+
+        return PriceSnapshot(
+            item_id=item_id,
+            instant_buy=high,
+            instant_sell=low,
+            timestamp=datetime.now(timezone.utc),
+            buy_volume=data.get("highPriceVolume", 0),
+            sell_volume=data.get("lowPriceVolume", 0),
+        )
+    except Exception:
+        return None
+
+
+def _fetch_wiki_item_name(item_id: int) -> str:
+    """Fetch item name from the OSRS Wiki mapping API."""
+    import requests
+
+    try:
+        url = "https://prices.runescape.wiki/api/v1/osrs/mapping"
+        headers = {"User-Agent": "osrs-flipping-ai"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        for item in resp.json():
+            if item.get("id") == item_id:
+                return item.get("name", f"Item {item_id}")
+    except Exception:
+        pass
+    return f"Item {item_id}"
+
+
 # ---------------------------------------------------------------------------
 # GET /api/predict/{item_id}
 # ---------------------------------------------------------------------------
@@ -59,17 +108,26 @@ async def predict_item(
         db = get_db()
         try:
             snapshots = get_price_history(db, item_id, hours=4)
+
+            # Fall back to Wiki API if no DB history
             if not snapshots:
-                return None  # signal 404
+                wiki_snap = _fetch_wiki_snapshot(item_id)
+                if not wiki_snap:
+                    return None  # signal 404
+                snapshots = [wiki_snap]
 
             rec = _pricer.price_item(item_id, snapshots=snapshots)
 
-            # Item name
+            # Item name — try DB first, then Wiki
             item_row = get_item(db, item_id)
-            item_name = item_row.name if item_row else f"Item {item_id}"
+            if item_row and item_row.name:
+                item_name = item_row.name
+            else:
+                item_name = _fetch_wiki_item_name(item_id)
 
             current_buy = rec.instant_buy
             current_sell = rec.instant_sell
+            spread = (current_buy - current_sell) if (current_buy and current_sell) else 0
 
             # Build predictions per horizon
             horizons_to_compute = [horizon] if horizon and horizon in ALL_HORIZONS else ALL_HORIZONS
@@ -77,10 +135,24 @@ async def predict_item(
             predictions = {}
             for h in horizons_to_compute:
                 scale = _horizon_scale(h)
-                momentum_offset = int(rec.momentum * _horizon_minutes(h))
+                minutes = _horizon_minutes(h)
+                momentum_offset = int(rec.momentum * minutes)
 
-                pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
-                pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
+                # When momentum is ~0 (e.g. single snapshot), use spread-based
+                # mean-reversion model: longer horizons → spread compresses
+                if abs(momentum_offset) < 1 and spread > 0:
+                    # Spread compression factor: longer horizons tend toward
+                    # tighter spreads as more offers arrive
+                    compression = min(0.5, scale * 0.35)  # up to 50% spread compression
+                    spread_shift = int(spread * compression)
+
+                    # Buyer pays less over time (buy price drifts down)
+                    pred_buy = int(current_buy - spread_shift * 0.6) if current_buy else None
+                    # Seller gets more over time (sell price drifts up)
+                    pred_sell = int(current_sell + spread_shift * 0.4) if current_sell else None
+                else:
+                    pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
+                    pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
 
                 predictions[h] = {
                     "buy": pred_buy,

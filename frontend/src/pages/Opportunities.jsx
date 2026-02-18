@@ -32,7 +32,7 @@ export default function Opportunities({ prices }) {
   const { data: raw, loading, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_profit: minPrice }),
     [minPrice],
-    30000,
+    120000,
   );
 
   // API now returns { items: [...], total: N }
@@ -79,7 +79,7 @@ export default function Opportunities({ prices }) {
       <div className="page-header">
         <div>
           <h2 className="page-title">Opportunities</h2>
-          <p className="page-subtitle">{filtered.length} scored items — only showing flips with 45+ score</p>
+          <p className="page-subtitle">{filtered.length} scored items — ranked by flip score</p>
         </div>
         <button className="btn-primary btn" onClick={reload}>
           <RefreshCw size={14} /> Refresh
@@ -143,7 +143,16 @@ export default function Opportunities({ prices }) {
             <tbody>
               {filtered.map((opp, i) => (
                 <tr key={i} onClick={() => nav(`/item/${opp.item_id}`)}>
-                  <td style={{ fontWeight: 500 }}>{opp.name}</td>
+                  <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <img
+                      src={`https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${opp.item_id}`}
+                      alt=""
+                      width={24}
+                      height={24}
+                      style={{ imageRendering: 'pixelated', flexShrink: 0 }}
+                      onError={e => { e.target.style.display = 'none'; }}
+                    />
+                    {opp.name}</td>
                   <td>
                     <span className={`badge ${scoreColor(opp.flip_score)}`}>
                       {opp.flip_score?.toFixed(0)}/100

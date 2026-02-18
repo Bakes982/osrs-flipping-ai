@@ -16,7 +16,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item
+from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, PriceSnapshot
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
 from backend.arbitrage_finder import ArbitrageFinder
@@ -29,6 +29,53 @@ _pricer = SmartPricer()
 _scorer = FlipScorer()
 _arb_finder = ArbitrageFinder()
 _sizer = PositionSizer()
+
+# ------- Wiki API helpers (fallback when DB has no data) -------
+
+def _fetch_wiki_snapshot(item_id: int):
+    """Fetch current prices from OSRS Wiki API → PriceSnapshot."""
+    import requests
+    from datetime import datetime, timezone
+    try:
+        resp = requests.get(
+            "https://prices.runescape.wiki/api/v1/osrs/latest",
+            headers={"User-Agent": "osrs-flipping-ai"}, timeout=10,
+        )
+        resp.raise_for_status()
+        d = resp.json().get("data", {}).get(str(item_id))
+        if not d or not d.get("high") or not d.get("low"):
+            return None
+        return PriceSnapshot(
+            item_id=item_id,
+            instant_buy=d["high"],
+            instant_sell=d["low"],
+            timestamp=datetime.now(timezone.utc),
+            buy_volume=d.get("highPriceVolume", 0),
+            sell_volume=d.get("lowPriceVolume", 0),
+        )
+    except Exception:
+        return None
+
+
+_wiki_name_cache: dict = {}
+
+
+def _fetch_wiki_item_name(item_id: int) -> str:
+    """Fetch item name from OSRS Wiki mapping API (cached)."""
+    if _wiki_name_cache:
+        return _wiki_name_cache.get(item_id, f"Item {item_id}")
+    import requests
+    try:
+        resp = requests.get(
+            "https://prices.runescape.wiki/api/v1/osrs/mapping",
+            headers={"User-Agent": "osrs-flipping-ai"}, timeout=15,
+        )
+        resp.raise_for_status()
+        for item in resp.json():
+            _wiki_name_cache[item.get("id", -1)] = item.get("name", "Unknown")
+    except Exception:
+        pass
+    return _wiki_name_cache.get(item_id, f"Item {item_id}")
 
 
 @router.get("")
@@ -148,6 +195,12 @@ async def get_opportunity_detail(item_id: int):
             snapshots = get_price_history(db, item_id, hours=4)
             flips = get_item_flips(db, item_id, days=30)
 
+            # Fall back to Wiki API if no DB snapshots
+            if not snapshots:
+                wiki_snap = _fetch_wiki_snapshot(item_id)
+                if wiki_snap:
+                    snapshots = [wiki_snap]
+
             # Score the item
             fs = _scorer.score_item(item_id, snapshots=snapshots, flips=flips)
 
@@ -174,9 +227,12 @@ async def get_opportunity_detail(item_id: int):
                 for f in flips[:20]
             ]
 
-            # Item metadata
+            # Item metadata — prefer DB, fallback to Wiki
             item_row = get_item(db, item_id)
-            item_name = item_row.name if item_row else f"Item {item_id}"
+            if item_row and item_row.name and not item_row.name.startswith("Item "):
+                item_name = item_row.name
+            else:
+                item_name = _fetch_wiki_item_name(item_id)
 
             return {
                 "item_id": item_id,

@@ -23,10 +23,10 @@ export default function Dashboard({ prices }) {
   const { data: raw, loading: oppsLoading, error: oppsError, reload: reloadOpps } = useApi(
     () => api.getOpportunities({ limit: 10, sort_by: 'total_score' }),
     [],
-    30000,
+    120000,
   );
-  const { data: perf } = useApi(() => api.getPerformance(), [], 60000);
-  const { data: portfolio } = useApi(() => api.getPortfolio(), [], 60000);
+  const { data: perf } = useApi(() => api.getPerformance(), [], 120000);
+  const { data: portfolio } = useApi(() => api.getPortfolio(), [], 120000);
 
   // API returns { items: [...], total: N }
   const opps = raw?.items || raw || [];
@@ -104,7 +104,16 @@ export default function Dashboard({ prices }) {
             <tbody>
               {opps.slice(0, 10).map((opp, i) => (
                 <tr key={i} onClick={() => nav(`/item/${opp.item_id}`)}>
-                  <td style={{ fontWeight: 500 }}>{opp.name}</td>
+                  <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <img
+                      src={`https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${opp.item_id}`}
+                      alt=""
+                      width={24}
+                      height={24}
+                      style={{ imageRendering: 'pixelated', flexShrink: 0 }}
+                      onError={e => { e.target.style.display = 'none'; }}
+                    />
+                    {opp.name}</td>
                   <td>
                     <span className={`badge ${scoreColor(opp.flip_score)}`}>
                       {opp.flip_score?.toFixed(0)}
