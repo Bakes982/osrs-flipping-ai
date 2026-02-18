@@ -1,9 +1,9 @@
-// API base URL: use VITE_API_URL env var if set, otherwise auto-detect.
-// Dev server (port 5173) → localhost backend; production → Render backend.
+// API base URL: VITE_API_URL must be set for production (Vercel env vars).
+// Dev server (port 5173) falls back to localhost backend.
 const API_BASE = import.meta.env.VITE_API_URL
   || (window.location.port === '5173'
     ? 'http://localhost:8001/api'
-    : 'https://osrs-flipping-ai.onrender.com/api');
+    : '/api');  // fallback — should be overridden by VITE_API_URL in production
 
 // WebSocket base: derive from API_BASE
 const _apiUrl = new URL(API_BASE, window.location.origin);
