@@ -66,6 +66,7 @@ class FeatureEngine:
         item_id: int,
         snapshots: Optional[List[PriceSnapshot]] = None,
         flips: Optional[List[FlipHistory]] = None,
+        reference_time: Optional[datetime] = None,
     ) -> Dict[str, float]:
         """
         Compute the complete feature vector for an item.
@@ -78,6 +79,9 @@ class FeatureEngine:
             Price history. If None, fetched from DB (last 48h).
         flips : list of FlipHistory, optional
             Flip history. If None, fetched from DB (last 30 days).
+        reference_time : datetime, optional
+            The point in time for temporal features. Pass the snapshot
+            timestamp during training to avoid data leakage.
 
         Returns
         -------
@@ -105,8 +109,9 @@ class FeatureEngine:
         # Technical indicators
         features.update(self._technical_features(snapshots))
 
-        # Temporal features
-        features.update(self._temporal_features())
+        # Temporal features — use reference_time during training,
+        # defaults to now for live inference
+        features.update(self._temporal_features(reference_time))
 
         # Historical flip features
         features.update(self._historical_features(flips))
@@ -258,9 +263,17 @@ class FeatureEngine:
     # Temporal Features
     # ------------------------------------------------------------------
 
-    def _temporal_features(self) -> Dict[str, float]:
-        """Time-based cyclical features."""
-        now = datetime.utcnow()
+    def _temporal_features(self, reference_time: datetime = None) -> Dict[str, float]:
+        """Time-based cyclical features.
+
+        Parameters
+        ----------
+        reference_time : datetime, optional
+            The time to compute features for. If None, uses current UTC time.
+            During training, this should be the snapshot's timestamp to avoid
+            data leakage from using current wallclock time.
+        """
+        now = reference_time or datetime.utcnow()
         hour = now.hour + now.minute / 60.0
         dow = now.weekday()  # Monday=0, Sunday=6
 

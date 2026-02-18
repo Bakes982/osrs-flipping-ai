@@ -42,6 +42,7 @@ class FlipScore:
     trend_score: float = 0.0
     history_score: float = 0.0
     stability_score: float = 0.0
+    ml_score: float = 0.0  # ML model confidence signal
 
     # Composite
     total_score: float = 0.0
@@ -66,6 +67,11 @@ class FlipScore:
     spread: Optional[int] = None
     spread_pct: Optional[float] = None
 
+    # ML prediction context
+    ml_direction: Optional[str] = None
+    ml_confidence: Optional[float] = None
+    ml_method: Optional[str] = None
+
     # Historical context
     win_rate: Optional[float] = None
     total_flips: int = 0
@@ -80,14 +86,17 @@ class FlipScorer:
     additional checks to produce a 0-100 flip quality score.
     """
 
-    # Weights for each component
+    # Weights for each component (must sum to 1.0)
+    # ML component gets weight when models are trained; otherwise
+    # its weight is redistributed to other components automatically
     WEIGHTS = {
-        "spread": 0.25,
-        "volume": 0.25,
-        "freshness": 0.15,
-        "trend": 0.15,
+        "spread": 0.22,
+        "volume": 0.22,
+        "freshness": 0.13,
+        "trend": 0.13,
         "history": 0.10,
-        "stability": 0.10,
+        "stability": 0.08,
+        "ml": 0.12,  # ML prediction signal
     }
 
     # Minimum score to suggest a flip (out of 100)
@@ -95,6 +104,18 @@ class FlipScorer:
 
     def __init__(self):
         self.pricer = SmartPricer()
+        self._ml_predictor = None
+
+    def _get_ml_predictor(self):
+        """Lazily load the ML predictor for scoring enrichment."""
+        if self._ml_predictor is None:
+            try:
+                from backend.ml.predictor import Predictor
+                self._ml_predictor = Predictor()
+                self._ml_predictor.load_models()
+            except Exception:
+                pass
+        return self._ml_predictor
 
     def score_item(
         self,
@@ -151,16 +172,35 @@ class FlipScorer:
             fs.trend_score = self._score_trend(rec)
             fs.history_score = self._score_history(fs, flips)
             fs.stability_score = self._score_stability(snapshots)
+            fs.ml_score = self._score_ml(fs, item_id, snapshots, flips)
 
             # Composite weighted score
-            fs.total_score = (
-                fs.spread_score * self.WEIGHTS["spread"]
-                + fs.volume_score * self.WEIGHTS["volume"]
-                + fs.freshness_score * self.WEIGHTS["freshness"]
-                + fs.trend_score * self.WEIGHTS["trend"]
-                + fs.history_score * self.WEIGHTS["history"]
-                + fs.stability_score * self.WEIGHTS["stability"]
-            )
+            # If ML models aren't trained, redistribute ML weight to others
+            if fs.ml_score < 0:
+                # ML unavailable — use original weights without ML
+                fs.ml_score = 0
+                ml_weight = 0
+                non_ml_total = sum(
+                    v for k, v in self.WEIGHTS.items() if k != "ml"
+                )
+                fs.total_score = (
+                    fs.spread_score * (self.WEIGHTS["spread"] / non_ml_total)
+                    + fs.volume_score * (self.WEIGHTS["volume"] / non_ml_total)
+                    + fs.freshness_score * (self.WEIGHTS["freshness"] / non_ml_total)
+                    + fs.trend_score * (self.WEIGHTS["trend"] / non_ml_total)
+                    + fs.history_score * (self.WEIGHTS["history"] / non_ml_total)
+                    + fs.stability_score * (self.WEIGHTS["stability"] / non_ml_total)
+                )
+            else:
+                fs.total_score = (
+                    fs.spread_score * self.WEIGHTS["spread"]
+                    + fs.volume_score * self.WEIGHTS["volume"]
+                    + fs.freshness_score * self.WEIGHTS["freshness"]
+                    + fs.trend_score * self.WEIGHTS["trend"]
+                    + fs.history_score * self.WEIGHTS["history"]
+                    + fs.stability_score * self.WEIGHTS["stability"]
+                    + fs.ml_score * self.WEIGHTS["ml"]
+                )
 
             # Apply SmartPricer confidence as a multiplier
             fs.total_score *= max(0.3, rec.confidence)
@@ -435,6 +475,76 @@ class FlipScorer:
         else:
             return 10  # Very volatile
 
+    def _score_ml(
+        self,
+        fs: FlipScore,
+        item_id: int,
+        snapshots: List[PriceSnapshot],
+        flips: List[FlipHistory],
+    ) -> float:
+        """Score based on ML model predictions.
+
+        Returns -1 if ML is unavailable (weight will be redistributed).
+        Returns 0-100 based on ML confidence and direction alignment.
+        """
+        predictor = self._get_ml_predictor()
+        if predictor is None:
+            return -1  # sentinel: ML unavailable
+
+        try:
+            result = predictor.predict_item(
+                item_id, snapshots=snapshots, flips=flips, save_to_db=False,
+            )
+            meta = result.get("_meta", {})
+            method = meta.get("method", "none")
+
+            if method == "none":
+                return -1
+
+            # Use the 5m and 30m horizons as primary signals for flipping
+            pred_5m = result.get("5m", {})
+            pred_30m = result.get("30m", {})
+
+            direction_5m = pred_5m.get("direction", "flat")
+            confidence_5m = pred_5m.get("confidence", 0.5)
+            direction_30m = pred_30m.get("direction", "flat")
+            confidence_30m = pred_30m.get("confidence", 0.5)
+
+            # Store on FlipScore for frontend display
+            fs.ml_direction = direction_5m
+            fs.ml_confidence = confidence_5m
+            fs.ml_method = method
+
+            # Scoring logic:
+            # For flipping, we want: short-term stable or up, medium-term stable
+            # If ML says price will crash, that's bad for a flip
+            score = 50.0  # neutral baseline
+
+            # 5m signal (short-term — most important for flip timing)
+            if direction_5m == "up":
+                score += 20 * confidence_5m
+            elif direction_5m == "flat":
+                score += 10 * confidence_5m  # flat is fine for flipping
+            elif direction_5m == "down":
+                score -= 25 * confidence_5m  # price dropping = risky
+
+            # 30m signal (medium-term — helps avoid getting stuck)
+            if direction_30m == "up":
+                score += 15 * confidence_30m
+            elif direction_30m == "flat":
+                score += 5 * confidence_30m
+            elif direction_30m == "down":
+                score -= 15 * confidence_30m
+
+            # Bonus for ML vs statistical: ML models are more trustworthy
+            if method == "ml":
+                score += 5
+
+            return max(0, min(100, score))
+
+        except Exception:
+            return -1  # ML failed, redistribute weight
+
     # ------------------------------------------------------------------
     # Reason builder
     # ------------------------------------------------------------------
@@ -470,6 +580,13 @@ class FlipScorer:
         # Profit
         if fs.expected_profit:
             parts.append(f"+{fs.expected_profit:,} GP ({fs.expected_profit_pct:.1f}%)")
+
+        # ML signal
+        if fs.ml_direction and fs.ml_confidence:
+            ml_label = f"AI: {fs.ml_direction} ({fs.ml_confidence:.0%})"
+            if fs.ml_method == "ml":
+                ml_label += " [ML]"
+            parts.append(ml_label)
 
         return " | ".join(parts)
 

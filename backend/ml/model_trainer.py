@@ -211,6 +211,7 @@ class ModelTrainer:
                     try:
                         features = self.feature_engine.compute_features(
                             item_id, history_slice, flips,
+                            reference_time=snap.timestamp,
                         )
                     except Exception as e:
                         logger.debug(f"Feature computation failed for item {item_id}: {e}")

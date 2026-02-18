@@ -1,7 +1,8 @@
 """
 ML Analysis Endpoints for OSRS Flipping AI
-GET /api/predict/{item_id}  - multi-horizon price predictions
+GET /api/predict/{item_id}  - multi-horizon price predictions (ML-backed)
 GET /api/model/metrics      - model accuracy metrics per horizon
+GET /api/model/status       - ML pipeline status & learning progress
 """
 
 import asyncio
@@ -30,6 +31,28 @@ from backend.smart_pricer import SmartPricer
 router = APIRouter(tags=["analysis"])
 
 _pricer = SmartPricer()
+
+# Lazily-initialized ML predictor (shared across requests)
+_ml_predictor = None
+
+def _get_ml_predictor():
+    """Lazily initialize and return the ML predictor singleton."""
+    global _ml_predictor
+    if _ml_predictor is None:
+        try:
+            from backend.ml.predictor import Predictor
+            _ml_predictor = Predictor()
+            count = _ml_predictor.load_models()
+            import logging
+            logging.getLogger(__name__).info(
+                "ML Predictor initialized: %d models loaded", count
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "ML Predictor unavailable: %s — using heuristic fallback", e
+            )
+    return _ml_predictor
 
 # Horizons the system supports
 ALL_HORIZONS = ["1m", "5m", "30m", "2h", "8h", "24h"]
@@ -183,7 +206,13 @@ async def predict_item(
     item_id: int,
     horizon: Optional[str] = Query(None, description="Specific horizon e.g. 5m, 30m. Omit for all."),
 ):
-    """Return multi-horizon price predictions for an item."""
+    """Return multi-horizon price predictions for an item.
+
+    Uses the ML pipeline (LightGBM / sklearn RandomForest) when trained
+    models are available, with a statistical + heuristic fallback.
+    The ML models retrain every 6 hours on live Wiki price data, so
+    predictions get smarter over time.
+    """
     def _sync():
         db = get_db()
         try:
@@ -196,8 +225,6 @@ async def predict_item(
                     return None  # signal 404
                 snapshots = [wiki_snap]
 
-            rec = _pricer.price_item(item_id, snapshots=snapshots)
-
             # Item name — try DB first, then Wiki
             item_row = get_item(db, item_id)
             if item_row and item_row.name:
@@ -205,47 +232,80 @@ async def predict_item(
             else:
                 item_name = _fetch_wiki_item_name(item_id)
 
+            # --- Try ML pipeline first ---
+            ml_predictor = _get_ml_predictor()
+            ml_predictions = None
+            ml_method = "heuristic"
+
+            if ml_predictor is not None:
+                try:
+                    from backend.database import get_item_flips
+                    flips = get_item_flips(db, item_id, days=30)
+                    ml_result = ml_predictor.predict_item(
+                        item_id, snapshots=snapshots, flips=flips,
+                        save_to_db=True,
+                    )
+                    meta = ml_result.get("_meta", {})
+                    ml_method = meta.get("method", "statistical")
+
+                    # Only use ML predictions if they have real values
+                    if any(
+                        ml_result.get(h, {}).get("buy", 0) > 0
+                        for h in ALL_HORIZONS
+                    ):
+                        ml_predictions = ml_result
+                except Exception:
+                    pass  # fall through to heuristic
+
+            # --- SmartPricer heuristic (always computed for suggested_action) ---
+            rec = _pricer.price_item(item_id, snapshots=snapshots)
             current_buy = rec.instant_buy
             current_sell = rec.instant_sell
             spread = (current_buy - current_sell) if (current_buy and current_sell) else 0
 
-            # Build predictions per horizon
+            # Build predictions — prefer ML, fall back to heuristic
             horizons_to_compute = [horizon] if horizon and horizon in ALL_HORIZONS else ALL_HORIZONS
-
             predictions = {}
+
             for h in horizons_to_compute:
-                scale = _horizon_scale(h)
-                minutes = _horizon_minutes(h)
-                momentum_offset = int(rec.momentum * minutes)
-
-                # When momentum is ~0 (e.g. single snapshot), use spread-based
-                # mean-reversion model: longer horizons → spread compresses
-                if abs(momentum_offset) < 1 and spread > 0:
-                    # Spread compression factor: longer horizons tend toward
-                    # tighter spreads as more offers arrive
-                    compression = min(0.5, scale * 0.35)  # up to 50% spread compression
-                    spread_shift = int(spread * compression)
-
-                    # Buyer pays less over time (buy price drifts down)
-                    pred_buy = int(current_buy - spread_shift * 0.6) if current_buy else None
-                    # Seller gets more over time (sell price drifts up)
-                    pred_sell = int(current_sell + spread_shift * 0.4) if current_sell else None
+                if ml_predictions and h in ml_predictions:
+                    ml_pred = ml_predictions[h]
+                    predictions[h] = {
+                        "buy": ml_pred.get("buy"),
+                        "sell": ml_pred.get("sell"),
+                        "direction": ml_pred.get("direction", "flat"),
+                        "confidence": ml_pred.get("confidence", 0.5),
+                        "method": ml_method,
+                    }
                 else:
-                    pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
-                    pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
+                    # Heuristic fallback (spread-based mean-reversion)
+                    scale = _horizon_scale(h)
+                    minutes = _horizon_minutes(h)
+                    momentum_offset = int(rec.momentum * minutes)
 
-                predictions[h] = {
-                    "buy": pred_buy,
-                    "sell": pred_sell,
-                    "direction": _direction(current_buy, pred_buy),
-                    "confidence": round(max(0.1, rec.confidence * (1.0 - scale * 0.15)), 3),
-                }
+                    if abs(momentum_offset) < 1 and spread > 0:
+                        compression = min(0.5, scale * 0.35)
+                        spread_shift = int(spread * compression)
+                        pred_buy = int(current_buy - spread_shift * 0.6) if current_buy else None
+                        pred_sell = int(current_sell + spread_shift * 0.4) if current_sell else None
+                    else:
+                        pred_buy = int(current_buy + momentum_offset * scale) if current_buy else None
+                        pred_sell = int(current_sell + momentum_offset * scale) if current_sell else None
+
+                    predictions[h] = {
+                        "buy": pred_buy,
+                        "sell": pred_sell,
+                        "direction": _direction(current_buy, pred_buy),
+                        "confidence": round(max(0.1, rec.confidence * (1.0 - scale * 0.15)), 3),
+                        "method": "heuristic",
+                    }
 
             return {
                 "item_id": item_id,
                 "item_name": item_name,
                 "current_buy": current_buy,
                 "current_sell": current_sell,
+                "prediction_method": ml_method if ml_predictions else "heuristic",
                 "predictions": predictions,
                 "suggested_action": {
                     "buy_at": rec.recommended_buy,
@@ -328,6 +388,172 @@ async def get_model_metrics():
                     }
 
             return {"horizons": results}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/model/status  –  Full ML pipeline status & learning progress
+# ---------------------------------------------------------------------------
+
+@router.get("/api/model/status")
+async def get_model_status():
+    """Return comprehensive ML pipeline status including:
+    - Whether ML models are trained and active
+    - Prediction accuracy over time (learning curve)
+    - Data collection stats (how much training data we have)
+    - Next retrain schedule
+    """
+    def _sync():
+        db = get_db()
+        try:
+            from datetime import datetime, timedelta
+
+            # --- Model status per horizon ---
+            horizons = {}
+            any_trained = False
+            for h in ALL_HORIZONS:
+                row = get_model_metrics_latest(db, h)
+                if row and row.direction_accuracy is not None:
+                    any_trained = True
+                    horizons[h] = {
+                        "trained": True,
+                        "direction_accuracy": round(row.direction_accuracy * 100, 1) if row.direction_accuracy else None,
+                        "price_mae": round(row.price_mae, 0) if row.price_mae else None,
+                        "price_mape": round(row.price_mape, 2) if row.price_mape else None,
+                        "profit_accuracy": round(row.profit_accuracy * 100, 1) if row.profit_accuracy else None,
+                        "sample_count": row.sample_count or 0,
+                        "last_trained": row.timestamp.isoformat() if row.timestamp else None,
+                    }
+                else:
+                    horizons[h] = {
+                        "trained": False,
+                        "direction_accuracy": None,
+                        "price_mae": None,
+                        "price_mape": None,
+                        "profit_accuracy": None,
+                        "sample_count": 0,
+                        "last_trained": None,
+                    }
+
+            # --- Prediction accuracy tracking ---
+            # Count predictions with recorded outcomes
+            total_predictions = db.predictions.count_documents({})
+            predictions_with_outcomes = db.predictions.count_documents({
+                "actual_buy": {"$ne": None}
+            })
+
+            # Direction accuracy from recorded outcomes
+            correct_direction = 0
+            total_graded = 0
+            if predictions_with_outcomes > 0:
+                pipeline = [
+                    {"$match": {"actual_direction": {"$ne": None}, "predicted_direction": {"$ne": None}}},
+                    {"$group": {
+                        "_id": None,
+                        "total": {"$sum": 1},
+                        "correct": {"$sum": {
+                            "$cond": [{"$eq": ["$predicted_direction", "$actual_direction"]}, 1, 0]
+                        }},
+                    }},
+                ]
+                agg_result = list(db.predictions.aggregate(pipeline))
+                if agg_result:
+                    total_graded = agg_result[0]["total"]
+                    correct_direction = agg_result[0]["correct"]
+
+            live_accuracy = round(correct_direction / total_graded * 100, 1) if total_graded > 0 else None
+
+            # --- Accuracy over time (learning curve) ---
+            # Group by date to show accuracy improving over days
+            learning_curve = []
+            if total_graded > 0:
+                curve_pipeline = [
+                    {"$match": {"actual_direction": {"$ne": None}, "predicted_direction": {"$ne": None}}},
+                    {"$group": {
+                        "_id": {
+                            "$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}
+                        },
+                        "total": {"$sum": 1},
+                        "correct": {"$sum": {
+                            "$cond": [{"$eq": ["$predicted_direction", "$actual_direction"]}, 1, 0]
+                        }},
+                    }},
+                    {"$sort": {"_id": 1}},
+                    {"$limit": 30},  # last 30 days
+                ]
+                for row in db.predictions.aggregate(curve_pipeline):
+                    if row["total"] >= 5:  # min 5 predictions per day
+                        learning_curve.append({
+                            "date": row["_id"],
+                            "accuracy": round(row["correct"] / row["total"] * 100, 1),
+                            "predictions": row["total"],
+                        })
+
+            # --- Data collection stats ---
+            snapshot_count = db.price_snapshots.count_documents({})
+            tracked_items = len(db.price_snapshots.distinct("item_id"))
+            oldest_snapshot = db.price_snapshots.find_one(
+                {}, sort=[("timestamp", 1)], projection={"timestamp": 1}
+            )
+            newest_snapshot = db.price_snapshots.find_one(
+                {}, sort=[("timestamp", -1)], projection={"timestamp": 1}
+            )
+
+            data_age_hours = 0
+            if oldest_snapshot and newest_snapshot:
+                data_span = newest_snapshot["timestamp"] - oldest_snapshot["timestamp"]
+                data_age_hours = round(data_span.total_seconds() / 3600, 1)
+
+            # Feature cache count
+            feature_count = db.item_features.count_documents({})
+
+            # --- ML predictor status ---
+            ml_predictor = _get_ml_predictor()
+            predictor_status = None
+            if ml_predictor is not None:
+                try:
+                    predictor_status = ml_predictor.status()
+                except Exception:
+                    pass
+
+            return {
+                "ml_active": any_trained,
+                "prediction_method": "ml" if any_trained else "statistical",
+                "horizons": horizons,
+                "live_accuracy": {
+                    "direction_accuracy_pct": live_accuracy,
+                    "total_predictions": total_predictions,
+                    "graded_predictions": total_graded,
+                    "correct_predictions": correct_direction,
+                },
+                "learning_curve": learning_curve,
+                "data_collection": {
+                    "total_snapshots": snapshot_count,
+                    "tracked_items": tracked_items,
+                    "data_span_hours": data_age_hours,
+                    "feature_vectors_cached": feature_count,
+                },
+                "predictor": predictor_status,
+                "pipeline_info": {
+                    "price_collection_interval": "10s",
+                    "feature_computation_interval": "60s",
+                    "prediction_interval": "60s",
+                    "retrain_interval": "6h",
+                    "data_retention_raw": "7 days",
+                    "data_retention_aggregated": "30+ days",
+                },
+            }
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Model status error: %s", e)
+            return {
+                "ml_active": False,
+                "prediction_method": "statistical",
+                "error": str(e),
+            }
         finally:
             db.close()
 

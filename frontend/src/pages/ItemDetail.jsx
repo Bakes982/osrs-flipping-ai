@@ -425,7 +425,14 @@ export default function ItemDetail() {
       {/* Multi-Horizon Predictions */}
       <div className="card" style={{ marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 14 }}>Price Predictions</h3>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <h3 style={{ fontSize: 14 }}>Price Predictions</h3>
+            {predictions?.prediction_method && (
+              <span className={`badge ${predictions.prediction_method === 'ml' ? 'badge-green' : 'badge-yellow'}`} style={{ fontSize: 11 }}>
+                {predictions.prediction_method === 'ml' ? '🧠 ML Model' : '📊 Statistical'}
+              </span>
+            )}
+          </div>
           <div className="horizon-tabs">
             {HORIZONS.map(h => (
               <button
@@ -448,6 +455,7 @@ export default function ItemDetail() {
                 <th>Predicted Sell</th>
                 <th>Direction</th>
                 <th>Confidence</th>
+                <th>Method</th>
               </tr>
             </thead>
             <tbody>
@@ -467,6 +475,11 @@ export default function ItemDetail() {
                     <td>
                       <span className={`badge ${p.confidence > 0.7 ? 'badge-green' : p.confidence > 0.5 ? 'badge-yellow' : 'badge-red'}`}>
                         {(p.confidence * 100).toFixed(0)}%
+                      </span>
+                    </td>
+                    <td>
+                      <span style={{ fontSize: 11, color: p.method === 'ml' ? '#22c55e' : '#999' }}>
+                        {p.method === 'ml' ? '🧠 ML' : p.method === 'statistical' ? '📊 Stat' : '📐 Heur'}
                       </span>
                     </td>
                   </tr>

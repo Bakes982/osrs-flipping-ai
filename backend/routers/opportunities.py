@@ -142,6 +142,12 @@ async def list_opportunities(
             "trend_score": round(fs.trend_score, 1),
             "history_score": round(fs.history_score, 1),
             "stability_score": round(fs.stability_score, 1),
+            "ml_signal_score": round(fs.ml_score, 1),
+
+            # ML prediction details
+            "ml_direction": fs.ml_direction,
+            "ml_prediction_confidence": round(fs.ml_confidence, 3) if fs.ml_confidence else None,
+            "ml_method": fs.ml_method,
 
             # Historical
             "win_rate": round(fs.win_rate * 100, 1) if fs.win_rate is not None else None,

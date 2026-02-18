@@ -154,6 +154,9 @@ export const api = {
   getModelMetrics() {
     return fetchJSON('/model/metrics');
   },
+  getModelStatus() {
+    return fetchJSON('/model/status');
+  },
 
   // Alerts
   getAlerts(params = {}) {

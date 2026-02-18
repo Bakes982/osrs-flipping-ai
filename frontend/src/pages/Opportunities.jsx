@@ -96,6 +96,19 @@ function ExpandedDetail({ opp }) {
                 <span className="text-muted">Stability</span>
                 <ScoreBar score={opp.stability_score || 0} />
               </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span className="text-muted">🧠 AI Signal</span>
+                <ScoreBar score={opp.ml_signal_score || 0} />
+              </div>
+              {opp.ml_direction && (
+                <div style={{ marginTop: 6, padding: '6px 10px', background: 'rgba(34,197,94,0.06)', borderRadius: 6, fontSize: 12 }}>
+                  AI predicts <strong style={{ color: opp.ml_direction === 'up' ? '#22c55e' : opp.ml_direction === 'down' ? '#ef4444' : '#f59e0b' }}>
+                    {opp.ml_direction === 'up' ? '▲ Up' : opp.ml_direction === 'down' ? '▼ Down' : '— Flat'}
+                  </strong>
+                  {opp.ml_prediction_confidence != null && ` (${(opp.ml_prediction_confidence * 100).toFixed(0)}% conf)`}
+                  {opp.ml_method && <span className="text-muted"> · {opp.ml_method === 'ml' ? 'ML Model' : 'Statistical'}</span>}
+                </div>
+              )}
             </div>
           </div>
 
