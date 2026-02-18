@@ -8,6 +8,7 @@ Run with:
 
 import sys
 import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -52,8 +53,16 @@ async def lifespan(app: FastAPI):
     logger.info("Initialising database...")
     init_db()
 
-    logger.info("Starting background tasks...")
-    await start_background_tasks()
+    # Schedule background tasks to start AFTER uvicorn is fully listening.
+    # Starting them before yield can block the event loop with sync MongoDB
+    # operations, preventing uvicorn from completing startup.
+    async def _delayed_start():
+        await asyncio.sleep(3)
+        logger.info("Starting background tasks...")
+        await start_background_tasks()
+
+    asyncio.create_task(_delayed_start())
+    logger.info("Database ready, background tasks scheduled.")
 
     yield  # Application is running
 
