@@ -22,6 +22,4 @@ COPY user_config.py .
 
 EXPOSE 8001
 
-ENV PORT=8001
-
-CMD ["sh", "-c", "exec uvicorn backend.app:app --host 0.0.0.0 --port $PORT"]
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8001"]
