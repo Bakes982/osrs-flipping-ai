@@ -6,12 +6,15 @@ bad flips using multiple independent signals. Each signal has a
 veto threshold that can reject an item entirely.
 
 Score breakdown (100 points max):
-  - Spread quality    (25 pts)  – is the margin real and healthy?
+  - Spread quality    (25 pts)  – is the margin in the 0.5-2% sweet spot?
   - Volume & liquidity (25 pts) – can you actually fill orders?
-  - Freshness         (15 pts)  – how recent is the price data?
-  - Trend alignment   (15 pts)  – is the trend helping or hurting?
+  - Freshness         (12 pts)  – how recent is the price data?
+  - Trend alignment   (10 pts)  – is the trend helping or hurting?
   - Historical winrate (10 pts) – how well has this item flipped before?
-  - Stability         (10 pts)  – is the price stable or whipsawing?
+  - Stability         (08 pts)  – is the price stable or whipsawing?
+  - ML prediction     (10 pts)  – AI confidence signal
+
+Post-score multiplier for price range (10M-50M sweet spot).
 """
 
 import time
@@ -90,13 +93,13 @@ class FlipScorer:
     # ML component gets weight when models are trained; otherwise
     # its weight is redistributed to other components automatically
     WEIGHTS = {
-        "spread": 0.22,
-        "volume": 0.22,
-        "freshness": 0.13,
-        "trend": 0.13,
+        "spread": 0.25,     # margin quality is #1 predictor of profitable flips
+        "volume": 0.25,     # liquidity is critical — can't profit if stuck
+        "freshness": 0.12,
+        "trend": 0.10,
         "history": 0.10,
         "stability": 0.08,
-        "ml": 0.12,  # ML prediction signal
+        "ml": 0.10,         # ML prediction signal
     }
 
     # Minimum score to suggest a flip (out of 100)
@@ -207,6 +210,30 @@ class FlipScorer:
             # Apply SmartPricer confidence as a multiplier
             fs.total_score *= max(0.3, rec.confidence)
 
+            # Price-range multiplier — data from 1,522 Copilot trades:
+            #   10M-50M:  sweet spot (93% WR, 144K avg/flip, 150K GP/hr)
+            #   50M+:     strong (83% WR, 322K avg/flip)
+            #   1M-10M:   solid
+            #   <10K:     good for bulk (46K avg/flip via volume)
+            #   10K-100K: neutral
+            #   100K-1M:  WORST bracket (-7.9M net loss!) — overcompeted
+            mid_price = (rec.instant_buy + rec.instant_sell) // 2 if rec.instant_buy and rec.instant_sell else 0
+            if mid_price > 0:
+                if 10_000_000 <= mid_price <= 50_000_000:
+                    fs.total_score *= 1.15   # best bracket
+                elif mid_price > 50_000_000:
+                    fs.total_score *= 1.10   # strong
+                elif 1_000_000 <= mid_price < 10_000_000:
+                    fs.total_score *= 1.05   # solid
+                elif mid_price < 10_000:
+                    fs.total_score *= 1.05   # bulk flipping works
+                elif 100_000 <= mid_price < 1_000_000:
+                    fs.total_score *= 0.85   # historically net loser
+                # 10K-100K stays at 1.0 (neutral)
+
+            # Cap at 100
+            fs.total_score = min(100, fs.total_score)
+
             # Generate human-readable reason
             fs.reason = self._build_reason(fs, rec)
 
@@ -249,10 +276,10 @@ class FlipScorer:
             fs.vetoed = True
             fs.veto_reasons.append("Zero volume in last 5 minutes - likely illiquid trap")
 
-        # Veto 4: Suspiciously large spread (>15% on most items)
-        if fs.spread_pct and fs.spread_pct > 15:
+        # Veto 4: Wide spread (>8%) — data shows >10% margins are net money losers
+        if fs.spread_pct and fs.spread_pct > 8:
             fs.vetoed = True
-            fs.veto_reasons.append(f"Spread too wide ({fs.spread_pct:.1f}%) - likely manipulated or illiquid")
+            fs.veto_reasons.append(f"Spread too wide ({fs.spread_pct:.1f}%) - margins >8% lose money historically")
 
         # Veto 5: Spread is negative or item is inverted
         if fs.spread is not None and fs.spread <= 0:
@@ -298,44 +325,56 @@ class FlipScorer:
     # ------------------------------------------------------------------
 
     def _score_spread(self, fs: FlipScore, rec: PriceRecommendation) -> float:
-        """Score spread quality. Ideal: 1-5%. Too tight: unprofitable. Too wide: trap."""
+        """Score spread quality.
+
+        Data from 1,522 Copilot trades shows the sweet spot is 0.5-2%:
+          0.5-1%  → 36.7M profit, 89% WR
+          1-2%    → 46.6M profit, 94% WR  (BEST)
+          2-5%    → diminishing returns
+          5-10%   → poor
+          10%+    → net LOSER (-11.3M)
+        """
         pct = fs.spread_pct or 0
 
         if pct <= 0:
             return 0
 
-        # Sweet spot: 1-3% for high-volume, 2-5% for medium, 3-8% for low
+        # Data-driven scoring — sweet spot 0.5-2% regardless of volume
         if rec.volume_5m > 30:
-            # High volume: even tight spreads are fine
-            if 0.5 <= pct <= 3:
-                return 95
+            # High volume: tight spreads are king
+            if 0.5 <= pct <= 2:
+                return 100   # sweet spot
             elif pct < 0.5:
-                return 40  # might not cover tax
+                return 35    # might not cover tax
+            elif pct <= 3:
+                return 80
             elif pct <= 5:
+                return 55
+            else:
+                return 20    # wide spread on liquid item = suspicious
+        elif rec.volume_5m > 10:
+            if 0.5 <= pct <= 2:
+                return 95
+            elif 2 < pct <= 3:
                 return 75
-            elif pct <= 8:
+            elif pct < 0.5:
+                return 25
+            elif pct <= 5:
                 return 50
             else:
-                return 25  # suspicious
-        elif rec.volume_5m > 10:
-            if 1 <= pct <= 5:
-                return 90
-            elif pct < 1:
-                return 30
-            elif pct <= 8:
-                return 65
-            else:
-                return 20
+                return 15
         else:
             # Low volume: wider spreads are normal but still risky
-            if 2 <= pct <= 8:
-                return 70
-            elif pct < 2:
-                return 20
-            elif pct <= 12:
-                return 40
+            if 1 <= pct <= 3:
+                return 75
+            elif 0.5 <= pct < 1:
+                return 55
+            elif 3 < pct <= 5:
+                return 45
+            elif pct < 0.5:
+                return 15
             else:
-                return 10
+                return 10    # >5% on low vol = trap
 
     def _score_volume(
         self, fs: FlipScore, rec: PriceRecommendation, snapshots: List[PriceSnapshot]
