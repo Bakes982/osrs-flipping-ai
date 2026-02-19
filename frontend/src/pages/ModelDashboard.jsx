@@ -6,10 +6,17 @@ const HORIZONS = ['1m', '5m', '30m', '2h', '8h', '24h'];
 const HORIZON_LABELS = { '1m': '1 Min', '5m': '5 Min', '30m': '30 Min', '2h': '2 Hour', '8h': '8 Hour', '24h': '24 Hour' };
 
 export default function ModelDashboard() {
-  const { data: status, loading } = useApi(() => api.getModelStatus(), [], 30000);
+  const { data: status, loading, error, reload } = useApi(() => api.getModelStatus(), [], 30000);
   const { data: metrics } = useApi(() => api.getModelMetrics(), [], 60000);
 
   if (loading) return <div className="loading">Loading ML pipeline status...</div>;
+  if (error) return (
+    <div className="empty" style={{ color: '#ef4444' }}>
+      <strong>Failed to load ML status</strong><br />
+      <small className="text-muted">{error.message || 'Connection error'}</small><br /><br />
+      <button className="btn" onClick={reload}>Retry</button>
+    </div>
+  );
 
   const mlActive = status?.ml_active;
   const liveAcc = status?.live_accuracy;
@@ -45,13 +52,13 @@ export default function ModelDashboard() {
       {/* KPI Summary row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, marginBottom: 24 }}>
         <div className="card" style={{ textAlign: 'center', padding: 20 }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: mlActive ? 'var(--color-success)' : 'var(--color-warning)' }}>
+          <div style={{ fontSize: 28, fontWeight: 700, color: mlActive ? 'var(--green)' : 'var(--yellow)' }}>
             {status?.prediction_method === 'ml' ? 'ML' : 'Statistical'}
           </div>
           <div className="text-muted" style={{ marginTop: 4 }}>Active Method</div>
         </div>
         <div className="card" style={{ textAlign: 'center', padding: 20 }}>
-          <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--color-primary)' }}>
+          <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--cyan)' }}>
             {liveAcc?.direction_accuracy_pct != null ? `${liveAcc.direction_accuracy_pct}%` : '—'}
           </div>
           <div className="text-muted" style={{ marginTop: 4 }}>Live Direction Accuracy</div>
@@ -201,7 +208,7 @@ export default function ModelDashboard() {
         <h3 style={{ marginBottom: 16 }}>⚙️ How the AI Learns</h3>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 20 }}>
           <div>
-            <h4 style={{ color: 'var(--color-primary)', marginBottom: 8 }}>📡 Data Collection</h4>
+            <h4 style={{ color: 'var(--cyan)', marginBottom: 8 }}>📡 Data Collection</h4>
             <ul style={{ listStyle: 'none', padding: 0, lineHeight: 2 }}>
               <li>🔄 Live prices collected every <strong>{pipeline?.price_collection_interval || '10s'}</strong></li>
               <li>🧮 Feature vectors recomputed every <strong>{pipeline?.feature_computation_interval || '60s'}</strong></li>
@@ -211,7 +218,7 @@ export default function ModelDashboard() {
             </ul>
           </div>
           <div>
-            <h4 style={{ color: 'var(--color-primary)', marginBottom: 8 }}>🧠 Model Training</h4>
+            <h4 style={{ color: 'var(--cyan)', marginBottom: 8 }}>🧠 Model Training</h4>
             <ul style={{ listStyle: 'none', padding: 0, lineHeight: 2 }}>
               <li>🔄 Models retrain every <strong>{pipeline?.retrain_interval || '6h'}</strong></li>
               <li>🎯 Predictions run every <strong>{pipeline?.prediction_interval || '60s'}</strong></li>
@@ -221,7 +228,7 @@ export default function ModelDashboard() {
             </ul>
           </div>
           <div>
-            <h4 style={{ color: 'var(--color-primary)', marginBottom: 8 }}>🔬 ML Architecture</h4>
+            <h4 style={{ color: 'var(--cyan)', marginBottom: 8 }}>🔬 ML Architecture</h4>
             <ul style={{ listStyle: 'none', padding: 0, lineHeight: 2 }}>
               <li>🌳 {status?.predictor?.forecaster?.backend === 'lightgbm' ? 'LightGBM' : 'Random Forest'} models</li>
               <li>📊 Direction classifier (up/down/flat)</li>

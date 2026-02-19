@@ -2,7 +2,7 @@ import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
-  ArrowUpRight, Info, Zap, Shield, BarChart3, Target,
+  ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -161,9 +161,8 @@ export default function Opportunities() {
   const [search, setSearch] = useState('');
   const [minPrice, setMinPrice] = useState(0);
   const [expandedId, setExpandedId] = useState(null);
-  const [viewMode, setViewMode] = useState('table'); // 'table' or 'cards'
 
-  const { data: raw, loading, reload } = useApi(
+  const { data: raw, loading, error, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_profit: minPrice }),
     [minPrice], 120000,
   );
@@ -309,6 +308,12 @@ export default function Opportunities() {
       <div className="card" style={{ padding: 0, overflow: 'auto' }}>
         {loading ? (
           <div className="loading">Scanning market for opportunities...</div>
+        ) : error ? (
+          <div className="empty" style={{ color: '#ef4444' }}>
+            <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
+            <strong>Failed to load opportunities</strong><br />
+            <small className="text-muted">{error.message || 'Connection error'} — auto-retrying</small>
+          </div>
         ) : filtered.length === 0 ? (
           <div className="empty">
             <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />

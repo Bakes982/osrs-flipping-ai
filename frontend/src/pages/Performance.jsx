@@ -1,5 +1,6 @@
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, CartesianGrid } from 'recharts';
 import { useNavigate } from 'react-router-dom';
+import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -12,9 +13,17 @@ function formatGP(n) {
 
 export default function Performance() {
   const nav = useNavigate();
-  const { data: perf, loading } = useApi(() => api.getPerformance(), [], 120000);
+  const { data: perf, loading, error, reload } = useApi(() => api.getPerformance(), [], 120000);
 
   if (loading) return <div className="loading">Loading performance data...</div>;
+  if (error) return (
+    <div className="empty" style={{ color: '#ef4444' }}>
+      <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
+      <strong>Failed to load performance data</strong><br />
+      <small className="text-muted">{error.message || 'Connection error'}</small><br /><br />
+      <button className="btn" onClick={reload}><RefreshCw size={14} /> Retry</button>
+    </div>
+  );
   if (!perf || perf.total_flips === 0) return (
     <div className="empty">
       No performance data available yet.

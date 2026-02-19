@@ -42,6 +42,7 @@ export default function Alerts() {
   const [filter, setFilter] = useState('all');
   const [showForm, setShowForm] = useState(false);
   const [newTarget, setNewTarget] = useState({ item_id: '', item_name: '', target_price: '', direction: 'below' });
+  const [actionError, setActionError] = useState(null);
 
   const { data: alertData, loading, reload } = useApi(
     () => api.getAlerts({ limit: 100, hours: 48 }),
@@ -63,32 +64,50 @@ export default function Alerts() {
     : alerts.filter(a => a.alert_type === filter);
 
   const handleAckAll = async () => {
-    await api.acknowledgeAlerts({ acknowledge_all: true });
-    reload();
+    setActionError(null);
+    try {
+      await api.acknowledgeAlerts({ acknowledge_all: true });
+      reload();
+    } catch (err) {
+      setActionError(`Failed to acknowledge alerts: ${err.message}`);
+    }
   };
 
   const handleAck = async (id) => {
-    await api.acknowledgeAlerts({ alert_ids: [id] });
-    reload();
+    try {
+      await api.acknowledgeAlerts({ alert_ids: [id] });
+      reload();
+    } catch (err) {
+      setActionError(`Failed to acknowledge alert: ${err.message}`);
+    }
   };
 
   const handleCreateTarget = async (e) => {
     e.preventDefault();
     if (!newTarget.item_id || !newTarget.target_price) return;
-    await api.createPriceTarget({
-      item_id: parseInt(newTarget.item_id),
-      item_name: newTarget.item_name,
-      target_price: parseInt(newTarget.target_price),
-      direction: newTarget.direction,
-    });
-    setNewTarget({ item_id: '', item_name: '', target_price: '', direction: 'below' });
-    setShowForm(false);
-    reloadTargets();
+    setActionError(null);
+    try {
+      await api.createPriceTarget({
+        item_id: parseInt(newTarget.item_id),
+        item_name: newTarget.item_name,
+        target_price: parseInt(newTarget.target_price),
+        direction: newTarget.direction,
+      });
+      setNewTarget({ item_id: '', item_name: '', target_price: '', direction: 'below' });
+      setShowForm(false);
+      reloadTargets();
+    } catch (err) {
+      setActionError(`Failed to create price target: ${err.message}`);
+    }
   };
 
   const handleDeleteTarget = async (itemId, direction) => {
-    await api.deletePriceTarget(itemId, direction);
-    reloadTargets();
+    try {
+      await api.deletePriceTarget(itemId, direction);
+      reloadTargets();
+    } catch (err) {
+      setActionError(`Failed to delete price target: ${err.message}`);
+    }
   };
 
   return (
@@ -111,6 +130,18 @@ export default function Alerts() {
           </button>
         </div>
       </div>
+
+      {/* Error banner */}
+      {actionError && (
+        <div style={{
+          padding: '10px 16px', marginBottom: 16, borderRadius: 8,
+          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
+          color: 'var(--red)', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span><AlertTriangle size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />{actionError}</span>
+          <button onClick={() => setActionError(null)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 16 }}>&times;</button>
+        </div>
+      )}
 
       {/* Price target form */}
       {showForm && (

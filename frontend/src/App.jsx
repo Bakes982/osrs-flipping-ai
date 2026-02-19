@@ -35,6 +35,7 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
   const [alertCount, setAlertCount] = useState(0);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // Check if user is logged in (uses Bearer token or cookie via api client)
   useEffect(() => {
@@ -101,7 +102,12 @@ export default function App() {
   return (
     <BrowserRouter>
       <div className="app">
-        <nav className="sidebar">
+        {/* Mobile menu overlay */}
+        <div
+          className={`mobile-overlay ${mobileMenuOpen ? 'visible' : ''}`}
+          onClick={() => setMobileMenuOpen(false)}
+        />
+        <nav className={`sidebar ${mobileMenuOpen ? 'open' : ''}`}>
           <div className="sidebar-header">
             <h1 className="logo">OSRS<span>Flipper</span></h1>
             <div className="status-badge">
@@ -116,6 +122,7 @@ export default function App() {
                 to={path}
                 end={path === '/'}
                 className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+                onClick={() => setMobileMenuOpen(false)}
               >
                 <Icon size={18} />
                 <span>{label}</span>
@@ -139,6 +146,13 @@ export default function App() {
           </div>
         </nav>
         <main className="content">
+          <button
+            className="mobile-menu-btn"
+            onClick={() => setMobileMenuOpen(o => !o)}
+            style={{ marginBottom: 12 }}
+          >
+            ☰
+          </button>
           <Routes>
             <Route path="/" element={<Dashboard prices={livePrices} />} />
             <Route path="/opportunities" element={<Opportunities prices={livePrices} />} />

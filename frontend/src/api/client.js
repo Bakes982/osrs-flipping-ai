@@ -43,8 +43,9 @@ export function clearToken() {
 // Core fetch wrapper
 // ---------------------------------------------------------------------------
 
-function authHeaders() {
-  const headers = { 'Content-Type': 'application/json' };
+function authHeaders(hasBody = false) {
+  const headers = {};
+  if (hasBody) headers['Content-Type'] = 'application/json';
   const token = getToken();
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -54,10 +55,11 @@ function authHeaders() {
 
 async function fetchJSON(path, options = {}, retries = 3) {
   const url = `${API_BASE}${path}`;
+  const hasBody = !!options.body;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, {
-        headers: authHeaders(),
+        headers: authHeaders(hasBody),
         ...options,
       });
 
@@ -76,7 +78,9 @@ async function fetchJSON(path, options = {}, retries = 3) {
         throw new Error('Backend returned unexpected HTML. It may be restarting.');
       }
       if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-      return res.json();
+      if (res.status === 204) return null;
+      const text = await res.text();
+      return text ? JSON.parse(text) : null;
     } catch (err) {
       if (attempt < retries && err instanceof TypeError) {
         // Network error (CORS block, DNS, offline) – retry

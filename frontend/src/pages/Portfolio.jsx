@@ -50,24 +50,28 @@ export default function Portfolio({ prices }) {
   );
   const totalPnL = positions.reduce((s, p) => s + (p.recommended_profit || 0), 0);
 
+  const [actionError, setActionError] = useState(null);
+
   const handleDismiss = async (e, tradeId) => {
     e.stopPropagation();
+    setActionError(null);
     try {
       await api.dismissPosition(tradeId);
       reloadPos();
-      setLivePositions(null); // force refresh from API
+      setLivePositions(null);
     } catch (err) {
-      console.error('Failed to dismiss position:', err);
+      setActionError(`Failed to dismiss position: ${err.message}`);
     }
   };
 
   const handleClearCsv = async () => {
+    setActionError(null);
     try {
-      const res = await api.clearCsvPositions();
+      await api.clearCsvPositions();
       reloadPos();
       setLivePositions(null);
     } catch (err) {
-      console.error('Failed to clear CSV positions:', err);
+      setActionError(`Failed to clear CSV positions: ${err.message}`);
     }
   };
 
@@ -90,7 +94,7 @@ export default function Portfolio({ prices }) {
       <div className="stats-grid">
         <div className="card">
           <div className="card-title">Open Positions</div>
-          <div className="card-value">{positions.length || holdings.length}</div>
+          <div className="card-value">{positions.length}</div>
         </div>
         <div className="card">
           <div className="card-title">Total Invested</div>
@@ -109,6 +113,18 @@ export default function Portfolio({ prices }) {
           </div>
         </div>
       </div>
+
+      {/* Error banner */}
+      {actionError && (
+        <div style={{
+          padding: '10px 16px', marginBottom: 16, borderRadius: 8,
+          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
+          color: 'var(--red)', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        }}>
+          <span><AlertTriangle size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />{actionError}</span>
+          <button onClick={() => setActionError(null)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer' }}>&times;</button>
+        </div>
+      )}
 
       {/* Active Positions (with live pricing) */}
       <div className="card" style={{ marginBottom: 24 }}>
@@ -221,7 +237,7 @@ export default function Portfolio({ prices }) {
       <div className="card">
         <h3 style={{ fontSize: 14, marginBottom: 16 }}>Recent Trades</h3>
         {!trades?.length ? (
-          <div className="empty">No trades recorded — <a href="/import" style={{ color: 'var(--cyan)' }}>import your CSV</a></div>
+          <div className="empty">No trades recorded — <span onClick={() => nav('/import')} style={{ color: 'var(--cyan)', cursor: 'pointer' }}>import your CSV</span></div>
         ) : (
           <table className="data-table">
             <thead>
