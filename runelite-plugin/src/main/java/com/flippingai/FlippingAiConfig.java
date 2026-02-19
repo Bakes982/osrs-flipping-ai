@@ -70,6 +70,18 @@ public interface FlippingAiConfig extends Config
         return PredictionHorizon.FIVE_MIN;
     }
 
+    @ConfigItem(
+        keyName = "showPriceSuggestions",
+        name = "GE Price Suggestions",
+        description = "Show clickable AI and Wiki price suggestions when setting a GE offer price",
+        section = displaySection,
+        position = 3
+    )
+    default boolean showPriceSuggestions()
+    {
+        return true;
+    }
+
     @ConfigSection(
         name = "Notifications",
         description = "Alert settings",

@@ -6,8 +6,10 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
+import net.runelite.api.VarPlayer;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.VarClientIntChanged;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
@@ -67,10 +69,17 @@ public class FlippingAiPlugin extends Plugin
     private NavigationButton navButton;
     private ScheduledExecutorService scheduler;
 
+    // GE price suggestion state
+    private OfferEditorWidget offerEditor;
+    private boolean isSelling = false;
+    private boolean priceSuggestionsShown = false;
+
     // GE widget group and child IDs
     private static final int GE_OFFER_WINDOW_GROUP = 465;
     private static final int GE_SEARCH_RESULTS = 162;
     private static final int GE_ITEM_ID_CHILD = 21;
+    private static final int GE_OFFER_CONTAINER_CHILD = 26;
+    private static final int GE_OFFER_TYPE_TEXT_CHILD = 20;
 
     @Provides
     FlippingAiConfig provideConfig(ConfigManager configManager)
@@ -119,6 +128,8 @@ public class FlippingAiPlugin extends Plugin
 
         currentPrediction = null;
         currentGeItemId = -1;
+        offerEditor = null;
+        priceSuggestionsShown = false;
         log.info("Flipping AI stopped");
     }
 
@@ -152,24 +163,113 @@ public class FlippingAiPlugin extends Plugin
         if (offer.getState() == GrandExchangeOfferState.BOUGHT ||
             offer.getState() == GrandExchangeOfferState.SOLD)
         {
-            // Could log completed trades here for local tracking
             log.debug("GE trade completed: {} x{} @ {}gp",
                 offer.getItemId(), offer.getTotalQuantity(), offer.getPrice());
         }
     }
 
+    @Subscribe
+    public void onVarClientIntChanged(VarClientIntChanged event)
+    {
+        // VarClientInt index 5 = INPUT_TYPE
+        if (event.getIndex() != 5)
+        {
+            return;
+        }
+
+        int inputType = client.getVarcIntValue(5);
+
+        // Input closed — clean up
+        if (inputType == 0)
+        {
+            offerEditor = null;
+            priceSuggestionsShown = false;
+            return;
+        }
+
+        // 7 = chatbox text input (used for GE price and quantity entry)
+        if (inputType != 7 || !config.showPriceSuggestions())
+        {
+            return;
+        }
+
+        clientThread.invokeLater(this::tryCreatePriceSuggestions);
+    }
+
+    private void tryCreatePriceSuggestions()
+    {
+        if (priceSuggestionsShown)
+        {
+            return;
+        }
+
+        // Only show on the price input, not the quantity input
+        Widget chatboxTitle = client.getWidget(162, 1);
+        if (chatboxTitle == null || !"Set a price for each item:".equals(chatboxTitle.getText()))
+        {
+            return;
+        }
+
+        // Verify GE offer setup is visible
+        Widget offerContainer = client.getWidget(GE_OFFER_WINDOW_GROUP, GE_OFFER_CONTAINER_CHILD);
+        if (offerContainer == null || offerContainer.isHidden())
+        {
+            return;
+        }
+
+        // Determine buy/sell (varbit 4397 = GE_OFFER_CREATION_TYPE; 0=buy, 1=sell)
+        isSelling = client.getVarbitValue(4397) == 1;
+
+        // Get the current item from VarPlayer
+        int geItemId = client.getVarpValue(VarPlayer.CURRENT_GE_ITEM);
+        if (geItemId <= 0)
+        {
+            return;
+        }
+
+        // If we don't have a prediction for this item, fetch one and wait
+        if (currentPrediction == null || currentPrediction.itemId != geItemId)
+        {
+            if (currentGeItemId != geItemId)
+            {
+                currentGeItemId = geItemId;
+                fetchPrediction(geItemId);
+            }
+            return;
+        }
+
+        // Create the suggestion widgets in the chatbox
+        Widget chatboxContainer = client.getWidget(162, 0);
+        if (chatboxContainer == null)
+        {
+            return;
+        }
+
+        offerEditor = new OfferEditorWidget(client, chatboxContainer);
+        long wikiPrice = isSelling ? currentPrediction.currentSell : currentPrediction.currentBuy;
+        long aiPrice = isSelling ? currentPrediction.suggestedSell : currentPrediction.suggestedBuy;
+        offerEditor.showPriceSuggestions(isSelling, wikiPrice, aiPrice);
+        priceSuggestionsShown = true;
+    }
+
     private void updateGeItemId()
     {
         clientThread.invokeLater(() -> {
-            Widget geWidget = client.getWidget(GE_OFFER_WINDOW_GROUP, GE_ITEM_ID_CHILD);
-            if (geWidget != null)
+            // Try VarPlayer first (more reliable), fall back to widget
+            int itemId = client.getVarpValue(VarPlayer.CURRENT_GE_ITEM);
+            if (itemId <= 0)
             {
-                int itemId = geWidget.getItemId();
-                if (itemId > 0 && itemId != currentGeItemId)
+                Widget geWidget = client.getWidget(GE_OFFER_WINDOW_GROUP, GE_ITEM_ID_CHILD);
+                if (geWidget != null)
                 {
-                    currentGeItemId = itemId;
-                    fetchPrediction(itemId);
+                    itemId = geWidget.getItemId();
                 }
+            }
+            if (itemId > 0 && itemId != currentGeItemId)
+            {
+                currentGeItemId = itemId;
+                priceSuggestionsShown = false; // Reset when item changes
+                fetchPrediction(itemId);
             }
         });
     }
@@ -184,6 +284,11 @@ public class FlippingAiPlugin extends Plugin
             {
                 notifier.notify("Flipping AI: " + prediction.itemName +
                     " - potential " + prediction.getFormattedProfit() + " GP profit!");
+            }
+            // If the GE price input is still open, show suggestions now
+            if (prediction != null)
+            {
+                clientThread.invokeLater(this::tryCreatePriceSuggestions);
             }
         });
     }
