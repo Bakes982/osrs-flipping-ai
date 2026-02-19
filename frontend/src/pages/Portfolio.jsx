@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye } from 'lucide-react';
+import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye, X, Trash2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api, createPriceSocket } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -15,10 +15,13 @@ const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif
 
 export default function Portfolio({ prices }) {
   const nav = useNavigate();
+  const [sourceFilter, setSourceFilter] = useState('dink'); // 'dink' | 'all'
   const { data: portfolio, loading, reload } = useApi(() => api.getPortfolio(), [], 120000);
   const { data: trades } = useApi(() => api.getTrades({ limit: 50 }), [], 120000);
   const { data: posData, loading: posLoading, reload: reloadPos } = useApi(
-    () => api.getActivePositions(), [], 60000
+    () => api.getActivePositions(sourceFilter === 'all' ? undefined : sourceFilter),
+    [sourceFilter],
+    60000
   );
 
   // Live position updates from WebSocket
@@ -30,7 +33,6 @@ export default function Portfolio({ prices }) {
         setLivePositions(msg.positions);
       }
       if (msg.type === 'position_opened' || msg.type === 'position_closed') {
-        // Refresh positions when a new trade comes in
         reloadPos();
       }
     });
@@ -40,16 +42,34 @@ export default function Portfolio({ prices }) {
   // Use live data if available, otherwise fall back to API snapshot
   const positions = livePositions || posData?.positions || [];
 
-  // Holdings from portfolio (fallback if no positions endpoint data)
-  const holdings = portfolio?.holdings || [];
   const totalInvested = positions.reduce(
     (s, p) => s + (p.buy_price || 0) * (p.quantity || 0), 0
-  ) || holdings.reduce((s, h) => s + (h.total_cost || (h.buy_price * h.quantity) || 0), 0);
-
+  );
   const totalCurrentValue = positions.reduce(
     (s, p) => s + (p.current_price || p.buy_price || 0) * (p.quantity || 0), 0
   );
   const totalPnL = positions.reduce((s, p) => s + (p.recommended_profit || 0), 0);
+
+  const handleDismiss = async (e, tradeId) => {
+    e.stopPropagation();
+    try {
+      await api.dismissPosition(tradeId);
+      reloadPos();
+      setLivePositions(null); // force refresh from API
+    } catch (err) {
+      console.error('Failed to dismiss position:', err);
+    }
+  };
+
+  const handleClearCsv = async () => {
+    try {
+      const res = await api.clearCsvPositions();
+      reloadPos();
+      setLivePositions(null);
+    } catch (err) {
+      console.error('Failed to clear CSV positions:', err);
+    }
+  };
 
   return (
     <div>
@@ -97,6 +117,22 @@ export default function Portfolio({ prices }) {
             <Eye size={16} /> Active Positions
             {livePositions && <span className="badge badge-green" style={{ fontSize: 10 }}>LIVE</span>}
           </h3>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <select
+              value={sourceFilter}
+              onChange={e => { setSourceFilter(e.target.value); setLivePositions(null); }}
+              className="input"
+              style={{ padding: '4px 8px', fontSize: 12, width: 'auto' }}
+            >
+              <option value="dink">DINK Only</option>
+              <option value="all">All Sources</option>
+            </select>
+            {sourceFilter === 'all' && positions.some(p => p.source === 'csv_import') && (
+              <button className="btn" style={{ fontSize: 11, padding: '4px 10px' }} onClick={handleClearCsv}>
+                <Trash2 size={12} /> Clear CSV
+              </button>
+            )}
+          </div>
         </div>
         {posLoading && !positions.length ? <div className="loading">Loading positions...</div> : (
           !positions.length ? (
@@ -115,6 +151,7 @@ export default function Portfolio({ prices }) {
                   <th>Rec. Sell</th>
                   <th>Change</th>
                   <th>Est. Profit</th>
+                  <th style={{ width: 36 }}></th>
                 </tr>
               </thead>
               <tbody>
@@ -158,6 +195,18 @@ export default function Portfolio({ prices }) {
                         {recProfit != null
                           ? `${recProfit >= 0 ? '+' : ''}${formatGP(recProfit)} (${recProfitPct >= 0 ? '+' : ''}${recProfitPct.toFixed(1)}%)`
                           : '—'}
+                      </td>
+                      <td>
+                        <button
+                          onClick={(e) => handleDismiss(e, p.trade_id)}
+                          title="Dismiss position"
+                          style={{
+                            background: 'none', border: 'none', cursor: 'pointer',
+                            color: 'var(--text-muted)', padding: 4,
+                          }}
+                        >
+                          <X size={14} />
+                        </button>
                       </td>
                     </tr>
                   );

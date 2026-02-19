@@ -894,18 +894,32 @@ def find_snapshot_near_time(
 # Active-position tracking helpers
 # ---------------------------------------------------------------------------
 
-def find_active_positions(db: Database) -> List[Dict]:
-    """Return all active (open) positions — BUY trades not yet matched to a flip."""
+def find_active_positions(
+    db: Database,
+    source: Optional[str] = None,
+) -> List[Dict]:
+    """Return active (open) positions — BUY trades not yet matched to a flip.
+
+    Args:
+        source: Filter by trade source ('dink', 'csv_import', or None for all).
+                Dismissed positions are always excluded.
+    """
     matched_ids = get_matched_buy_trade_ids(db)
-    docs = db.trades.find({
+    dismissed = set(get_setting(db, "dismissed_positions", default=[]))
+
+    query: Dict = {
         "trade_type": "BUY",
         "status": "BOUGHT",
-    }).sort("timestamp", DESCENDING)
+    }
+    if source:
+        query["source"] = source
+
+    docs = db.trades.find(query).sort("timestamp", DESCENDING)
 
     positions = []
     for d in docs:
         trade = Trade.from_doc(d)
-        if trade.id not in matched_ids:
+        if trade.id not in matched_ids and trade.id not in dismissed:
             positions.append({
                 "trade_id": trade.id,
                 "item_id": trade.item_id,
@@ -916,8 +930,32 @@ def find_active_positions(db: Database) -> List[Dict]:
                 "bought_at": trade.timestamp.isoformat() if trade.timestamp else None,
                 "player": trade.player,
                 "market_price_at_buy": trade.market_price,
+                "source": trade.source,
             })
     return positions
+
+
+def dismiss_position(db: Database, trade_id: str):
+    """Mark a position as dismissed so it no longer shows in active positions."""
+    dismissed = get_setting(db, "dismissed_positions", default=[])
+    if trade_id not in dismissed:
+        dismissed.append(trade_id)
+        set_setting(db, "dismissed_positions", dismissed)
+
+
+def dismiss_positions_by_source(db: Database, source: str) -> int:
+    """Dismiss all active positions from a given source (e.g. 'csv_import')."""
+    positions = find_active_positions(db, source=source)
+    dismissed = get_setting(db, "dismissed_positions", default=[])
+    count = 0
+    for p in positions:
+        tid = p["trade_id"]
+        if tid not in dismissed:
+            dismissed.append(tid)
+            count += 1
+    if count:
+        set_setting(db, "dismissed_positions", dismissed)
+    return count
 
 
 def get_position_monitoring_state(db: Database) -> Dict:

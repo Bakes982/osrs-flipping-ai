@@ -126,8 +126,15 @@ export const api = {
   getPortfolio() {
     return fetchJSON('/portfolio');
   },
-  getActivePositions() {
-    return fetchJSON('/positions');
+  getActivePositions(source) {
+    const qs = source ? `?source=${source}` : '';
+    return fetchJSON(`/positions${qs}`);
+  },
+  dismissPosition(tradeId) {
+    return fetchJSON(`/positions/dismiss?trade_id=${tradeId}`, { method: 'POST' });
+  },
+  clearCsvPositions() {
+    return fetchJSON('/positions/clear-csv', { method: 'POST' });
   },
   getTrades(params = {}) {
     const qs = new URLSearchParams(params).toString();

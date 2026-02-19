@@ -35,6 +35,8 @@ from backend.database import (
     find_all_flips,
     find_unmatched_buy_trades,
     find_active_positions,
+    dismiss_position,
+    dismiss_positions_by_source,
     insert_trade,
     insert_flip,
     get_matched_buy_trade_ids,
@@ -472,19 +474,51 @@ async def clear_trade_history():
 # ---------------------------------------------------------------------------
 
 @router.get("/api/positions")
-async def get_active_positions():
+async def get_active_positions(
+    source: Optional[str] = Query(None, description="Filter by source: 'dink' or 'csv_import'"),
+):
     """Return all active (open) positions with live pricing data.
 
     Each position includes the original buy price, current market price,
     recommended sell price, and estimated profit/loss.
+
+    Use ?source=dink to show only DINK-tracked positions (recommended).
     """
     def _sync():
         from backend.tasks import get_position_monitor
         monitor = get_position_monitor()
-        return monitor.get_positions_with_prices()
+        return monitor.get_positions_with_prices(source=source)
 
     positions = await asyncio.to_thread(_sync)
     return {"positions": positions, "total": len(positions)}
+
+
+@router.post("/api/positions/dismiss")
+async def dismiss_active_position(trade_id: str = Query(..., description="Trade ID to dismiss")):
+    """Dismiss a single position so it no longer appears in active positions."""
+    def _sync():
+        db = get_db()
+        try:
+            dismiss_position(db, trade_id)
+            return {"status": "ok", "dismissed": trade_id}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
+
+
+@router.post("/api/positions/clear-csv")
+async def clear_csv_positions():
+    """Dismiss all positions that came from CSV import (stale data)."""
+    def _sync():
+        db = get_db()
+        try:
+            count = dismiss_positions_by_source(db, "csv_import")
+            return {"status": "ok", "dismissed_count": count}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------
