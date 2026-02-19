@@ -184,12 +184,17 @@ async def get_trades(
     limit: int = Query(100, ge=1, le=1000),
     item_id: Optional[int] = Query(None),
     player: Optional[str] = Query(None, description="Filter by player RSN"),
+    status: Optional[str] = Query(None, description="Exact status filter (BOUGHT, SOLD, BUYING, SELLING)"),
+    completed_only: bool = Query(True, description="Only show filled trades (BOUGHT/SOLD)"),
 ):
     """Return trade history from the trades table."""
     def _sync():
         db = get_db()
         try:
-            rows = find_trades(db, item_id=item_id, limit=limit, player=player)
+            rows = find_trades(
+                db, item_id=item_id, limit=limit, player=player,
+                status=status, completed_only=completed_only,
+            )
             return [
                 {
                     "id": t.id,

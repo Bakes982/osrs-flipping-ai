@@ -679,7 +679,33 @@ def insert_price_snapshots(db: Database, snapshots: List[PriceSnapshot]) -> int:
 
 
 def insert_trade(db: Database, trade: Trade) -> str:
-    """Insert a trade and return the new ObjectId as string."""
+    """Insert a trade, de-duplicating by (item_id, player, slot, status, quantity, price).
+
+    DINK can send the same webhook multiple times — this prevents
+    phantom duplicate positions from appearing in the portfolio.
+    Returns the existing document's ID if a duplicate is found.
+    """
+    # Build a dedup key from the fields that uniquely identify a GE event
+    dedup_query: Dict = {
+        "item_id": trade.item_id,
+        "player": trade.player,
+        "status": trade.status,
+        "quantity": trade.quantity,
+        "price": trade.price,
+    }
+    if trade.slot is not None:
+        dedup_query["slot"] = trade.slot
+    # If a matching doc was inserted within the last 60 seconds, skip
+    if trade.timestamp:
+        dedup_query["timestamp"] = {
+            "$gte": trade.timestamp - timedelta(seconds=60),
+            "$lte": trade.timestamp + timedelta(seconds=60),
+        }
+    existing = db.trades.find_one(dedup_query)
+    if existing:
+        trade.id = str(existing["_id"])
+        return trade.id
+
     doc = trade.to_doc()
     result = db.trades.insert_one(doc)
     trade.id = str(result.inserted_id)
@@ -780,13 +806,28 @@ def find_trades(
     item_id: Optional[int] = None,
     limit: int = 100,
     player: Optional[str] = None,
+    status: Optional[str] = None,
+    completed_only: bool = False,
 ) -> List[Trade]:
-    """Find trades, newest first.  Optionally filter by player (RSN)."""
+    """Find trades, newest first.
+
+    Args:
+        item_id: Filter by item.
+        limit: Max rows.
+        player: Filter by player RSN.
+        status: Exact status filter (e.g. 'BOUGHT', 'SOLD').
+        completed_only: If True, only return trades with
+            status BOUGHT or SOLD (i.e. actually filled).
+    """
     query: Dict = {}
     if item_id is not None:
         query["item_id"] = item_id
     if player:
         query["player"] = player
+    if status:
+        query["status"] = status
+    elif completed_only:
+        query["status"] = {"$in": ["BOUGHT", "SOLD"]}
     docs = (
         db.trades.find(query)
         .sort("timestamp", DESCENDING)

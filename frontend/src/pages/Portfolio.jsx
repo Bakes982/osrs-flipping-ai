@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye, X, Trash2 } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye, X, Trash2, Clock, Filter } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api, createPriceSocket } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -12,43 +12,71 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
+function timeAgo(dateStr) {
+  if (!dateStr) return '';
+  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
+  if (diff < 60) return `${Math.floor(diff)}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
 const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
 
 export default function Portfolio({ prices }) {
   const nav = useNavigate();
   const { activeAccount } = useAccount();
-  const [sourceFilter, setSourceFilter] = useState('dink'); // 'dink' | 'all'
-  const { data: portfolio, loading, reload } = useApi(
-    () => api.getPortfolio(activeAccount), [activeAccount], 120000,
-  );
-  const { data: trades } = useApi(
-    () => api.getTrades({ limit: 50, ...(activeAccount ? { player: activeAccount } : {}) }),
-    [activeAccount], 120000,
-  );
+  const [sourceFilter, setSourceFilter] = useState('dink');
+  const [showPending, setShowPending] = useState(false);          // toggle for BUYING/SELLING
+  const [lastRefresh, setLastRefresh] = useState(Date.now());     // for "updated X ago"
+  const refreshTimer = useRef(null);
+
+  // ---- Active positions (only BOUGHT, unmatched) ----
   const { data: posData, loading: posLoading, reload: reloadPos } = useApi(
     () => api.getActivePositions(sourceFilter === 'all' ? undefined : sourceFilter, activeAccount),
     [sourceFilter, activeAccount],
-    60000
+    30000                                                        // auto-refresh every 30s
   );
 
-  // Live position updates from WebSocket
+  // ---- Trade history (only filled by default) ----
+  const { data: trades, reload: reloadTrades } = useApi(
+    () => api.getTrades({
+      limit: 50,
+      ...(activeAccount ? { player: activeAccount } : {}),
+      completed_only: showPending ? 'false' : 'true',
+    }),
+    [activeAccount, showPending], 120000,
+  );
+
+  // WebSocket for live position updates
   const [livePositions, setLivePositions] = useState(null);
 
   useEffect(() => {
     const socket = createPriceSocket((msg) => {
       if (msg.type === 'position_update' && msg.positions) {
         setLivePositions(msg.positions);
+        setLastRefresh(Date.now());
       }
       if (msg.type === 'position_opened' || msg.type === 'position_closed') {
         reloadPos();
+        reloadTrades();
+        setLastRefresh(Date.now());
       }
     });
     return () => socket.close();
-  }, [reloadPos]);
+  }, [reloadPos, reloadTrades]);
+
+  // Tick the "updated X ago" label every 10s
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 10000);
+    return () => clearInterval(id);
+  }, []);
 
   // Use live data if available, otherwise fall back to API snapshot
   const positions = livePositions || posData?.positions || [];
 
+  // ---- Summary stats (only from real filled positions) ----
   const totalInvested = positions.reduce(
     (s, p) => s + (p.buy_price || 0) * (p.quantity || 0), 0
   );
@@ -67,7 +95,7 @@ export default function Portfolio({ prices }) {
       reloadPos();
       setLivePositions(null);
     } catch (err) {
-      setActionError(`Failed to dismiss position: ${err.message}`);
+      setActionError(`Failed to dismiss: ${err.message}`);
     }
   };
 
@@ -82,29 +110,40 @@ export default function Portfolio({ prices }) {
     }
   };
 
+  const handleRefreshAll = () => {
+    reloadPos();
+    reloadTrades();
+    setLivePositions(null);
+    setLastRefresh(Date.now());
+  };
+
   return (
     <div>
+      {/* ---- Header ---- */}
       <div className="page-header">
         <div>
           <h2 className="page-title">Portfolio</h2>
           <p className="page-subtitle">
             {activeAccount
-              ? `${activeAccount} — active positions & trade history`
-              : 'Active positions & trade history'}
+              ? `${activeAccount} — filled positions & trade history`
+              : 'All accounts — filled positions & trade history'}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span className="text-muted" style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}>
+            <Clock size={12} /> {timeAgo(new Date(lastRefresh).toISOString())}
+          </span>
           <button className="btn" onClick={() => nav('/import')}>Import CSV</button>
-          <button className="btn" onClick={() => { reload(); reloadPos(); }}>
+          <button className="btn" onClick={handleRefreshAll}>
             <RefreshCw size={14} /> Refresh
           </button>
         </div>
       </div>
 
-      {/* Stats */}
+      {/* ---- Summary cards ---- */}
       <div className="stats-grid">
         <div className="card">
-          <div className="card-title">Open Positions</div>
+          <div className="card-title">Filled Positions</div>
           <div className="card-value">{positions.length}</div>
         </div>
         <div className="card">
@@ -125,7 +164,7 @@ export default function Portfolio({ prices }) {
         </div>
       </div>
 
-      {/* Error banner */}
+      {/* ---- Error ---- */}
       {actionError && (
         <div style={{
           padding: '10px 16px', marginBottom: 16, borderRadius: 8,
@@ -137,7 +176,9 @@ export default function Portfolio({ prices }) {
         </div>
       )}
 
-      {/* Active Positions (with live pricing) */}
+      {/* ================================================================== */}
+      {/*  Active Positions — only items actually BOUGHT (filled)             */}
+      {/* ================================================================== */}
       <div className="card" style={{ marginBottom: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h3 style={{ fontSize: 14, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -161,11 +202,15 @@ export default function Portfolio({ prices }) {
             )}
           </div>
         </div>
+
         {posLoading && !positions.length ? <div className="loading">Loading positions...</div> : (
           !positions.length ? (
             <div className="empty">
-              No active positions — when DINK sends a BUY confirmation, positions appear here
-              with live price tracking and sell recommendations.
+              No filled positions yet.
+              <br />
+              <span className="text-muted" style={{ fontSize: 12 }}>
+                Only items that were actually bought appear here — pending/cancelled offers are excluded.
+              </span>
             </div>
           ) : (
             <table className="data-table">
@@ -175,10 +220,11 @@ export default function Portfolio({ prices }) {
                   {!activeAccount && <th>Account</th>}
                   <th>Qty</th>
                   <th>Buy Price</th>
-                  <th>Current Price</th>
+                  <th>Current</th>
                   <th>Rec. Sell</th>
                   <th>Change</th>
                   <th>Est. Profit</th>
+                  <th style={{ width: 80 }}>Bought</th>
                   <th style={{ width: 36 }}></th>
                 </tr>
               </thead>
@@ -227,6 +273,9 @@ export default function Portfolio({ prices }) {
                           ? `${recProfit >= 0 ? '+' : ''}${formatGP(recProfit)} (${recProfitPct >= 0 ? '+' : ''}${recProfitPct.toFixed(1)}%)`
                           : '—'}
                       </td>
+                      <td className="text-muted" style={{ fontSize: 11 }}>
+                        {timeAgo(p.bought_at)}
+                      </td>
                       <td>
                         <button
                           onClick={(e) => handleDismiss(e, p.trade_id)}
@@ -248,11 +297,25 @@ export default function Portfolio({ prices }) {
         )}
       </div>
 
-      {/* Recent Trades */}
+      {/* ================================================================== */}
+      {/*  Trade History — only filled by default, toggle to see pending      */}
+      {/* ================================================================== */}
       <div className="card">
-        <h3 style={{ fontSize: 14, marginBottom: 16 }}>Recent Trades</h3>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ fontSize: 14, margin: 0 }}>Trade History</h3>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
+            <Filter size={12} />
+            <input
+              type="checkbox"
+              checked={showPending}
+              onChange={e => setShowPending(e.target.checked)}
+              style={{ accentColor: 'var(--cyan)' }}
+            />
+            Include pending (BUYING / SELLING)
+          </label>
+        </div>
         {!trades?.length ? (
-          <div className="empty">No trades recorded — <span onClick={() => nav('/import')} style={{ color: 'var(--cyan)', cursor: 'pointer' }}>import your CSV</span></div>
+          <div className="empty">No completed trades — <span onClick={() => nav('/import')} style={{ color: 'var(--cyan)', cursor: 'pointer' }}>import your CSV</span> or wait for DINK webhooks.</div>
         ) : (
           <table className="data-table">
             <thead>
@@ -261,6 +324,7 @@ export default function Portfolio({ prices }) {
                 <th>Item</th>
                 {!activeAccount && <th>Account</th>}
                 <th>Type</th>
+                <th>Status</th>
                 <th>Qty</th>
                 <th>Price</th>
                 <th>Total</th>
@@ -268,24 +332,34 @@ export default function Portfolio({ prices }) {
               </tr>
             </thead>
             <tbody>
-              {trades.slice(0, 30).map((t, i) => (
-                <tr key={i}>
-                  <td className="text-muted">{t.timestamp ? new Date(t.timestamp).toLocaleString() : '—'}</td>
-                  <td style={{ fontWeight: 500 }}>{t.item_name}</td>
-                  {!activeAccount && (
-                    <td className="text-muted" style={{ fontSize: 11 }}>{t.player || '—'}</td>
-                  )}
-                  <td>
-                    <span className={`badge ${t.trade_type === 'BUY' ? 'badge-green' : 'badge-red'}`}>
-                      {t.trade_type}
-                    </span>
-                  </td>
-                  <td>{t.quantity?.toLocaleString()}</td>
-                  <td className="gp">{formatGP(t.price)}</td>
-                  <td className="gp">{formatGP(t.total_value)}</td>
-                  <td className="text-muted" style={{ fontSize: 11 }}>{t.source || '—'}</td>
-                </tr>
-              ))}
+              {trades.slice(0, 30).map((t, i) => {
+                const isFilled = t.status === 'BOUGHT' || t.status === 'SOLD';
+                return (
+                  <tr key={i} style={{ opacity: isFilled ? 1 : 0.5 }}>
+                    <td className="text-muted" style={{ fontSize: 12 }}>
+                      {t.timestamp ? timeAgo(t.timestamp) : '—'}
+                    </td>
+                    <td style={{ fontWeight: 500 }}>{t.item_name}</td>
+                    {!activeAccount && (
+                      <td className="text-muted" style={{ fontSize: 11 }}>{t.player || '—'}</td>
+                    )}
+                    <td>
+                      <span className={`badge ${t.trade_type === 'BUY' ? 'badge-green' : 'badge-red'}`}>
+                        {t.trade_type}
+                      </span>
+                    </td>
+                    <td>
+                      <span className={`badge ${isFilled ? 'badge-green' : 'badge-yellow'}`} style={{ fontSize: 10 }}>
+                        {t.status}
+                      </span>
+                    </td>
+                    <td>{t.quantity?.toLocaleString()}</td>
+                    <td className="gp">{formatGP(t.price)}</td>
+                    <td className="gp">{formatGP(t.total_value)}</td>
+                    <td className="text-muted" style={{ fontSize: 11 }}>{t.source || '—'}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
