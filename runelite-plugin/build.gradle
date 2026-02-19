@@ -16,7 +16,10 @@ dependencies {
     annotationProcessor 'org.projectlombok:lombok:1.18.30'
     compileOnly 'org.pf4j:pf4j:3.10.0'
     implementation 'com.google.code.gson:gson:2.10.1'
+
     testImplementation 'junit:junit:4.13.2'
+    testImplementation group: 'net.runelite', name: 'client', version: runeLiteVersion
+    testImplementation group: 'net.runelite', name: 'jshell', version: runeLiteVersion
 }
 
 group = 'com.flippingai'
@@ -29,4 +32,18 @@ java {
 
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
+}
+
+test {
+    // Exclude the plugin launcher from unit tests — it launches RuneLite
+    exclude '**/FlippingAiPluginTest.class'
+}
+
+// Task to launch RuneLite with our plugin loaded
+tasks.register('runClient', JavaExec) {
+    group = 'runelite'
+    description = 'Launch RuneLite with FlippingAI plugin loaded'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.flippingai.FlippingAiPluginTest'
+    jvmArgs = ['-ea']
 }
