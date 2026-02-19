@@ -34,6 +34,7 @@ models/
 # Charts
 charts/
 *.png
+!runelite-plugin/src/main/resources/*.png
 
 # IDE
 .vscode/

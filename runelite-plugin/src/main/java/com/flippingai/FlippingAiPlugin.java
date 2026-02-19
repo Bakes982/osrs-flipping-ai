@@ -95,10 +95,27 @@ public class FlippingAiPlugin extends Plugin
 
         panel = new FlippingAiPanel(this);
 
-        final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/panel_icon.png");
+        BufferedImage icon;
+        try
+        {
+            icon = ImageUtil.loadImageResource(getClass(), "/panel_icon.png");
+        }
+        catch (Exception e)
+        {
+            log.warn("panel_icon.png not found, using fallback icon");
+            icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+            // Draw a simple "F" as placeholder
+            java.awt.Graphics2D g = icon.createGraphics();
+            g.setColor(new java.awt.Color(0xF5, 0xA6, 0x23)); // amber
+            g.fillRect(2, 2, 12, 12);
+            g.setColor(java.awt.Color.BLACK);
+            g.setFont(new java.awt.Font("Arial", java.awt.Font.BOLD, 11));
+            g.drawString("F", 4, 13);
+            g.dispose();
+        }
         navButton = NavigationButton.builder()
             .tooltip("Flipping AI")
-            .icon(icon != null ? icon : new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB))
+            .icon(icon)
             .priority(10)
             .panel(panel)
             .build();
