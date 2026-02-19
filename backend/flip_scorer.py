@@ -228,7 +228,7 @@ class FlipScorer:
                 elif mid_price < 10_000:
                     fs.total_score *= 1.05   # bulk flipping works
                 elif 100_000 <= mid_price < 1_000_000:
-                    fs.total_score *= 0.85   # historically net loser
+                    fs.total_score *= 0.90   # historically weaker bracket
                 # 10K-100K stays at 1.0 (neutral)
 
             # Cap at 100
@@ -276,10 +276,10 @@ class FlipScorer:
             fs.vetoed = True
             fs.veto_reasons.append("Zero volume in last 5 minutes - likely illiquid trap")
 
-        # Veto 4: Wide spread (>8%) — data shows >10% margins are net money losers
-        if fs.spread_pct and fs.spread_pct > 8:
+        # Veto 4: Wide spread (>12%) — data shows wide-spread items are illiquid traps
+        if fs.spread_pct and fs.spread_pct > 12:
             fs.vetoed = True
-            fs.veto_reasons.append(f"Spread too wide ({fs.spread_pct:.1f}%) - margins >8% lose money historically")
+            fs.veto_reasons.append(f"Spread too wide ({fs.spread_pct:.1f}%) - likely illiquid trap")
 
         # Veto 5: Spread is negative or item is inverted
         if fs.spread is not None and fs.spread <= 0:
@@ -325,56 +325,55 @@ class FlipScorer:
     # ------------------------------------------------------------------
 
     def _score_spread(self, fs: FlipScore, rec: PriceRecommendation) -> float:
-        """Score spread quality.
+        """Score margin quality using REALIZED margin (after SmartPricer + tax).
 
-        Data from 1,522 Copilot trades shows the sweet spot is 0.5-2%:
+        Raw GE spread is always wider than realized margin because SmartPricer
+        positions orders 15-40% into the spread, plus GE tax eats into it.
+        A 4% raw spread often yields ~1.2% realized margin.
+
+        Data from 1,522 Copilot trades (realized margins):
           0.5-1%  → 36.7M profit, 89% WR
           1-2%    → 46.6M profit, 94% WR  (BEST)
           2-5%    → diminishing returns
-          5-10%   → poor
-          10%+    → net LOSER (-11.3M)
+          >10%    → net LOSER (-11.3M)
         """
-        pct = fs.spread_pct or 0
+        # Use expected_profit_pct = realized margin after pricing + tax
+        realized = rec.expected_profit_pct or 0
+        raw_pct = fs.spread_pct or 0
 
-        if pct <= 0:
+        if realized <= 0:
             return 0
 
-        # Data-driven scoring — sweet spot 0.5-2% regardless of volume
-        if rec.volume_5m > 30:
-            # High volume: tight spreads are king
-            if 0.5 <= pct <= 2:
-                return 100   # sweet spot
-            elif pct < 0.5:
-                return 35    # might not cover tax
-            elif pct <= 3:
-                return 80
-            elif pct <= 5:
-                return 55
+        # --- Score on realized margin (primary signal) ---
+        if 0.5 <= realized <= 2.0:
+            # Sweet spot — data proves this is where the money is
+            if 1.0 <= realized <= 2.0:
+                margin_score = 100  # optimal
             else:
-                return 20    # wide spread on liquid item = suspicious
-        elif rec.volume_5m > 10:
-            if 0.5 <= pct <= 2:
-                return 95
-            elif 2 < pct <= 3:
-                return 75
-            elif pct < 0.5:
-                return 25
-            elif pct <= 5:
-                return 50
-            else:
-                return 15
+                margin_score = 90   # 0.5-1% still great
+        elif 0.3 <= realized < 0.5:
+            margin_score = 65       # thin but workable for high-value items
+        elif 2.0 < realized <= 3.0:
+            margin_score = 75       # slightly wide but still profitable
+        elif 3.0 < realized <= 5.0:
+            margin_score = 50       # diminishing returns
+        elif realized < 0.3:
+            margin_score = 30       # too thin, tax risk
         else:
-            # Low volume: wider spreads are normal but still risky
-            if 1 <= pct <= 3:
-                return 75
-            elif 0.5 <= pct < 1:
-                return 55
-            elif 3 < pct <= 5:
-                return 45
-            elif pct < 0.5:
-                return 15
-            else:
-                return 10    # >5% on low vol = trap
+            margin_score = 15       # >5% realized = likely trap
+
+        # --- Volume adjustment: tight spreads need volume to fill ---
+        if realized < 0.5 and rec.volume_5m < 10:
+            margin_score = max(10, margin_score - 20)  # thin + low vol = bad
+        elif realized >= 1.0 and rec.volume_5m >= 30:
+            margin_score = min(100, margin_score + 5)   # sweet spot + liquid
+
+        # --- Raw spread sanity check (secondary signal) ---
+        # Even with good realized margin, very wide raw spreads signal risk
+        if raw_pct > 8:
+            margin_score = min(margin_score, 40)  # cap score for wide raw spreads
+
+        return margin_score
 
     def _score_volume(
         self, fs: FlipScore, rec: PriceRecommendation, snapshots: List[PriceSnapshot]
