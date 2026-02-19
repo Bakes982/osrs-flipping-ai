@@ -324,14 +324,15 @@ class MLScorer:
 class DataPruner:
     """Aggregates and prunes old price data once per day.
 
-    - Snapshots older than 7 days -> 5m candles in PriceAggregate
-    - PriceAggregate 5m rows older than 30 days -> 1h candles
-    - Deletes raw snapshots older than 7 days after aggregation
+    - Snapshots older than 3 days -> 5m candles in PriceAggregate
+    - PriceAggregate 5m rows older than 14 days -> 1h candles
+    - Deletes raw snapshots older than 3 days after aggregation
+    - Deletes old predictions (> 3 days) and alerts (> 7 days)
     """
 
     def _aggregate_snapshots_to_5m(self, db):
-        """Aggregate raw snapshots older than 7 days into 5-minute candles."""
-        cutoff = datetime.utcnow() - timedelta(days=7)
+        """Aggregate raw snapshots older than 3 days into 5-minute candles."""
+        cutoff = datetime.utcnow() - timedelta(days=3)
 
         # Get distinct item_ids with old data
         item_ids = db.price_snapshots.distinct("item_id", {"timestamp": {"$lt": cutoff}})
@@ -386,8 +387,8 @@ class DataPruner:
         return total_created
 
     def _aggregate_5m_to_1h(self, db):
-        """Roll up 5m candles older than 30 days into 1h candles."""
-        cutoff = datetime.utcnow() - timedelta(days=30)
+        """Roll up 5m candles older than 14 days into 1h candles."""
+        cutoff = datetime.utcnow() - timedelta(days=14)
 
         # Get distinct item_ids with old 5m data
         item_ids = db.price_aggregates.distinct(
@@ -439,10 +440,32 @@ class DataPruner:
         logger.info("Created %d 1h aggregate candles, deleted %d old 5m candles", total_created, total_deleted)
 
     def _delete_old_snapshots(self, db):
-        """Delete raw snapshots older than 7 days (already aggregated)."""
-        cutoff = datetime.utcnow() - timedelta(days=7)
+        """Delete raw snapshots older than 3 days (already aggregated)."""
+        cutoff = datetime.utcnow() - timedelta(days=3)
         result = db.price_snapshots.delete_many({"timestamp": {"$lt": cutoff}})
         logger.info("Deleted %d old raw snapshots", result.deleted_count)
+
+        # Also prune predictions and model metrics to stay under storage quota
+        cutoff_pred = datetime.utcnow() - timedelta(days=3)
+        try:
+            r2 = db.predictions.delete_many({"timestamp": {"$lt": cutoff_pred}})
+            logger.info("Deleted %d old predictions", r2.deleted_count)
+        except Exception:
+            pass
+
+        cutoff_alerts = datetime.utcnow() - timedelta(days=7)
+        try:
+            r3 = db.alerts.delete_many({"timestamp": {"$lt": cutoff_alerts}})
+            logger.info("Deleted %d old alerts", r3.deleted_count)
+        except Exception:
+            pass
+
+        cutoff_metrics = datetime.utcnow() - timedelta(days=7)
+        try:
+            r4 = db.model_metrics.delete_many({"timestamp": {"$lt": cutoff_metrics}})
+            logger.info("Deleted %d old model_metrics", r4.deleted_count)
+        except Exception:
+            pass
 
     async def prune(self):
         """Run the full pruning cycle in a background thread."""

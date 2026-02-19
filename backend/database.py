@@ -464,6 +464,50 @@ class Database:
 # Initialization
 # ---------------------------------------------------------------------------
 
+def _emergency_prune(db_wrapper):
+    """Delete old data to get under the 512 MB Atlas free-tier limit.
+
+    Called during startup when index creation fails with AtlasError 8000.
+    Aggressively prunes snapshots, predictions, alerts, and aggregates
+    so the server can at least start and begin serving requests.
+    """
+    from datetime import timedelta
+    cutoff_snap   = datetime.utcnow() - timedelta(days=2)
+    cutoff_pred   = datetime.utcnow() - timedelta(days=3)
+    cutoff_alerts = datetime.utcnow() - timedelta(days=7)
+    cutoff_agg    = datetime.utcnow() - timedelta(days=14)
+
+    try:
+        r1 = db_wrapper.price_snapshots.delete_many({"timestamp": {"$lt": cutoff_snap}})
+        logger.info("Emergency prune: deleted %d old snapshots", r1.deleted_count)
+    except Exception as e:
+        logger.warning("Emergency prune snapshots failed: %s", e)
+
+    try:
+        r2 = db_wrapper.predictions.delete_many({"timestamp": {"$lt": cutoff_pred}})
+        logger.info("Emergency prune: deleted %d old predictions", r2.deleted_count)
+    except Exception as e:
+        logger.warning("Emergency prune predictions failed: %s", e)
+
+    try:
+        r3 = db_wrapper.alerts.delete_many({"timestamp": {"$lt": cutoff_alerts}})
+        logger.info("Emergency prune: deleted %d old alerts", r3.deleted_count)
+    except Exception as e:
+        logger.warning("Emergency prune alerts failed: %s", e)
+
+    try:
+        r4 = db_wrapper.price_aggregates.delete_many({"timestamp": {"$lt": cutoff_agg}})
+        logger.info("Emergency prune: deleted %d old aggregates", r4.deleted_count)
+    except Exception as e:
+        logger.warning("Emergency prune aggregates failed: %s", e)
+
+    try:
+        r5 = db_wrapper.model_metrics.delete_many({"timestamp": {"$lt": cutoff_alerts}})
+        logger.info("Emergency prune: deleted %d old model_metrics", r5.deleted_count)
+    except Exception as e:
+        logger.warning("Emergency prune model_metrics failed: %s", e)
+
+
 def init_db():
     """Initialize MongoDB connection, create indexes."""
     global _client, _wrapper
@@ -486,65 +530,86 @@ def init_db():
     db = _client[DATABASE_NAME]
     _wrapper = Database(db)
 
-    # Create indexes
-    _wrapper.price_snapshots.create_index(
-        [("item_id", ASCENDING), ("timestamp", ASCENDING)],
-        background=True,
-    )
-    _wrapper.price_snapshots.create_index(
-        [("timestamp", ASCENDING)],
-        background=True,
-    )
-    _wrapper.price_aggregates.create_index(
-        [("item_id", ASCENDING), ("timestamp", ASCENDING), ("interval", ASCENDING)],
-        background=True,
-    )
-    _wrapper.trades.create_index(
-        [("item_id", ASCENDING), ("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.trades.create_index(
-        [("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.flip_history.create_index(
-        [("item_id", ASCENDING), ("sell_time", DESCENDING)],
-        background=True,
-    )
-    _wrapper.flip_history.create_index(
-        [("buy_trade_id", ASCENDING)],
-        background=True,
-    )
-    _wrapper.predictions.create_index(
-        [("item_id", ASCENDING), ("horizon", ASCENDING), ("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.model_metrics.create_index(
-        [("horizon", ASCENDING), ("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.item_features.create_index(
-        [("item_id", ASCENDING)],
-        unique=True,
-        background=True,
-    )
-    _wrapper.alerts.create_index(
-        [("item_id", ASCENDING), ("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.alerts.create_index(
-        [("timestamp", DESCENDING)],
-        background=True,
-    )
-    # Player (RSN) indexes for multi-account filtering
-    _wrapper.trades.create_index(
-        [("player", ASCENDING), ("timestamp", DESCENDING)],
-        background=True,
-    )
-    _wrapper.flip_history.create_index(
-        [("player", ASCENDING), ("sell_time", DESCENDING)],
-        background=True,
-    )
+    # Create indexes — wrapped in try/except so the app can still start
+    # even if MongoDB Atlas is over its free-tier storage quota.
+    def _ensure_indexes():
+        _wrapper.price_snapshots.create_index(
+            [("item_id", ASCENDING), ("timestamp", ASCENDING)],
+            background=True,
+        )
+        _wrapper.price_snapshots.create_index(
+            [("timestamp", ASCENDING)],
+            background=True,
+        )
+        _wrapper.price_aggregates.create_index(
+            [("item_id", ASCENDING), ("timestamp", ASCENDING), ("interval", ASCENDING)],
+            background=True,
+        )
+        _wrapper.trades.create_index(
+            [("item_id", ASCENDING), ("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.trades.create_index(
+            [("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.flip_history.create_index(
+            [("item_id", ASCENDING), ("sell_time", DESCENDING)],
+            background=True,
+        )
+        _wrapper.flip_history.create_index(
+            [("buy_trade_id", ASCENDING)],
+            background=True,
+        )
+        _wrapper.predictions.create_index(
+            [("item_id", ASCENDING), ("horizon", ASCENDING), ("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.model_metrics.create_index(
+            [("horizon", ASCENDING), ("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.item_features.create_index(
+            [("item_id", ASCENDING)],
+            unique=True,
+            background=True,
+        )
+        _wrapper.alerts.create_index(
+            [("item_id", ASCENDING), ("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.alerts.create_index(
+            [("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.trades.create_index(
+            [("player", ASCENDING), ("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.flip_history.create_index(
+            [("player", ASCENDING), ("sell_time", DESCENDING)],
+            background=True,
+        )
+
+    try:
+        _ensure_indexes()
+    except Exception as idx_err:
+        err_msg = str(idx_err)
+        if "space quota" in err_msg or "8000" in err_msg:
+            logger.warning(
+                "MongoDB over storage quota — running emergency prune then retrying indexes..."
+            )
+            _emergency_prune(_wrapper)
+            try:
+                _ensure_indexes()
+                logger.info("Indexes created after emergency prune")
+            except Exception as retry_err:
+                logger.warning(
+                    "Index creation still failing after prune: %s — continuing without indexes",
+                    retry_err,
+                )
+        else:
+            logger.warning("Index creation failed: %s — continuing without indexes", idx_err)
 
     logger.info("MongoDB initialized: %s / %s", MONGODB_URL.split("@")[-1], DATABASE_NAME)
 
