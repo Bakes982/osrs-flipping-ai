@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, Check, Trash2, Plus, AlertTriangle, TrendingUp, Target } from 'lucide-react';
+import { Bell, Check, Trash2, Plus, AlertTriangle, TrendingUp, TrendingDown, Target, Eye } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -26,6 +26,7 @@ const ALERT_ICONS = {
   dump: AlertTriangle,
   opportunity: TrendingUp,
   ml_signal: TrendingUp,
+  position_change: Eye,
 };
 
 const ALERT_COLORS = {
@@ -33,6 +34,7 @@ const ALERT_COLORS = {
   dump: 'badge-red',
   opportunity: 'badge-green',
   ml_signal: 'badge-yellow',
+  position_change: 'badge-cyan',
 };
 
 export default function Alerts() {

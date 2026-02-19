@@ -126,6 +126,9 @@ export const api = {
   getPortfolio() {
     return fetchJSON('/portfolio');
   },
+  getActivePositions() {
+    return fetchJSON('/positions');
+  },
   getTrades(params = {}) {
     const qs = new URLSearchParams(params).toString();
     return fetchJSON(`/trades${qs ? '?' + qs : ''}`);

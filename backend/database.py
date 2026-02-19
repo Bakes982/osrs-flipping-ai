@@ -888,3 +888,38 @@ def find_snapshot_near_time(
         sort=[("timestamp", ASCENDING)],
     )
     return PriceSnapshot.from_doc(doc) if doc else None
+
+
+# ---------------------------------------------------------------------------
+# Active-position tracking helpers
+# ---------------------------------------------------------------------------
+
+def find_active_positions(db: Database) -> List[Dict]:
+    """Return all active (open) positions — BUY trades not yet matched to a flip."""
+    matched_ids = get_matched_buy_trade_ids(db)
+    docs = db.trades.find({
+        "trade_type": "BUY",
+        "status": "BOUGHT",
+    }).sort("timestamp", DESCENDING)
+
+    positions = []
+    for d in docs:
+        trade = Trade.from_doc(d)
+        if trade.id not in matched_ids:
+            positions.append({
+                "trade_id": trade.id,
+                "item_id": trade.item_id,
+                "item_name": trade.item_name,
+                "quantity": trade.quantity,
+                "buy_price": trade.price,
+                "total_cost": trade.total_value,
+                "bought_at": trade.timestamp.isoformat() if trade.timestamp else None,
+                "player": trade.player,
+                "market_price_at_buy": trade.market_price,
+            })
+    return positions
+
+
+def get_position_monitoring_state(db: Database) -> Dict:
+    """Get the saved position monitoring state (last-alerted prices etc.)."""
+    return get_setting(db, "position_monitor_state", default={})

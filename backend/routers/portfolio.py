@@ -34,10 +34,12 @@ from backend.database import (
     find_trades,
     find_all_flips,
     find_unmatched_buy_trades,
+    find_active_positions,
     insert_trade,
     insert_flip,
     get_matched_buy_trade_ids,
 )
+from backend.websocket import manager
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +468,26 @@ async def clear_trade_history():
 
 
 # ---------------------------------------------------------------------------
+# GET /api/positions  -  Active positions with live pricing
+# ---------------------------------------------------------------------------
+
+@router.get("/api/positions")
+async def get_active_positions():
+    """Return all active (open) positions with live pricing data.
+
+    Each position includes the original buy price, current market price,
+    recommended sell price, and estimated profit/loss.
+    """
+    def _sync():
+        from backend.tasks import get_position_monitor
+        monitor = get_position_monitor()
+        return monitor.get_positions_with_prices()
+
+    positions = await asyncio.to_thread(_sync)
+    return {"positions": positions, "total": len(positions)}
+
+
+# ---------------------------------------------------------------------------
 # POST /api/dink  -  DINK Webhook Receiver
 # ---------------------------------------------------------------------------
 
@@ -577,6 +599,30 @@ async def _handle_ge_trade(data: dict):
             "DINK trade stored: %s %s x%d @ %s GP (%s)",
             trade_type, item_name, quantity, f"{price:,}", status,
         )
+
+        # Broadcast position events via WebSocket
+        if status == "BOUGHT":
+            # New position opened — tell the frontend and trigger monitoring
+            await manager.broadcast_json({
+                "type": "position_opened",
+                "item_id": item_id,
+                "item_name": item_name,
+                "quantity": quantity,
+                "buy_price": price,
+                "player": player_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        elif status == "SOLD":
+            # Position closed
+            await manager.broadcast_json({
+                "type": "position_closed",
+                "item_id": item_id,
+                "item_name": item_name,
+                "quantity": quantity,
+                "sell_price": price,
+                "player": player_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
     except Exception as e:
         logger.error("Error storing DINK trade: %s", e)
     finally:

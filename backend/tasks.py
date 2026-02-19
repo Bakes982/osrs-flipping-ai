@@ -24,11 +24,14 @@ from backend.database import (
     Alert,
     get_tracked_item_ids,
     get_setting,
+    set_setting,
     get_latest_price,
     insert_price_snapshots,
     insert_alert,
     upsert_item_feature,
     get_item,
+    find_active_positions,
+    get_price_history,
 )
 from backend.websocket import manager
 
@@ -740,6 +743,290 @@ class AlertMonitor:
 
 
 # ---------------------------------------------------------------------------
+# PositionMonitor
+# ---------------------------------------------------------------------------
+
+class PositionMonitor:
+    """Monitors active positions (unmatched BUY trades) for price changes.
+
+    Every 60 seconds:
+    1. Finds all open positions (BOUGHT but not yet matched to a flip)
+    2. Looks up the current market price for each held item
+    3. Re-calculates the recommended sell price via SmartPricer
+    4. If the price has moved significantly since the last alert, fires:
+       - A WebSocket broadcast so the dashboard updates live
+       - A Discord notification (if enabled) for large changes
+       - An in-DB Alert record
+    """
+
+    CHECK_INTERVAL = 60  # seconds between checks
+    SMALL_CHANGE_PCT = 2.0   # % change to flag on dashboard
+    LARGE_CHANGE_PCT = 5.0   # % change to send Discord notification
+    COOLDOWN_MINUTES = 15    # minimum minutes between alerts for the same item
+
+    def __init__(self):
+        # item_id → {last_alerted_price, last_alerted_at, last_rec_sell}
+        self._state: Dict[int, dict] = {}
+        self._pricer = None
+
+    def _get_pricer(self):
+        if self._pricer is None:
+            try:
+                from backend.smart_pricer import SmartPricer
+                self._pricer = SmartPricer()
+            except Exception as e:
+                logger.error("PositionMonitor: failed to init SmartPricer: %s", e)
+        return self._pricer
+
+    async def check_positions(self):
+        """Main tick: scan open positions and check for price movement."""
+        positions = await asyncio.to_thread(self._get_positions)
+        if not positions:
+            return
+
+        pricer = self._get_pricer()
+        if pricer is None:
+            return
+
+        now = datetime.utcnow()
+        updates = []
+
+        for pos in positions:
+            item_id = pos["item_id"]
+            buy_price = pos["buy_price"]
+            quantity = pos["quantity"]
+
+            try:
+                result = await asyncio.to_thread(
+                    self._evaluate_position, pricer, pos
+                )
+                if result is None:
+                    continue
+
+                current_price = result["current_price"]
+                rec_sell = result["recommended_sell"]
+                pnl_pct = result["pnl_pct"]
+                rec_profit = result["recommended_profit"]
+                rec_profit_pct = result["recommended_profit_pct"]
+
+                # Build the position update payload
+                update = {
+                    "item_id": item_id,
+                    "item_name": pos["item_name"],
+                    "quantity": quantity,
+                    "buy_price": buy_price,
+                    "current_price": current_price,
+                    "recommended_sell": rec_sell,
+                    "pnl_pct": round(pnl_pct, 2),
+                    "recommended_profit": rec_profit,
+                    "recommended_profit_pct": round(rec_profit_pct, 2),
+                    "bought_at": pos.get("bought_at"),
+                    "trade_id": pos.get("trade_id"),
+                }
+
+                updates.append(update)
+
+                # Check if we should fire an alert
+                state = self._state.get(item_id, {})
+                last_alerted = state.get("last_alerted_price", buy_price)
+                last_alerted_at = state.get("last_alerted_at")
+                change_from_alert = ((current_price - last_alerted) / last_alerted * 100) if last_alerted else 0
+
+                # Cooldown check
+                on_cooldown = (
+                    last_alerted_at
+                    and (now - last_alerted_at).total_seconds() < self.COOLDOWN_MINUTES * 60
+                )
+
+                if abs(change_from_alert) >= self.SMALL_CHANGE_PCT and not on_cooldown:
+                    direction = "dropped" if change_from_alert < 0 else "risen"
+                    alert_msg = (
+                        f"{pos['item_name']} has {direction} {abs(change_from_alert):.1f}% "
+                        f"since your buy ({buy_price:,} → {current_price:,} GP). "
+                        f"Recommended sell: {rec_sell:,} GP "
+                        f"(est. profit: {'+' if rec_profit >= 0 else ''}{rec_profit:,} GP)"
+                    )
+
+                    # Save alert to DB
+                    await asyncio.to_thread(
+                        self._save_alert, item_id, pos["item_name"],
+                        alert_msg, update
+                    )
+
+                    # Update state
+                    self._state[item_id] = {
+                        "last_alerted_price": current_price,
+                        "last_alerted_at": now,
+                        "last_rec_sell": rec_sell,
+                    }
+
+                    # Discord for large moves
+                    if abs(change_from_alert) >= self.LARGE_CHANGE_PCT:
+                        asyncio.create_task(
+                            self._send_discord_position_alert(pos, update, change_from_alert)
+                        )
+
+            except Exception as e:
+                logger.debug("PositionMonitor: error checking %s: %s", pos["item_name"], e)
+
+        # Broadcast all position updates to connected frontends
+        if updates:
+            await manager.broadcast_json({
+                "type": "position_update",
+                "timestamp": now.isoformat(),
+                "positions": updates,
+            })
+
+    def _get_positions(self) -> List[Dict]:
+        """Sync: find active positions from DB."""
+        db = get_db()
+        try:
+            return find_active_positions(db)
+        finally:
+            db.close()
+
+    def _evaluate_position(self, pricer, pos: dict) -> Optional[dict]:
+        """Sync: compute current price + recommended sell for one position."""
+        item_id = pos["item_id"]
+        buy_price = pos["buy_price"]
+        quantity = pos["quantity"]
+
+        db = get_db()
+        try:
+            snapshots = get_price_history(db, item_id, hours=4)
+            if not snapshots:
+                return None
+
+            latest = snapshots[-1]
+            current_price = latest.instant_buy or latest.instant_sell
+            if not current_price:
+                return None
+
+            rec = pricer.price_item(item_id, snapshots=snapshots)
+            rec_sell = rec.recommended_sell or current_price
+
+            # P&L from current instant price vs buy price
+            pnl_pct = (current_price - buy_price) / buy_price * 100 if buy_price else 0
+
+            # Estimated profit if sold at recommended sell
+            tax = int(min(rec_sell * 0.02, 5_000_000))
+            rec_profit = (rec_sell - buy_price) * quantity - tax * quantity
+
+            rec_profit_pct = (
+                (rec_sell - buy_price - tax) / buy_price * 100
+            ) if buy_price else 0
+
+            return {
+                "current_price": current_price,
+                "recommended_sell": rec_sell,
+                "pnl_pct": pnl_pct,
+                "recommended_profit": rec_profit,
+                "recommended_profit_pct": rec_profit_pct,
+            }
+        finally:
+            db.close()
+
+    def _save_alert(self, item_id: int, item_name: str, message: str, data: dict):
+        """Sync: insert a position_change alert into the DB."""
+        db = get_db()
+        try:
+            alert = Alert(
+                item_id=item_id,
+                item_name=item_name,
+                alert_type="position_change",
+                message=message,
+                data=data,
+            )
+            insert_alert(db, alert)
+            logger.info("Position alert: %s", message)
+        finally:
+            db.close()
+
+    async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
+        """Send a Discord embed for a large price move on an active position."""
+        try:
+            def _sync():
+                db = get_db()
+                try:
+                    wh = get_setting(db, "discord_webhook")
+                    if isinstance(wh, dict):
+                        if not wh.get("enabled", False):
+                            return None
+                        return wh.get("url")
+                    url = get_setting(db, "discord_webhook_url")
+                    enabled = get_setting(db, "discord_alerts_enabled", False)
+                    return url if url and enabled else None
+                finally:
+                    db.close()
+
+            webhook_url = await asyncio.to_thread(_sync)
+            if not webhook_url:
+                return
+
+            import requests as _requests
+
+            direction = "\U0001f4c9 PRICE DROP" if change_pct < 0 else "\U0001f4c8 PRICE RISE"
+            color = 0xFF4444 if change_pct < 0 else 0x44FF44
+
+            embed = {
+                "title": f"{direction}: {pos['item_name']}",
+                "color": color,
+                "fields": [
+                    {"name": "\U0001f6d2 Buy Price", "value": f"{pos['buy_price']:,} GP", "inline": True},
+                    {"name": "\U0001f4b2 Current Price", "value": f"{update['current_price']:,} GP", "inline": True},
+                    {"name": "\U0001f4c9 Change", "value": f"{change_pct:+.1f}%", "inline": True},
+                    {"name": "\U0001f3af Recommended Sell", "value": f"{update['recommended_sell']:,} GP", "inline": True},
+                    {"name": "\U0001f4b0 Est. Profit", "value": f"{update['recommended_profit']:+,} GP ({update['recommended_profit_pct']:+.1f}%)", "inline": True},
+                    {"name": "\U0001f4e6 Quantity", "value": f"{pos['quantity']:,}", "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI \u2022 Position Monitor"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+            logger.info("Discord position alert sent for %s", pos["item_name"])
+        except Exception as e:
+            logger.error("Failed to send Discord position alert: %s", e)
+
+    def get_positions_with_prices(self) -> List[Dict]:
+        """Get all active positions with live pricing (for API endpoint)."""
+        pricer = self._get_pricer()
+        positions = self._get_positions()
+        if not positions or pricer is None:
+            return positions or []
+
+        enriched = []
+        for pos in positions:
+            result = self._evaluate_position(pricer, pos)
+            if result:
+                pos.update(result)
+            enriched.append(pos)
+        return enriched
+
+    async def run_forever(self):
+        logger.info("PositionMonitor started (checks every %ds)", self.CHECK_INTERVAL)
+        # Wait for initial price data
+        await asyncio.sleep(45)
+        while True:
+            try:
+                await self.check_positions()
+            except Exception as e:
+                logger.error("PositionMonitor tick error: %s", e)
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+
+# Singleton
+_position_monitor: Optional[PositionMonitor] = None
+
+
+def get_position_monitor() -> PositionMonitor:
+    global _position_monitor
+    if _position_monitor is None:
+        _position_monitor = PositionMonitor()
+    return _position_monitor
+
+
+# ---------------------------------------------------------------------------
 # OpportunityNotifier
 # ---------------------------------------------------------------------------
 
@@ -974,6 +1261,7 @@ async def start_background_tasks():
     alert_monitor = AlertMonitor()
     pruner = DataPruner()
     opp_notifier = get_opportunity_notifier()
+    pos_monitor = get_position_monitor()
 
     # Start PriceCollector first (it feeds data to everything else)
     _tasks.append(asyncio.create_task(collector.run_forever()))
@@ -996,6 +1284,7 @@ async def start_background_tasks():
     _tasks.append(asyncio.create_task(retrainer.run_forever()))
     _tasks.append(asyncio.create_task(pruner.run_forever()))
     _tasks.append(asyncio.create_task(opp_notifier.run_forever()))
+    _tasks.append(asyncio.create_task(pos_monitor.run_forever()))
 
     logger.info("All %d background tasks started", len(_tasks))
 

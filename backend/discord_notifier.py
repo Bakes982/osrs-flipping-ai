@@ -136,9 +136,9 @@ def generate_opportunity_chart(
     )
 
     # Info box
-    profit = sell_price - buy_price
+    gross = sell_price - buy_price
     tax = int(min(sell_price * 0.02, 5_000_000))
-    net = profit - tax
+    net = gross - tax
     info = (
         f"Buy: {_format_gp(buy_price)}\n"
         f"Sell: {_format_gp(sell_price)}\n"
@@ -277,9 +277,8 @@ class DiscordOpportunityNotifier:
         win_rate = opp.get("win_rate")
         reason = opp.get("reason", "")
 
-        # Tax
-        tax = int(min(sell * 0.02, 5_000_000)) if sell else 0
-        net_profit = profit - tax if profit else 0
+        # profit from opportunities endpoint is already net of tax
+        net_profit = profit or 0
 
         # Build embed fields
         fields = [

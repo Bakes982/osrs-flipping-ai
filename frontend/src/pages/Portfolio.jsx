@@ -1,6 +1,7 @@
-import { RefreshCw } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../api/client';
+import { api, createPriceSocket } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
 function formatGP(n) {
@@ -10,53 +11,99 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
+const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
+
 export default function Portfolio({ prices }) {
   const nav = useNavigate();
   const { data: portfolio, loading, reload } = useApi(() => api.getPortfolio(), [], 120000);
   const { data: trades } = useApi(() => api.getTrades({ limit: 50 }), [], 120000);
+  const { data: posData, loading: posLoading, reload: reloadPos } = useApi(
+    () => api.getActivePositions(), [], 60000
+  );
 
-  // Holdings come from backend as "holdings" array
-  const holdings = portfolio?.holdings || portfolio?.investments || [];
-  const totalInvested = holdings.reduce((s, h) => s + (h.total_cost || (h.buy_price * h.quantity) || 0), 0);
+  // Live position updates from WebSocket
+  const [livePositions, setLivePositions] = useState(null);
+
+  useEffect(() => {
+    const socket = createPriceSocket((msg) => {
+      if (msg.type === 'position_update' && msg.positions) {
+        setLivePositions(msg.positions);
+      }
+      if (msg.type === 'position_opened' || msg.type === 'position_closed') {
+        // Refresh positions when a new trade comes in
+        reloadPos();
+      }
+    });
+    return () => socket.close();
+  }, [reloadPos]);
+
+  // Use live data if available, otherwise fall back to API snapshot
+  const positions = livePositions || posData?.positions || [];
+
+  // Holdings from portfolio (fallback if no positions endpoint data)
+  const holdings = portfolio?.holdings || [];
+  const totalInvested = positions.reduce(
+    (s, p) => s + (p.buy_price || 0) * (p.quantity || 0), 0
+  ) || holdings.reduce((s, h) => s + (h.total_cost || (h.buy_price * h.quantity) || 0), 0);
+
+  const totalCurrentValue = positions.reduce(
+    (s, p) => s + (p.current_price || p.buy_price || 0) * (p.quantity || 0), 0
+  );
+  const totalPnL = positions.reduce((s, p) => s + (p.recommended_profit || 0), 0);
 
   return (
     <div>
       <div className="page-header">
         <div>
           <h2 className="page-title">Portfolio</h2>
-          <p className="page-subtitle">Track holdings and trade history</p>
+          <p className="page-subtitle">Active positions &amp; trade history</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn" onClick={() => nav('/import')}>Import CSV</button>
-          <button className="btn" onClick={reload}><RefreshCw size={14} /> Refresh</button>
+          <button className="btn" onClick={() => { reload(); reloadPos(); }}>
+            <RefreshCw size={14} /> Refresh
+          </button>
         </div>
       </div>
 
+      {/* Stats */}
       <div className="stats-grid">
         <div className="card">
-          <div className="card-title">Active Holdings</div>
-          <div className="card-value">{holdings.length}</div>
+          <div className="card-title">Open Positions</div>
+          <div className="card-value">{positions.length || holdings.length}</div>
         </div>
         <div className="card">
           <div className="card-title">Total Invested</div>
           <div className="card-value text-cyan">{formatGP(totalInvested)}</div>
         </div>
         <div className="card">
-          <div className="card-title">Cash</div>
-          <div className="card-value text-green">{formatGP(portfolio?.cash || 0)}</div>
+          <div className="card-title">Current Value</div>
+          <div className="card-value" style={{ color: totalCurrentValue >= totalInvested ? 'var(--green)' : 'var(--red)' }}>
+            {positions.length ? formatGP(totalCurrentValue) : '—'}
+          </div>
         </div>
         <div className="card">
-          <div className="card-title">Trades Recorded</div>
-          <div className="card-value">{trades?.length || 0}</div>
+          <div className="card-title">Est. Profit (at rec. sell)</div>
+          <div className="card-value" style={{ color: totalPnL >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {positions.length ? `${totalPnL >= 0 ? '+' : ''}${formatGP(totalPnL)}` : '—'}
+          </div>
         </div>
       </div>
 
-      {/* Holdings */}
+      {/* Active Positions (with live pricing) */}
       <div className="card" style={{ marginBottom: 24 }}>
-        <h3 style={{ fontSize: 14, marginBottom: 16 }}>Active Holdings</h3>
-        {loading ? <div className="loading">Loading...</div> : (
-          !holdings.length ? (
-            <div className="empty">No active holdings — import your trades CSV to populate</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ fontSize: 14, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Eye size={16} /> Active Positions
+            {livePositions && <span className="badge badge-green" style={{ fontSize: 10 }}>LIVE</span>}
+          </h3>
+        </div>
+        {posLoading && !positions.length ? <div className="loading">Loading positions...</div> : (
+          !positions.length ? (
+            <div className="empty">
+              No active positions — when DINK sends a BUY confirmation, positions appear here
+              with live price tracking and sell recommendations.
+            </div>
           ) : (
             <table className="data-table">
               <thead>
@@ -64,34 +111,57 @@ export default function Portfolio({ prices }) {
                   <th>Item</th>
                   <th>Qty</th>
                   <th>Buy Price</th>
-                  <th>Total Cost</th>
-                  <th>Account</th>
-                  <th>Bought At</th>
+                  <th>Current Price</th>
+                  <th>Rec. Sell</th>
+                  <th>Change</th>
+                  <th>Est. Profit</th>
                 </tr>
               </thead>
               <tbody>
-                {holdings.map((h, i) => (
-                  <tr key={i}>
-                    <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {h.item_id > 0 && (
-                        <img
-                          src={`https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${h.item_id}`}
-                          alt="" width={24} height={24}
-                          style={{ imageRendering: 'pixelated' }}
-                          onError={e => { e.target.style.display = 'none'; }}
-                        />
-                      )}
-                      {h.item_name}
-                    </td>
-                    <td>{h.quantity?.toLocaleString()}</td>
-                    <td className="gp">{formatGP(h.buy_price)}</td>
-                    <td className="gp">{formatGP(h.total_cost || (h.buy_price * h.quantity))}</td>
-                    <td className="text-muted">{h.player || '—'}</td>
-                    <td className="text-muted">
-                      {h.bought_at ? new Date(h.bought_at).toLocaleString() : '—'}
-                    </td>
-                  </tr>
-                ))}
+                {positions.map((p, i) => {
+                  const pnlPct = p.pnl_pct || 0;
+                  const recProfit = p.recommended_profit;
+                  const recProfitPct = p.recommended_profit_pct || 0;
+                  const isDown = pnlPct < 0;
+                  return (
+                    <tr key={p.trade_id || i} style={{ cursor: 'pointer' }}
+                        onClick={() => p.item_id && nav(`/item/${p.item_id}`)}>
+                      <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {p.item_id > 0 && (
+                          <img src={IMG(p.item_id)} alt="" width={24} height={24}
+                               style={{ imageRendering: 'pixelated' }}
+                               onError={e => { e.target.style.display = 'none'; }} />
+                        )}
+                        {p.item_name}
+                        {Math.abs(pnlPct) >= 5 && (
+                          <AlertTriangle size={14} color="var(--red)" style={{ marginLeft: 4 }} />
+                        )}
+                      </td>
+                      <td>{(p.quantity || 0).toLocaleString()}</td>
+                      <td className="gp">{formatGP(p.buy_price)}</td>
+                      <td className="gp">
+                        {p.current_price ? formatGP(p.current_price) : '—'}
+                      </td>
+                      <td className="gp" style={{ color: 'var(--cyan)', fontWeight: 600 }}>
+                        {p.recommended_sell ? formatGP(p.recommended_sell) : '—'}
+                      </td>
+                      <td>
+                        {p.current_price ? (
+                          <span className={`badge ${isDown ? 'badge-red' : 'badge-green'}`}
+                                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                            {isDown ? <TrendingDown size={12} /> : <TrendingUp size={12} />}
+                            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
+                          </span>
+                        ) : '—'}
+                      </td>
+                      <td style={{ color: recProfit >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
+                        {recProfit != null
+                          ? `${recProfit >= 0 ? '+' : ''}${formatGP(recProfit)} (${recProfitPct >= 0 ? '+' : ''}${recProfitPct.toFixed(1)}%)`
+                          : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )
