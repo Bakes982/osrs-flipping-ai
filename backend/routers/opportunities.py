@@ -81,6 +81,7 @@ def _fetch_wiki_item_name(item_id: int) -> str:
 @router.get("")
 async def list_opportunities(
     min_profit: int = Query(0, description="Minimum net profit in GP"),
+    min_price: int = Query(0, description="Minimum item buy price in GP"),
     min_score: float = Query(15, ge=0, le=100, description="Minimum flip score (0-100)"),
     max_risk: int = Query(8, description="Maximum risk score (1-10) for initial scan"),
     min_volume: int = Query(1, description="Minimum 5-minute volume"),
@@ -98,7 +99,7 @@ async def list_opportunities(
     try:
         raw = await asyncio.to_thread(
             scan_all_items_for_flips,
-            min_price=10_000,
+            min_price=max(10_000, min_price),
             max_price=500_000_000,
             min_margin_pct=0.2,
             max_risk=max_risk,

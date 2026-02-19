@@ -163,7 +163,7 @@ export default function Opportunities() {
   const [expandedId, setExpandedId] = useState(null);
 
   const { data: raw, loading, error, reload } = useApi(
-    () => api.getOpportunities({ limit: 200, min_profit: minPrice }),
+    () => api.getOpportunities({ limit: 200, min_price: minPrice }),
     [minPrice], 120000,
   );
 
