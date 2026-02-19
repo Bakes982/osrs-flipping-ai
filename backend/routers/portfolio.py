@@ -300,6 +300,12 @@ def _item_performance(flips):
         total = sum(f.net_profit for f in flip_list)
         wins = sum(1 for f in flip_list if f.net_profit > 0)
         avg_dur = sum(f.duration_seconds for f in flip_list) / len(flip_list) if flip_list else 0
+
+        # Price & margin stats for trade analysis
+        buy_prices = [f.buy_price for f in flip_list if f.buy_price and f.buy_price > 0]
+        margins = [f.margin_pct for f in flip_list if f.margin_pct is not None]
+        quantities = [f.quantity for f in flip_list if f.quantity and f.quantity > 0]
+
         result.append({
             "item_id": item_id,
             "item_name": data["name"],
@@ -308,6 +314,11 @@ def _item_performance(flips):
             "avg_profit": int(total / len(flip_list)),
             "win_rate": round(wins / len(flip_list) * 100, 1) if flip_list else 0,
             "avg_duration_min": round(avg_dur / 60, 1),
+            # Enriched fields for trade analysis
+            "avg_buy_price": int(sum(buy_prices) / len(buy_prices)) if buy_prices else None,
+            "avg_margin_pct": round(sum(margins) / len(margins), 2) if margins else None,
+            "avg_quantity": int(sum(quantities) / len(quantities)) if quantities else None,
+            "gp_per_hour": int(total / (avg_dur / 3600)) if avg_dur > 0 else None,
         })
     result.sort(key=lambda x: x["total_profit"], reverse=True)
     return result
