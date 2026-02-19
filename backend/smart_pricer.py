@@ -242,34 +242,43 @@ class SmartPricer:
         is_buy: bool,
     ) -> int:
         """
-        Calculate optimal queue-jumping offset based on volume.
+        Calculate optimal queue-jumping offset based on volume and price.
         For buys: INCREASE offer price to jump ahead in the buy queue.
         For sells: DECREASE list price to sell faster.
 
-        The key insight: never offer at the exact price - you'll be behind
-        hundreds of other players. Always offset to jump the queue.
+        Key insight: low-volume items have barely any queue, so large
+        offsets just burn profit.  Only high-volume items need serious
+        queue-jumping.
         """
         if price < 10_000:
             # Cheap items: 1 GP offset
-            amount = 1
-        elif price < 10_000_000:
-            if volume_5m > 50:
-                # High volume cheap/mid items: 0.1% offset
-                amount = max(1, int(price * 0.001))
-            elif volume_5m > 10:
-                amount = max(1, int(price * 0.002))
-            elif volume_5m > 1:
-                amount = max(1, int(price * 0.005))
-            else:
-                amount = max(1, int(price * 0.01))
+            return 1
+
+        # Base percentage by volume tier (these are per-side, not round-trip)
+        if volume_5m >= 100:
+            pct = 0.0008   # 0.08% – extremely liquid
+        elif volume_5m >= 50:
+            pct = 0.001    # 0.10%
+        elif volume_5m >= 20:
+            pct = 0.0015   # 0.15%
+        elif volume_5m >= 10:
+            pct = 0.002    # 0.20%
+        elif volume_5m >= 5:
+            pct = 0.0015   # 0.15% – moderate, small queue
+        elif volume_5m >= 2:
+            pct = 0.001    # 0.10% – low volume, barely a queue
         else:
-            # Expensive items (10M+): cap offset
-            if volume_5m > 20:
-                amount = max(1, int(price * 0.001))
-            elif volume_5m > 5:
-                amount = max(1, int(price * 0.003))
-            else:
-                amount = min(50_000, max(1, int(price * 0.005)))
+            pct = 0.0005   # 0.05% – practically no queue
+
+        amount = max(1, int(price * pct))
+
+        # Hard cap: never offset more than 20K on items under 50M
+        if price < 50_000_000:
+            amount = min(amount, 20_000)
+
+        # For very expensive items (50M+), cap at 0.15% or 50K
+        if price >= 50_000_000:
+            amount = min(amount, max(1, int(price * 0.0015)), 50_000)
 
         return amount
 
@@ -313,12 +322,20 @@ class SmartPricer:
         vwap_30m: Optional[float],
         momentum: float,
         spread: int,
+        volume_5m: int = 0,
     ) -> int:
         """
         Clamp sell price against trend.
         Sell price starts at insta_buy and gets adjusted.
+        For low-volume items, use VWAP as a sanity check to avoid
+        relying on a single stale high-price transaction.
         """
         base = instant_buy
+
+        # For low-volume items, the last instant_buy might be an outlier.
+        # Use the lower of instant_buy and VWAP-5m to be conservative.
+        if volume_5m < 5 and vwap_5m and vwap_5m < instant_buy:
+            base = int(vwap_5m)
 
         if trend in (Trend.STRONG_UP, Trend.UP):
             # Uptrend: ride the wave, sell higher
@@ -572,7 +589,7 @@ class SmartPricer:
         )
         rec.clamped_sell = self.clamp_sell_price(
             rec.instant_buy, rec.trend, rec.vwap_5m, rec.vwap_30m,
-            rec.momentum, spread,
+            rec.momentum, spread, volume_5m=rec.volume_5m,
         )
 
         # Apply queue-jumping offsets
