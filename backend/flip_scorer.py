@@ -127,7 +127,9 @@ class FlipScorer:
         """Score a single item. Returns FlipScore with vetoes and component scores."""
         fs = FlipScore(item_id=item_id, item_name=item_name)
 
-        db = get_db()
+        # Only open a DB connection when we actually need data
+        need_db = snapshots is None or flips is None
+        db = get_db() if need_db else None
         try:
             if snapshots is None:
                 snapshots = get_price_history(db, item_id, hours=4)
@@ -209,7 +211,8 @@ class FlipScorer:
             fs.reason = self._build_reason(fs, rec)
 
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
         return fs
 
@@ -638,6 +641,7 @@ def score_opportunities(
                 item_id=item_id,
                 item_name=item.get("name", ""),
                 snapshots=[snap],
+                flips=[],  # no flip history for scan-sourced items
             )
             if fs.vetoed:
                 logger.debug(

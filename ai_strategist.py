@@ -294,10 +294,26 @@ def scan_all_items_for_flips(
             'low_age_mins': low_age_mins
         })
 
-    # Sort by net profit (absolute GP) for better balance
-    candidates.sort(key=lambda x: x['net_margin'], reverse=True)
+    # Separate liquid (vol > 0) from illiquid items so liquid items
+    # always get processed first.  Within each group, sort by a
+    # "flip value" metric: margin × sqrt(volume+1) balances GP per
+    # flip against fill speed.
+    import math
+    liquid = [c for c in candidates if c['total_volume'] > 0]
+    illiquid = [c for c in candidates if c['total_volume'] == 0]
 
-    print(f"Found {len(candidates)} items with positive margins")
+    def _flip_value(c):
+        vol = c['total_volume']
+        return c['net_margin'] * math.sqrt(vol + 1)
+
+    liquid.sort(key=_flip_value, reverse=True)
+    illiquid.sort(key=lambda x: x['net_margin'], reverse=True)
+
+    # Put liquid items first; fill remaining slots with illiquid
+    candidates = liquid + illiquid
+
+    print(f"Found {len(candidates)} items with positive margins "
+          f"({len(liquid)} liquid, {len(illiquid)} illiquid)")
 
     # Take top candidates and do full analysis
     recommendations = []
