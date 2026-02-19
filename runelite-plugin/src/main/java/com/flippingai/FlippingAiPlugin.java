@@ -263,7 +263,10 @@ public class FlippingAiPlugin extends Plugin
         }
 
         offerEditor = new OfferEditorWidget(client, chatboxContainer);
-        long wikiPrice = isSelling ? currentPrediction.currentSell : currentPrediction.currentBuy;
+        // Show the opposite-side wiki price as the reference:
+        // BUY  → insta-sell (floor / what sellers accept) matches Copilot UX
+        // SELL → insta-buy  (ceiling / what buyers pay)
+        long wikiPrice = isSelling ? currentPrediction.currentBuy : currentPrediction.currentSell;
         long aiPrice = isSelling ? currentPrediction.suggestedSell : currentPrediction.suggestedBuy;
         offerEditor.showPriceSuggestions(isSelling, wikiPrice, aiPrice);
         priceSuggestionsShown = true;

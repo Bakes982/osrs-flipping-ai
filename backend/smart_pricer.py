@@ -235,120 +235,114 @@ class SmartPricer:
 
         return validated_buy, validated_sell, was_ghost
 
-    def calculate_undercut(
+    def calculate_spread_position(
         self,
-        price: int,
+        insta_buy: int,
+        insta_sell: int,
         volume_5m: int,
-        is_buy: bool,
-    ) -> int:
+        trend: Trend,
+        vwap_5m_buy: Optional[float] = None,
+        vwap_5m_sell: Optional[float] = None,
+    ) -> Tuple[int, int]:
         """
-        Calculate optimal queue-jumping offset based on volume and price.
-        For buys: INCREASE offer price to jump ahead in the buy queue.
-        For sells: DECREASE list price to sell faster.
+        Spread-based pricing: position buy/sell within the bid-ask spread.
 
-        Key insight: low-volume items have barely any queue, so large
-        offsets just burn profit.  Only high-volume items need serious
-        queue-jumping.
+        For BUYS:  place above insta-sell (floor) → higher fills faster
+        For SELLS: place below insta-buy  (ceiling) → lower fills faster
+
+        The position fraction is tuned by spread width, volume, and trend
+        to approximate the behaviour of best-in-class flip pricing tools.
         """
-        if price < 10_000:
-            # Cheap items: 1 GP offset
-            return 1
+        spread = insta_buy - insta_sell
+        if spread <= 0:
+            return insta_sell, insta_buy
 
-        # Base percentage by volume tier (these are per-side, not round-trip)
+        spread_pct = spread / max(insta_sell, 1)
+
+        # ── Buy fraction ─────────────────────────────────────────
+        # Tighter spread → must be more aggressive (higher fraction)
+        if spread_pct < 0.005:          # <0.5%
+            buy_base = 0.40
+        elif spread_pct < 0.01:         # 0.5-1%
+            buy_base = 0.35
+        elif spread_pct < 0.02:         # 1-2%
+            buy_base = 0.30
+        elif spread_pct < 0.05:         # 2-5%
+            buy_base = 0.22
+        else:                           # >5%
+            buy_base = 0.15
+
+        # Volume scaling: more liquidity → more sellers → be patient
         if volume_5m >= 100:
-            pct = 0.0008   # 0.08% – extremely liquid
+            buy_base *= 0.75
         elif volume_5m >= 50:
-            pct = 0.001    # 0.10%
+            buy_base *= 0.85
         elif volume_5m >= 20:
-            pct = 0.0015   # 0.15%
-        elif volume_5m >= 10:
-            pct = 0.002    # 0.20%
+            buy_base *= 0.95
         elif volume_5m >= 5:
-            pct = 0.0015   # 0.15% – moderate, small queue
+            pass  # standard
         elif volume_5m >= 2:
-            pct = 0.001    # 0.10% – low volume, barely a queue
+            buy_base *= 1.05
         else:
-            pct = 0.0005   # 0.05% – practically no queue
+            buy_base *= 0.80  # very low – don't overpay
 
-        amount = max(1, int(price * pct))
+        # Trend nudge for buys
+        buy_trend = {
+            Trend.STRONG_UP:   0.05,
+            Trend.UP:          0.02,
+            Trend.NEUTRAL:     0.0,
+            Trend.DOWN:       -0.03,
+            Trend.STRONG_DOWN:-0.05,
+        }.get(trend, 0.0)
 
-        # Hard cap: never offset more than 20K on items under 50M
-        if price < 50_000_000:
-            amount = min(amount, 20_000)
+        buy_fraction = max(0.03, min(0.50, buy_base + buy_trend))
 
-        # For very expensive items (50M+), cap at 0.15% or 50K
-        if price >= 50_000_000:
-            amount = min(amount, max(1, int(price * 0.0015)), 50_000)
+        # ── Sell fraction ─────────────────────────────────────────
+        # Symmetric base, inverted trend
+        sell_base = buy_base  # same volume / spread logic
 
-        return amount
+        sell_trend = {
+            Trend.STRONG_UP:  -0.03,   # prices up → hold higher ask
+            Trend.UP:         -0.02,
+            Trend.NEUTRAL:     0.0,
+            Trend.DOWN:        0.03,   # prices down → sell faster
+            Trend.STRONG_DOWN: 0.05,
+        }.get(trend, 0.0)
 
-    def clamp_buy_price(
-        self,
-        instant_sell: int,
-        trend: Trend,
-        vwap_5m: Optional[float],
-        vwap_30m: Optional[float],
-        momentum: float,
-        spread: int,
-    ) -> int:
-        """
-        Clamp buy price against trend.
-        Buy price starts at insta_sell and gets adjusted.
-        """
-        base = instant_sell
+        sell_fraction = max(0.03, min(0.50, sell_base + sell_trend))
 
-        if trend in (Trend.STRONG_UP, Trend.UP):
-            # Uptrend: price might keep going up, be willing to pay more
-            # but cap at VWAP_5m to avoid chasing
-            if vwap_5m:
-                base = max(instant_sell, int(vwap_5m))
-        elif trend in (Trend.STRONG_DOWN, Trend.DOWN):
-            # Downtrend: wait for price to stabilize
-            # Use lower of insta_sell and VWAP_30m minus a cushion
-            cushion = int(abs(momentum) * 5)  # 5 minutes of momentum
-            if vwap_30m:
-                base = min(instant_sell, int(vwap_30m) - cushion)
-            else:
-                base = instant_sell - cushion
-        # NEUTRAL: use insta_sell as-is
+        # ── Compute prices ────────────────────────────────────────
+        buy_price  = int(insta_sell + spread * buy_fraction)
+        sell_price = int(insta_buy  - spread * sell_fraction)
 
-        return max(1, base)
+        # Cap: offset must not exceed 0.6 % of item value for items >= 1 M
+        if insta_sell >= 1_000_000:
+            max_buy_off = int(insta_sell * 0.006)
+            if buy_price - insta_sell > max_buy_off:
+                buy_price = insta_sell + max_buy_off
 
-    def clamp_sell_price(
-        self,
-        instant_buy: int,
-        trend: Trend,
-        vwap_5m: Optional[float],
-        vwap_30m: Optional[float],
-        momentum: float,
-        spread: int,
-        volume_5m: int = 0,
-    ) -> int:
-        """
-        Clamp sell price against trend.
-        Sell price starts at insta_buy and gets adjusted.
-        For low-volume items, use VWAP as a sanity check to avoid
-        relying on a single stale high-price transaction.
-        """
-        base = instant_buy
+        if insta_buy >= 1_000_000:
+            max_sell_off = int(insta_buy * 0.006)
+            if insta_buy - sell_price > max_sell_off:
+                sell_price = insta_buy - max_sell_off
 
-        # For low-volume items, the last instant_buy might be an outlier.
-        # Use the lower of instant_buy and VWAP-5m to be conservative.
-        if volume_5m < 5 and vwap_5m and vwap_5m < instant_buy:
-            base = int(vwap_5m)
+        # VWAP sanity: don't exceed recent avg by more than 1 %
+        if vwap_5m_buy and buy_price > vwap_5m_buy * 1.01:
+            buy_price = int(vwap_5m_buy)
+        if vwap_5m_sell and sell_price < vwap_5m_sell * 0.99:
+            sell_price = int(vwap_5m_sell)
 
-        if trend in (Trend.STRONG_UP, Trend.UP):
-            # Uptrend: ride the wave, sell higher
-            if vwap_30m:
-                momentum_bonus = int(abs(momentum) * 10)  # 10 min projection
-                base = max(instant_buy, int(vwap_30m) + momentum_bonus)
-        elif trend in (Trend.STRONG_DOWN, Trend.DOWN):
-            # Downtrend: sell fast before further drops
-            if vwap_5m:
-                base = min(instant_buy, int(vwap_5m))
-        # NEUTRAL: use insta_buy as-is
+        # Floor: buy must stay ≥ insta_sell, sell ≤ insta_buy
+        buy_price  = max(insta_sell, buy_price)
+        sell_price = min(insta_buy,  sell_price)
 
-        return max(1, base)
+        # Ensure buy < sell
+        if buy_price >= sell_price:
+            mid = (insta_buy + insta_sell) // 2
+            buy_price  = mid - 1
+            sell_price = mid + 1
+
+        return buy_price, sell_price
 
     def detect_waterfall(self, snapshots: List[PriceSnapshot]) -> bool:
         """
@@ -582,29 +576,16 @@ class SmartPricer:
             historical_spread_pct=historical_spread_pct,
         )
 
-        # Clamp prices against trend
-        rec.clamped_buy = self.clamp_buy_price(
-            rec.instant_sell, rec.trend, rec.vwap_5m, rec.vwap_30m,
-            rec.momentum, spread,
+        # Clamp prices via spread-based positioning
+        vwap_5m_sell = self.calculate_vwap(snapshots, 5, use_buy=False)
+        rec.recommended_buy, rec.recommended_sell = self.calculate_spread_position(
+            rec.instant_buy, rec.instant_sell,
+            rec.volume_5m, rec.trend,
+            vwap_5m_buy=rec.vwap_5m,
+            vwap_5m_sell=vwap_5m_sell,
         )
-        rec.clamped_sell = self.clamp_sell_price(
-            rec.instant_buy, rec.trend, rec.vwap_5m, rec.vwap_30m,
-            rec.momentum, spread, volume_5m=rec.volume_5m,
-        )
-
-        # Apply queue-jumping offsets
-        # Buy: INCREASE offer to jump ahead of other buyers
-        # Sell: DECREASE price to sell faster than other sellers
-        buy_offset = self.calculate_undercut(rec.clamped_buy, rec.volume_5m, is_buy=True)
-        sell_offset = self.calculate_undercut(rec.clamped_sell, rec.volume_5m, is_buy=False)
-
-        rec.recommended_buy = rec.clamped_buy + buy_offset   # Offer MORE to buy first
-        rec.recommended_sell = rec.clamped_sell - sell_offset  # List LOWER to sell first
-
-        # Ensure buy < sell
-        if rec.recommended_buy >= rec.recommended_sell:
-            rec.recommended_buy = rec.instant_sell
-            rec.recommended_sell = rec.instant_buy
+        rec.clamped_buy = rec.recommended_buy
+        rec.clamped_sell = rec.recommended_sell
 
         # Calculate expected profit
         gross = rec.recommended_sell - rec.recommended_buy

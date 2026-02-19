@@ -118,7 +118,9 @@ public class OfferEditorWidget
         // Market price line
         if (marketWidget != null && wikiPrice > 0)
         {
-            String side = isSelling ? "Insta-Sell" : "Insta-Buy";
+            // Show the opposite-side price as the reference boundary:
+            // BUY → "Insta-Sell" (sellers' floor), SELL → "Insta-Buy" (buyers' ceiling)
+            String side = isSelling ? "Insta-Buy" : "Insta-Sell";
             marketWidget.setText("\u25B8 " + side + ": " + nf.format(wikiPrice) + " gp");
             marketWidget.setTextColor(COLOR_MARKET);
             marketWidget.setAction(0, "Use price");
