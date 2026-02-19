@@ -877,11 +877,11 @@ class PositionMonitor:
                 "positions": updates,
             })
 
-    def _get_positions(self, source: Optional[str] = None) -> List[Dict]:
+    def _get_positions(self, source: Optional[str] = None, player: Optional[str] = None) -> List[Dict]:
         """Sync: find active positions from DB."""
         db = get_db()
         try:
-            return find_active_positions(db, source=source)
+            return find_active_positions(db, source=source, player=player)
         finally:
             db.close()
 
@@ -988,10 +988,10 @@ class PositionMonitor:
         except Exception as e:
             logger.error("Failed to send Discord position alert: %s", e)
 
-    def get_positions_with_prices(self, source: Optional[str] = None) -> List[Dict]:
+    def get_positions_with_prices(self, source: Optional[str] = None, player: Optional[str] = None) -> List[Dict]:
         """Get all active positions with live pricing (for API endpoint)."""
         pricer = self._get_pricer()
-        positions = self._get_positions(source=source)
+        positions = self._get_positions(source=source, player=player)
         if not positions or pricer is None:
             return positions or []
 

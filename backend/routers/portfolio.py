@@ -40,6 +40,7 @@ from backend.database import (
     insert_trade,
     insert_flip,
     get_matched_buy_trade_ids,
+    get_distinct_players,
 )
 from backend.websocket import manager
 
@@ -110,11 +111,31 @@ async def _fetch_live_price(item_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/accounts  -  Distinct player RSNs
+# ---------------------------------------------------------------------------
+
+@router.get("/api/accounts")
+async def get_accounts():
+    """Return list of distinct player RSNs found in trade data."""
+    def _sync():
+        db = get_db()
+        try:
+            return get_distinct_players(db)
+        finally:
+            db.close()
+
+    players = await asyncio.to_thread(_sync)
+    return {"accounts": players}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/portfolio
 # ---------------------------------------------------------------------------
 
 @router.get("/api/portfolio")
-async def get_portfolio():
+async def get_portfolio(
+    player: Optional[str] = Query(None, description="Filter by player RSN"),
+):
     """Return current holdings from portfolio.json or the database."""
     def _sync():
         portfolio = _load_portfolio_file()
@@ -123,8 +144,8 @@ async def get_portfolio():
         if not portfolio.get("holdings"):
             db = get_db()
             try:
-                matched_buy_ids = get_matched_buy_trade_ids(db)
-                all_trades = find_trades(db, limit=500)
+                matched_buy_ids = get_matched_buy_trade_ids(db, player=player)
+                all_trades = find_trades(db, limit=500, player=player)
                 buys = [t for t in all_trades if t.trade_type == "BUY" and t.status == "BOUGHT"]
                 holdings = []
                 for t in buys:
@@ -142,6 +163,13 @@ async def get_portfolio():
             finally:
                 db.close()
 
+        # If filtering by player and holdings came from JSON file, filter them
+        if player and portfolio.get("holdings"):
+            portfolio["holdings"] = [
+                h for h in portfolio["holdings"]
+                if h.get("player") == player
+            ]
+
         return portfolio
 
     return await asyncio.to_thread(_sync)
@@ -155,12 +183,13 @@ async def get_portfolio():
 async def get_trades(
     limit: int = Query(100, ge=1, le=1000),
     item_id: Optional[int] = Query(None),
+    player: Optional[str] = Query(None, description="Filter by player RSN"),
 ):
     """Return trade history from the trades table."""
     def _sync():
         db = get_db()
         try:
-            rows = find_trades(db, item_id=item_id, limit=limit)
+            rows = find_trades(db, item_id=item_id, limit=limit, player=player)
             return [
                 {
                     "id": t.id,
@@ -191,12 +220,14 @@ async def get_trades(
 # ---------------------------------------------------------------------------
 
 @router.get("/api/performance")
-async def get_performance():
+async def get_performance(
+    player: Optional[str] = Query(None, description="Filter by player RSN"),
+):
     """Return overall performance metrics computed from flip_history."""
     def _sync():
         db = get_db()
         try:
-            flips = find_all_flips(db)
+            flips = find_all_flips(db, player=player)
             if not flips:
                 return {
                     "total_flips": 0,
@@ -476,6 +507,7 @@ async def clear_trade_history():
 @router.get("/api/positions")
 async def get_active_positions(
     source: Optional[str] = Query(None, description="Filter by source: 'dink' or 'csv_import'"),
+    player: Optional[str] = Query(None, description="Filter by player RSN"),
 ):
     """Return all active (open) positions with live pricing data.
 
@@ -483,11 +515,12 @@ async def get_active_positions(
     recommended sell price, and estimated profit/loss.
 
     Use ?source=dink to show only DINK-tracked positions (recommended).
+    Use ?player=Igotbulks to show only that account's positions.
     """
     def _sync():
         from backend.tasks import get_position_monitor
         monitor = get_position_monitor()
-        return monitor.get_positions_with_prices(source=source)
+        return monitor.get_positions_with_prices(source=source, player=player)
 
     positions = await asyncio.to_thread(_sync)
     return {"positions": positions, "total": len(positions)}

@@ -3,6 +3,7 @@ import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye, X, Trash2 } fr
 import { useNavigate } from 'react-router-dom';
 import { api, createPriceSocket } from '../api/client';
 import { useApi } from '../hooks/useApi';
+import { useAccount } from '../hooks/useAccount';
 
 function formatGP(n) {
   if (n == null) return '—';
@@ -15,12 +16,18 @@ const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif
 
 export default function Portfolio({ prices }) {
   const nav = useNavigate();
+  const { activeAccount } = useAccount();
   const [sourceFilter, setSourceFilter] = useState('dink'); // 'dink' | 'all'
-  const { data: portfolio, loading, reload } = useApi(() => api.getPortfolio(), [], 120000);
-  const { data: trades } = useApi(() => api.getTrades({ limit: 50 }), [], 120000);
+  const { data: portfolio, loading, reload } = useApi(
+    () => api.getPortfolio(activeAccount), [activeAccount], 120000,
+  );
+  const { data: trades } = useApi(
+    () => api.getTrades({ limit: 50, ...(activeAccount ? { player: activeAccount } : {}) }),
+    [activeAccount], 120000,
+  );
   const { data: posData, loading: posLoading, reload: reloadPos } = useApi(
-    () => api.getActivePositions(sourceFilter === 'all' ? undefined : sourceFilter),
-    [sourceFilter],
+    () => api.getActivePositions(sourceFilter === 'all' ? undefined : sourceFilter, activeAccount),
+    [sourceFilter, activeAccount],
     60000
   );
 
@@ -80,7 +87,11 @@ export default function Portfolio({ prices }) {
       <div className="page-header">
         <div>
           <h2 className="page-title">Portfolio</h2>
-          <p className="page-subtitle">Active positions &amp; trade history</p>
+          <p className="page-subtitle">
+            {activeAccount
+              ? `${activeAccount} — active positions & trade history`
+              : 'Active positions & trade history'}
+          </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn" onClick={() => nav('/import')}>Import CSV</button>
@@ -161,6 +172,7 @@ export default function Portfolio({ prices }) {
               <thead>
                 <tr>
                   <th>Item</th>
+                  {!activeAccount && <th>Account</th>}
                   <th>Qty</th>
                   <th>Buy Price</th>
                   <th>Current Price</th>
@@ -190,6 +202,9 @@ export default function Portfolio({ prices }) {
                           <AlertTriangle size={14} color="var(--red)" style={{ marginLeft: 4 }} />
                         )}
                       </td>
+                      {!activeAccount && (
+                        <td className="text-muted" style={{ fontSize: 11 }}>{p.player || '—'}</td>
+                      )}
                       <td>{(p.quantity || 0).toLocaleString()}</td>
                       <td className="gp">{formatGP(p.buy_price)}</td>
                       <td className="gp">
@@ -244,6 +259,7 @@ export default function Portfolio({ prices }) {
               <tr>
                 <th>Time</th>
                 <th>Item</th>
+                {!activeAccount && <th>Account</th>}
                 <th>Type</th>
                 <th>Qty</th>
                 <th>Price</th>
@@ -256,6 +272,9 @@ export default function Portfolio({ prices }) {
                 <tr key={i}>
                   <td className="text-muted">{t.timestamp ? new Date(t.timestamp).toLocaleString() : '—'}</td>
                   <td style={{ fontWeight: 500 }}>{t.item_name}</td>
+                  {!activeAccount && (
+                    <td className="text-muted" style={{ fontSize: 11 }}>{t.player || '—'}</td>
+                  )}
                   <td>
                     <span className={`badge ${t.trade_type === 'BUY' ? 'badge-green' : 'badge-red'}`}>
                       {t.trade_type}

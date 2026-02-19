@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
+import { useAccount } from '../hooks/useAccount';
 
 function formatGP(n) {
   if (n == null) return '—';
@@ -13,7 +14,10 @@ function formatGP(n) {
 
 export default function Performance() {
   const nav = useNavigate();
-  const { data: perf, loading, error, reload } = useApi(() => api.getPerformance(), [], 120000);
+  const { activeAccount } = useAccount();
+  const { data: perf, loading, error, reload } = useApi(
+    () => api.getPerformance(activeAccount), [activeAccount], 120000,
+  );
 
   if (loading) return <div className="loading">Loading performance data...</div>;
   if (error) return (
@@ -49,7 +53,11 @@ export default function Performance() {
       <div className="page-header">
         <div>
           <h2 className="page-title">Performance</h2>
-          <p className="page-subtitle">Your flipping performance from {perf.total_flips} completed flips</p>
+          <p className="page-subtitle">
+            {activeAccount
+              ? `${activeAccount} — ${perf.total_flips} completed flips`
+              : `Your flipping performance from ${perf.total_flips} completed flips`}
+          </p>
         </div>
       </div>
 

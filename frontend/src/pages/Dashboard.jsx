@@ -11,6 +11,7 @@ import {
 } from 'recharts';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
+import { useAccount } from '../hooks/useAccount';
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -44,13 +45,18 @@ const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif
 
 export default function Dashboard() {
   const nav = useNavigate();
+  const { activeAccount } = useAccount();
 
   const { data: raw, loading: oppsLoading, error: oppsError, reload: reloadOpps } = useApi(
     () => api.getOpportunities({ limit: 20, sort_by: 'total_score' }),
     [], 120000,
   );
-  const { data: perf, loading: perfLoading } = useApi(() => api.getPerformance(), [], 120000);
-  const { data: portfolio } = useApi(() => api.getPortfolio(), [], 120000);
+  const { data: perf, loading: perfLoading } = useApi(
+    () => api.getPerformance(activeAccount), [activeAccount], 120000,
+  );
+  const { data: portfolio } = useApi(
+    () => api.getPortfolio(activeAccount), [activeAccount], 120000,
+  );
 
   const opps = raw?.items || raw || [];
 
@@ -123,7 +129,11 @@ export default function Dashboard() {
       <div className="page-header">
         <div>
           <h2 className="page-title">Dashboard</h2>
-          <p className="page-subtitle">Real-time market overview & performance analytics</p>
+          <p className="page-subtitle">
+            {activeAccount
+              ? `Stats for ${activeAccount}`
+              : 'Real-time market overview & performance analytics'}
+          </p>
         </div>
         <button className="btn" onClick={reloadOpps}>
           <RefreshCw size={14} /> Refresh

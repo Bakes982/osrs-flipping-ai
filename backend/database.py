@@ -536,6 +536,15 @@ def init_db():
         [("timestamp", DESCENDING)],
         background=True,
     )
+    # Player (RSN) indexes for multi-account filtering
+    _wrapper.trades.create_index(
+        [("player", ASCENDING), ("timestamp", DESCENDING)],
+        background=True,
+    )
+    _wrapper.flip_history.create_index(
+        [("player", ASCENDING), ("sell_time", DESCENDING)],
+        background=True,
+    )
 
     logger.info("MongoDB initialized: %s / %s", MONGODB_URL.split("@")[-1], DATABASE_NAME)
 
@@ -770,11 +779,14 @@ def find_trades(
     db: Database,
     item_id: Optional[int] = None,
     limit: int = 100,
+    player: Optional[str] = None,
 ) -> List[Trade]:
-    """Find trades, newest first."""
-    query = {}
+    """Find trades, newest first.  Optionally filter by player (RSN)."""
+    query: Dict = {}
     if item_id is not None:
         query["item_id"] = item_id
+    if player:
+        query["player"] = player
     docs = (
         db.trades.find(query)
         .sort("timestamp", DESCENDING)
@@ -783,22 +795,29 @@ def find_trades(
     return [Trade.from_doc(d) for d in docs]
 
 
-def find_all_flips(db: Database, limit: int = 5000) -> List[FlipHistory]:
-    """Find all flips, newest first."""
+def find_all_flips(
+    db: Database, limit: int = 5000, player: Optional[str] = None,
+) -> List[FlipHistory]:
+    """Find all flips, newest first.  Optionally filter by player (RSN)."""
+    query: Dict = {}
+    if player:
+        query["player"] = player
     docs = (
-        db.flip_history.find()
+        db.flip_history.find(query)
         .sort("sell_time", DESCENDING)
         .limit(limit)
     )
     return [FlipHistory.from_doc(d) for d in docs]
 
 
-def get_matched_buy_trade_ids(db: Database) -> set:
+def get_matched_buy_trade_ids(
+    db: Database, player: Optional[str] = None,
+) -> set:
     """Return set of buy_trade_id strings that have been matched to a flip."""
-    docs = db.flip_history.find(
-        {"buy_trade_id": {"$ne": None}},
-        {"buy_trade_id": 1},
-    )
+    query: Dict = {"buy_trade_id": {"$ne": None}}
+    if player:
+        query["player"] = player
+    docs = db.flip_history.find(query, {"buy_trade_id": 1})
     return {str(d["buy_trade_id"]) for d in docs}
 
 
@@ -897,14 +916,16 @@ def find_snapshot_near_time(
 def find_active_positions(
     db: Database,
     source: Optional[str] = None,
+    player: Optional[str] = None,
 ) -> List[Dict]:
     """Return active (open) positions — BUY trades not yet matched to a flip.
 
     Args:
         source: Filter by trade source ('dink', 'csv_import', or None for all).
+        player: Filter by player RSN.  None returns all players.
                 Dismissed positions are always excluded.
     """
-    matched_ids = get_matched_buy_trade_ids(db)
+    matched_ids = get_matched_buy_trade_ids(db, player=player)
     dismissed = set(get_setting(db, "dismissed_positions", default=[]))
 
     query: Dict = {
@@ -913,6 +934,8 @@ def find_active_positions(
     }
     if source:
         query["source"] = source
+    if player:
+        query["player"] = player
 
     docs = db.trades.find(query).sort("timestamp", DESCENDING)
 
@@ -961,3 +984,10 @@ def dismiss_positions_by_source(db: Database, source: str) -> int:
 def get_position_monitoring_state(db: Database) -> Dict:
     """Get the saved position monitoring state (last-alerted prices etc.)."""
     return get_setting(db, "position_monitor_state", default={})
+
+
+def get_distinct_players(db: Database) -> List[str]:
+    """Return sorted list of distinct player RSNs from the trades collection."""
+    players = db.trades.distinct("player")
+    # Filter out None/empty strings
+    return sorted([p for p in players if p])

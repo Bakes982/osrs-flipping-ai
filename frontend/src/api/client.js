@@ -127,12 +127,16 @@ export const api = {
   },
 
   // Portfolio
-  getPortfolio() {
-    return fetchJSON('/portfolio');
+  getPortfolio(player) {
+    const qs = player ? `?player=${encodeURIComponent(player)}` : '';
+    return fetchJSON(`/portfolio${qs}`);
   },
-  getActivePositions(source) {
-    const qs = source ? `?source=${source}` : '';
-    return fetchJSON(`/positions${qs}`);
+  getActivePositions(source, player) {
+    const params = new URLSearchParams();
+    if (source) params.set('source', source);
+    if (player) params.set('player', player);
+    const qs = params.toString();
+    return fetchJSON(`/positions${qs ? '?' + qs : ''}`);
   },
   dismissPosition(tradeId) {
     return fetchJSON(`/positions/dismiss?trade_id=${tradeId}`, { method: 'POST' });
@@ -144,8 +148,9 @@ export const api = {
     const qs = new URLSearchParams(params).toString();
     return fetchJSON(`/trades${qs ? '?' + qs : ''}`);
   },
-  getPerformance() {
-    return fetchJSON('/performance');
+  getPerformance(player) {
+    const qs = player ? `?player=${encodeURIComponent(player)}` : '';
+    return fetchJSON(`/performance${qs}`);
   },
 
   // Trade Import
@@ -209,6 +214,11 @@ export const api = {
   // Arbitrage
   getArbitrage() {
     return fetchJSON('/opportunities/arbitrage');
+  },
+
+  // Accounts
+  getAccounts() {
+    return fetchJSON('/accounts');
   },
 
   // Settings

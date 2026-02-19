@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, Briefcase, BarChart3,
-  Brain, Settings, LogOut, Bell, Upload,
+  Brain, Settings, LogOut, Bell, Upload, Users,
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
@@ -15,6 +15,7 @@ import SettingsPage from './pages/Settings';
 import Import from './pages/Import';
 import Login from './pages/Login';
 import { createPriceSocket, api, clearToken } from './api/client';
+import { AccountProvider, useAccount } from './hooks/useAccount';
 import './App.css';
 
 const NAV_ITEMS = [
@@ -27,6 +28,25 @@ const NAV_ITEMS = [
   { path: '/models', label: 'ML Models', icon: Brain },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
+
+function AccountSelector() {
+  const { accounts, activeAccount, setActiveAccount } = useAccount();
+  if (!accounts.length) return null;
+  return (
+    <div className="account-selector">
+      <Users size={14} />
+      <select
+        value={activeAccount || ''}
+        onChange={(e) => setActiveAccount(e.target.value || null)}
+      >
+        <option value="">All Accounts</option>
+        {accounts.map((a) => (
+          <option key={a} value={a}>{a}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
 export default function App() {
   const [livePrices, setLivePrices] = useState({});
@@ -100,6 +120,7 @@ export default function App() {
   }
 
   return (
+    <AccountProvider>
     <BrowserRouter>
       <div className="app">
         {/* Mobile menu overlay */}
@@ -114,6 +135,7 @@ export default function App() {
               <span className={`dot ${wsConnected ? 'online' : 'offline'}`} />
               {wsConnected ? 'Live' : 'Connecting...'}
             </div>
+            <AccountSelector />
           </div>
           <div className="nav-links">
             {NAV_ITEMS.map(({ path, label, icon: Icon }) => (
@@ -167,5 +189,6 @@ export default function App() {
         </main>
       </div>
     </BrowserRouter>
+    </AccountProvider>
   );
 }
