@@ -542,6 +542,23 @@ async def get_active_positions(
     return {"positions": positions, "total": len(positions)}
 
 
+@router.get("/api/positions/selling")
+async def get_selling_offers(
+    player: Optional[str] = Query(None, description="Filter by player RSN"),
+):
+    """Return all pending SELLING trades (sell offers posted but not yet filled)."""
+    def _sync():
+        db = get_db()
+        try:
+            from backend.database import find_pending_sells
+            return find_pending_sells(db, hours=24, player=player)
+        finally:
+            db.close()
+
+    sells = await asyncio.to_thread(_sync)
+    return {"sells": sells, "total": len(sells)}
+
+
 @router.post("/api/positions/dismiss")
 async def dismiss_active_position(trade_id: str = Query(..., description="Trade ID to dismiss")):
     """Dismiss a single position so it no longer appears in active positions."""

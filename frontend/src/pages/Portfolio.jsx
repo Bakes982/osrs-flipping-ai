@@ -1,367 +1,442 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { RefreshCw, TrendingDown, TrendingUp, AlertTriangle, Eye, X, Trash2, Clock, Filter } from 'lucide-react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import {
+  RefreshCw, TrendingUp, ArrowUpRight,
+  ShoppingCart, Tag, Clock, AlertTriangle, X,
+} from 'lucide-react';
 import { api, createPriceSocket } from '../api/client';
 import { useApi } from '../hooks/useApi';
-import { useAccount } from '../hooks/useAccount';
+
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
 
 function formatGP(n) {
   if (n == null) return '—';
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'B';
   if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return n.toLocaleString();
 }
 
-function timeAgo(dateStr) {
-  if (!dateStr) return '';
-  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
-  if (diff < 60) return `${Math.floor(diff)}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
+function elapsed(isoStr) {
+  if (!isoStr) return '—';
+  const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+function pnlColor(pct) {
+  if (pct == null) return 'var(--text-secondary)';
+  if (pct >= 1) return 'var(--green)';
+  if (pct >= 0) return 'var(--yellow)';
+  return 'var(--red)';
 }
 
 const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
 
-export default function Portfolio({ prices }) {
+/* ── Sub-components ────────────────────────────────────────────────────────── */
+
+function SectionHeader({ icon: Icon, title, count, color = 'var(--cyan)' }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14,
+      paddingBottom: 10, borderBottom: '1px solid var(--border)',
+    }}>
+      <div style={{
+        width: 32, height: 32, borderRadius: 8,
+        background: `linear-gradient(135deg, ${color}22, ${color}44)`,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        border: `1px solid ${color}44`,
+      }}>
+        <Icon size={16} color={color} />
+      </div>
+      <span style={{ fontWeight: 700, fontSize: 15 }}>{title}</span>
+      {count != null && (
+        <span style={{
+          background: 'var(--bg-secondary)', border: '1px solid var(--border)',
+          borderRadius: 12, padding: '2px 8px', fontSize: 11, color: 'var(--text-secondary)',
+        }}>{count}</span>
+      )}
+    </div>
+  );
+}
+
+function HoldingCard({ pos, onDismiss, flashId, nav }) {
+  const isFlashing = flashId === pos.item_id;
+  const pnl = pos.pnl_pct;
+  const profit = pos.recommended_profit;
+
+  return (
+    <div style={{
+      background: 'var(--bg-card)',
+      border: `1px solid ${isFlashing ? 'var(--red)' : pnl != null && pnl < -2 ? 'rgba(239,68,68,0.4)' : 'var(--border)'}`,
+      borderRadius: 12, padding: '14px 16px',
+      display: 'grid',
+      gridTemplateColumns: '36px 1fr auto auto auto auto auto',
+      alignItems: 'center', gap: 12,
+      transition: 'border-color 0.4s',
+      boxShadow: isFlashing ? '0 0 12px rgba(239,68,68,0.3)' : 'none',
+    }}>
+      <img src={IMG(pos.item_id)} alt="" width={32} height={32}
+        style={{ imageRendering: 'pixelated' }}
+        onError={e => { e.target.style.display = 'none'; }} />
+
+      <div>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>{pos.item_name}</div>
+        <div className="text-muted" style={{ fontSize: 10 }}>
+          {pos.player} · {pos.quantity?.toLocaleString()}×
+        </div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Bought</div>
+        <div style={{ fontSize: 12, fontWeight: 600 }}>{formatGP(pos.buy_price)}</div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Now</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--cyan)' }}>{formatGP(pos.current_price)}</div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Sell at</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--green)' }}>{formatGP(pos.recommended_sell)}</div>
+      </div>
+
+      <div style={{ textAlign: 'right', minWidth: 72 }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Est. Profit</div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: pnlColor(pos.recommended_profit_pct) }}>
+          {profit != null ? (profit >= 0 ? '+' : '') + formatGP(profit) : '—'}
+          {pos.recommended_profit_pct != null && (
+            <span style={{ fontSize: 10, marginLeft: 4 }}>
+              ({pos.recommended_profit_pct >= 0 ? '+' : ''}{pos.recommended_profit_pct?.toFixed(1)}%)
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
+          <Clock size={10} /> {elapsed(pos.bought_at)}
+        </span>
+        <button onClick={() => nav(`/item/${pos.item_id}`)} className="btn"
+          style={{ padding: '4px 7px', fontSize: 10 }} title="View chart">
+          <ArrowUpRight size={11} />
+        </button>
+        <button onClick={() => onDismiss(pos.trade_id)} className="btn"
+          style={{ padding: '4px 7px', fontSize: 10, color: 'var(--red)' }} title="Dismiss">
+          <X size={11} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SellOfferCard({ sell, alertMap, nav }) {
+  const alert = alertMap[sell.item_id];
+  const isAlerting = !!alert;
+  const dropPct = alert?.drop_pct;
+
+  return (
+    <div style={{
+      background: 'var(--bg-card)',
+      border: `1px solid ${isAlerting ? 'rgba(239,68,68,0.6)' : 'rgba(245,158,11,0.3)'}`,
+      borderRadius: 12, padding: '14px 16px',
+      display: 'grid',
+      gridTemplateColumns: '36px 1fr auto auto auto auto auto',
+      alignItems: 'center', gap: 12,
+      transition: 'border-color 0.4s',
+      boxShadow: isAlerting ? '0 0 14px rgba(239,68,68,0.25)' : 'none',
+    }}>
+      <img src={IMG(sell.item_id)} alt="" width={32} height={32}
+        style={{ imageRendering: 'pixelated' }}
+        onError={e => { e.target.style.display = 'none'; }} />
+
+      <div>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>{sell.item_name}</div>
+        <div className="text-muted" style={{ fontSize: 10 }}>
+          {sell.player} · {sell.quantity?.toLocaleString()}×
+        </div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Listed at</div>
+        <div style={{ fontSize: 12, fontWeight: 600 }}>{formatGP(sell.listed_sell_price)}</div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        <div className="text-muted" style={{ fontSize: 10 }}>Market now</div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: isAlerting ? 'var(--red)' : 'var(--cyan)' }}>
+          {alert ? formatGP(alert.current_market_price) : '—'}
+        </div>
+      </div>
+
+      <div style={{ textAlign: 'right' }}>
+        {isAlerting ? (
+          <span className="badge badge-red" style={{ fontSize: 11 }}>▼ {dropPct?.toFixed(1)}% below</span>
+        ) : (
+          <span className="badge badge-yellow" style={{ fontSize: 11 }}>Monitoring</span>
+        )}
+      </div>
+
+      <div style={{ textAlign: 'right', minWidth: 80 }}>
+        {alert?.suggested_relist ? (
+          <>
+            <div className="text-muted" style={{ fontSize: 10 }}>Re-list at</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--yellow)' }}>
+              {formatGP(alert.suggested_relist)}
+            </div>
+          </>
+        ) : <span />}
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
+          <Clock size={10} /> {elapsed(sell.listed_at)}
+        </span>
+        <button onClick={() => nav(`/item/${sell.item_id}`)} className="btn"
+          style={{ padding: '4px 7px', fontSize: 10 }} title="View chart">
+          <ArrowUpRight size={11} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Main Component ────────────────────────────────────────────────────────── */
+
+export default function Portfolio() {
   const nav = useNavigate();
-  const { activeAccount } = useAccount();
-  const [sourceFilter, setSourceFilter] = useState('dink');
-  const [showPending, setShowPending] = useState(false);          // toggle for BUYING/SELLING
-  const [lastRefresh, setLastRefresh] = useState(Date.now());     // for "updated X ago"
-  const refreshTimer = useRef(null);
+  const [sourceFilter, setSourceFilter] = useState('');
+  const [activeAccount, setActiveAccount] = useState('');
+  const [flashId, setFlashId] = useState(null);
+  const [sellAlertMap, setSellAlertMap] = useState({});
+  const wsRef = useRef(null);
 
-  // ---- Active positions (only BOUGHT, unmatched) ----
   const { data: posData, loading: posLoading, reload: reloadPos } = useApi(
-    () => api.getActivePositions(sourceFilter === 'all' ? undefined : sourceFilter, activeAccount),
+    () => api.getActivePositions(sourceFilter || undefined, activeAccount || undefined),
     [sourceFilter, activeAccount],
-    30000                                                        // auto-refresh every 30s
+    5000,
   );
 
-  // ---- Trade history (only filled by default) ----
-  const { data: trades, reload: reloadTrades } = useApi(
-    () => api.getTrades({
-      limit: 50,
-      ...(activeAccount ? { player: activeAccount } : {}),
-      completed_only: showPending ? 'false' : 'true',
-    }),
-    [activeAccount, showPending], 120000,
+  const { data: sellData, reload: reloadSells } = useApi(
+    () => api.getSellOffers(activeAccount || undefined),
+    [activeAccount],
+    10000,
   );
 
-  // WebSocket for live position updates
-  const [livePositions, setLivePositions] = useState(null);
+  const { data: tradeData, loading: tradeLoading } = useApi(
+    () => api.getTrades({ limit: 50, completed_only: 'true' }),
+    [],
+    120000,
+  );
+
+  const positions = posData?.positions || posData || [];
+  const sells = sellData?.sells || [];
+  const trades = tradeData?.trades || tradeData || [];
 
   useEffect(() => {
-    const socket = createPriceSocket((msg) => {
-      if (msg.type === 'position_update' && msg.positions) {
-        setLivePositions(msg.positions);
-        setLastRefresh(Date.now());
-      }
-      if (msg.type === 'position_opened' || msg.type === 'position_closed') {
+    const { socket, close } = createPriceSocket((msg) => {
+      if (msg.type === 'position_update') {
         reloadPos();
-        reloadTrades();
-        setLastRefresh(Date.now());
+      } else if (msg.type === 'position_opened' || msg.type === 'position_closed') {
+        reloadPos();
+        reloadSells();
+      } else if (msg.type === 'selling_price_alert') {
+        const map = {};
+        for (const a of (msg.alerts || [])) {
+          map[a.item_id] = a;
+          setFlashId(a.item_id);
+          setTimeout(() => setFlashId(null), 4000);
+        }
+        setSellAlertMap(prev => ({ ...prev, ...map }));
       }
     });
-    return () => socket.close();
-  }, [reloadPos, reloadTrades]);
-
-  // Tick the "updated X ago" label every 10s
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 10000);
-    return () => clearInterval(id);
+    wsRef.current = socket;
+    return () => close();
   }, []);
 
-  // Use live data if available, otherwise fall back to API snapshot
-  const positions = livePositions || posData?.positions || [];
-
-  // ---- Summary stats (only from real filled positions) ----
-  const totalInvested = positions.reduce(
-    (s, p) => s + (p.buy_price || 0) * (p.quantity || 0), 0
-  );
-  const totalCurrentValue = positions.reduce(
-    (s, p) => s + (p.current_price || p.buy_price || 0) * (p.quantity || 0), 0
-  );
-  const totalPnL = positions.reduce((s, p) => s + (p.recommended_profit || 0), 0);
-
-  const [actionError, setActionError] = useState(null);
-
-  const handleDismiss = async (e, tradeId) => {
-    e.stopPropagation();
-    setActionError(null);
+  const handleDismiss = async (tradeId) => {
     try {
       await api.dismissPosition(tradeId);
       reloadPos();
-      setLivePositions(null);
-    } catch (err) {
-      setActionError(`Failed to dismiss: ${err.message}`);
+    } catch (e) {
+      console.error('Dismiss failed', e);
     }
   };
 
-  const handleClearCsv = async () => {
-    setActionError(null);
-    try {
-      await api.clearCsvPositions();
-      reloadPos();
-      setLivePositions(null);
-    } catch (err) {
-      setActionError(`Failed to clear CSV positions: ${err.message}`);
-    }
-  };
-
-  const handleRefreshAll = () => {
-    reloadPos();
-    reloadTrades();
-    setLivePositions(null);
-    setLastRefresh(Date.now());
-  };
+  const stats = useMemo(() => {
+    if (!positions.length) return null;
+    const totalCost = positions.reduce((s, p) => s + (p.buy_price * p.quantity || 0), 0);
+    const totalProfit = positions.reduce((s, p) => s + (p.recommended_profit || 0), 0);
+    const avgPnl = positions.reduce((s, p) => s + (p.pnl_pct || 0), 0) / positions.length;
+    return { totalCost, totalProfit, avgPnl, count: positions.length };
+  }, [positions]);
 
   return (
     <div>
-      {/* ---- Header ---- */}
       <div className="page-header">
         <div>
-          <h2 className="page-title">Portfolio</h2>
+          <h2 className="page-title">Active Flips</h2>
           <p className="page-subtitle">
-            {activeAccount
-              ? `${activeAccount} — filled positions & trade history`
-              : 'All accounts — filled positions & trade history'}
+            Live positions · updates every 5s
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 8 }}>
+              <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--green)', display: 'inline-block', animation: 'pulse 2s infinite' }} />
+              Live
+            </span>
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <span className="text-muted" style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}>
-            <Clock size={12} /> {timeAgo(new Date(lastRefresh).toISOString())}
-          </span>
-          <button className="btn" onClick={() => nav('/import')}>Import CSV</button>
-          <button className="btn" onClick={handleRefreshAll}>
+          <select
+            value={sourceFilter}
+            onChange={e => setSourceFilter(e.target.value)}
+            style={{ padding: '7px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
+          >
+            <option value="">All sources</option>
+            <option value="dink">DINK only</option>
+            <option value="csv_import">CSV import</option>
+          </select>
+          <button className="btn" onClick={() => { reloadPos(); reloadSells(); }}>
             <RefreshCw size={14} /> Refresh
           </button>
         </div>
       </div>
 
-      {/* ---- Summary cards ---- */}
-      <div className="stats-grid">
-        <div className="card">
-          <div className="card-title">Filled Positions</div>
-          <div className="card-value">{positions.length}</div>
-        </div>
-        <div className="card">
-          <div className="card-title">Total Invested</div>
-          <div className="card-value text-cyan">{formatGP(totalInvested)}</div>
-        </div>
-        <div className="card">
-          <div className="card-title">Current Value</div>
-          <div className="card-value" style={{ color: totalCurrentValue >= totalInvested ? 'var(--green)' : 'var(--red)' }}>
-            {positions.length ? formatGP(totalCurrentValue) : '—'}
+      {stats && (
+        <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', marginBottom: 20 }}>
+          <div className="card" style={{ padding: '14px 16px' }}>
+            <div className="card-title">Holdings</div>
+            <div style={{ fontSize: 22, fontWeight: 700 }}>{stats.count}</div>
           </div>
-        </div>
-        <div className="card">
-          <div className="card-title">Est. Profit (at rec. sell)</div>
-          <div className="card-value" style={{ color: totalPnL >= 0 ? 'var(--green)' : 'var(--red)' }}>
-            {positions.length ? `${totalPnL >= 0 ? '+' : ''}${formatGP(totalPnL)}` : '—'}
+          <div className="card" style={{ padding: '14px 16px' }}>
+            <div className="card-title">Total Invested</div>
+            <div style={{ fontSize: 18, fontWeight: 700 }}>{formatGP(stats.totalCost)}</div>
           </div>
-        </div>
-      </div>
-
-      {/* ---- Error ---- */}
-      {actionError && (
-        <div style={{
-          padding: '10px 16px', marginBottom: 16, borderRadius: 8,
-          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)',
-          color: 'var(--red)', fontSize: 13, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        }}>
-          <span><AlertTriangle size={14} style={{ verticalAlign: 'middle', marginRight: 6 }} />{actionError}</span>
-          <button onClick={() => setActionError(null)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer' }}>&times;</button>
+          <div className="card" style={{ padding: '14px 16px' }}>
+            <div className="card-title">Est. Total Profit</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: pnlColor(stats.totalProfit) }}>
+              {stats.totalProfit >= 0 ? '+' : ''}{formatGP(stats.totalProfit)}
+            </div>
+          </div>
+          <div className="card" style={{ padding: '14px 16px' }}>
+            <div className="card-title">Avg P&L</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: pnlColor(stats.avgPnl) }}>
+              {stats.avgPnl >= 0 ? '+' : ''}{stats.avgPnl.toFixed(1)}%
+            </div>
+          </div>
+          {sells.length > 0 && (
+            <div className="card" style={{ padding: '14px 16px', border: '1px solid rgba(245,158,11,0.3)' }}>
+              <div className="card-title">Sell Offers</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--yellow)' }}>{sells.length}</div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* ================================================================== */}
-      {/*  Active Positions — only items actually BOUGHT (filled)             */}
-      {/* ================================================================== */}
-      <div className="card" style={{ marginBottom: 24 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 14, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Eye size={16} /> Active Positions
-            {livePositions && <span className="badge badge-green" style={{ fontSize: 10 }}>LIVE</span>}
-          </h3>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <select
-              value={sourceFilter}
-              onChange={e => { setSourceFilter(e.target.value); setLivePositions(null); }}
-              className="input"
-              style={{ padding: '4px 8px', fontSize: 12, width: 'auto' }}
-            >
-              <option value="dink">DINK Only</option>
-              <option value="all">All Sources</option>
-            </select>
-            {sourceFilter === 'all' && positions.some(p => p.source === 'csv_import') && (
-              <button className="btn" style={{ fontSize: 11, padding: '4px 10px' }} onClick={handleClearCsv}>
-                <Trash2 size={12} /> Clear CSV
-              </button>
-            )}
-          </div>
-        </div>
-
-        {posLoading && !positions.length ? <div className="loading">Loading positions...</div> : (
-          !positions.length ? (
-            <div className="empty">
-              No filled positions yet.
-              <br />
-              <span className="text-muted" style={{ fontSize: 12 }}>
-                Only items that were actually bought appear here — pending/cancelled offers are excluded.
+      {/* Sell Offers */}
+      {sells.length > 0 && (
+        <div className="card" style={{ marginBottom: 20, padding: '18px 20px' }}>
+          <SectionHeader icon={Tag} title="Sell Offers" count={sells.length} color="var(--yellow)" />
+          {Object.keys(sellAlertMap).length > 0 && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
+              padding: '8px 12px', background: 'rgba(239,68,68,0.08)',
+              border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, fontSize: 12,
+            }}>
+              <AlertTriangle size={14} color="var(--red)" />
+              <span style={{ color: 'var(--red)', fontWeight: 600 }}>
+                Market price has dropped below your listed price on {Object.keys(sellAlertMap).length} item(s) — consider re-listing.
               </span>
             </div>
-          ) : (
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {sells.map(sell => (
+              <SellOfferCard key={sell.trade_id} sell={sell} alertMap={sellAlertMap} nav={nav} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Active Holdings */}
+      <div className="card" style={{ marginBottom: 20, padding: '18px 20px' }}>
+        <SectionHeader icon={ShoppingCart} title="Active Holdings" count={positions.length} color="var(--cyan)" />
+        {posLoading && positions.length === 0 ? (
+          <div className="loading">Loading positions...</div>
+        ) : positions.length === 0 ? (
+          <div className="empty" style={{ padding: '30px 0' }}>
+            <ShoppingCart size={22} style={{ opacity: 0.4, marginBottom: 8 }} />
+            <div>No active holdings — buy something via the GE and DINK will pick it up.</div>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {positions.map(pos => (
+              <HoldingCard
+                key={pos.trade_id}
+                pos={pos}
+                onDismiss={handleDismiss}
+                flashId={flashId}
+                nav={nav}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Recent Completed Trades */}
+      <div className="card" style={{ padding: '18px 20px' }}>
+        <SectionHeader icon={TrendingUp} title="Recent Trades" count={trades.length} color="var(--green)" />
+        {tradeLoading && !trades.length ? (
+          <div className="loading">Loading trades...</div>
+        ) : trades.length === 0 ? (
+          <div className="empty" style={{ padding: '24px 0' }}>No completed trades yet.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
             <table className="data-table">
               <thead>
                 <tr>
                   <th>Item</th>
-                  {!activeAccount && <th>Account</th>}
+                  <th>Type</th>
                   <th>Qty</th>
-                  <th>Buy Price</th>
-                  <th>Current</th>
-                  <th>Rec. Sell</th>
-                  <th>Change</th>
-                  <th>Est. Profit</th>
-                  <th style={{ width: 80 }}>Bought</th>
-                  <th style={{ width: 36 }}></th>
+                  <th>Price</th>
+                  <th>Status</th>
+                  <th>Player</th>
+                  <th>When</th>
                 </tr>
               </thead>
               <tbody>
-                {positions.map((p, i) => {
-                  const pnlPct = p.pnl_pct || 0;
-                  const recProfit = p.recommended_profit;
-                  const recProfitPct = p.recommended_profit_pct || 0;
-                  const isDown = pnlPct < 0;
-                  return (
-                    <tr key={p.trade_id || i} style={{ cursor: 'pointer' }}
-                        onClick={() => p.item_id && nav(`/item/${p.item_id}`)}>
-                      <td style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8 }}>
-                        {p.item_id > 0 && (
-                          <img src={IMG(p.item_id)} alt="" width={24} height={24}
-                               style={{ imageRendering: 'pixelated' }}
-                               onError={e => { e.target.style.display = 'none'; }} />
-                        )}
-                        {p.item_name}
-                        {Math.abs(pnlPct) >= 5 && (
-                          <AlertTriangle size={14} color="var(--red)" style={{ marginLeft: 4 }} />
-                        )}
-                      </td>
-                      {!activeAccount && (
-                        <td className="text-muted" style={{ fontSize: 11 }}>{p.player || '—'}</td>
-                      )}
-                      <td>{(p.quantity || 0).toLocaleString()}</td>
-                      <td className="gp">{formatGP(p.buy_price)}</td>
-                      <td className="gp">
-                        {p.current_price ? formatGP(p.current_price) : '—'}
-                      </td>
-                      <td className="gp" style={{ color: 'var(--cyan)', fontWeight: 600 }}>
-                        {p.recommended_sell ? formatGP(p.recommended_sell) : '—'}
-                      </td>
-                      <td>
-                        {p.current_price ? (
-                          <span className={`badge ${isDown ? 'badge-red' : 'badge-green'}`}
-                                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                            {isDown ? <TrendingDown size={12} /> : <TrendingUp size={12} />}
-                            {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
-                          </span>
-                        ) : '—'}
-                      </td>
-                      <td style={{ color: recProfit >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
-                        {recProfit != null
-                          ? `${recProfit >= 0 ? '+' : ''}${formatGP(recProfit)} (${recProfitPct >= 0 ? '+' : ''}${recProfitPct.toFixed(1)}%)`
-                          : '—'}
-                      </td>
-                      <td className="text-muted" style={{ fontSize: 11 }}>
-                        {timeAgo(p.bought_at)}
-                      </td>
-                      <td>
-                        <button
-                          onClick={(e) => handleDismiss(e, p.trade_id)}
-                          title="Dismiss position"
-                          style={{
-                            background: 'none', border: 'none', cursor: 'pointer',
-                            color: 'var(--text-muted)', padding: 4,
-                          }}
-                        >
-                          <X size={14} />
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )
-        )}
-      </div>
-
-      {/* ================================================================== */}
-      {/*  Trade History — only filled by default, toggle to see pending      */}
-      {/* ================================================================== */}
-      <div className="card">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 14, margin: 0 }}>Trade History</h3>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' }}>
-            <Filter size={12} />
-            <input
-              type="checkbox"
-              checked={showPending}
-              onChange={e => setShowPending(e.target.checked)}
-              style={{ accentColor: 'var(--cyan)' }}
-            />
-            Include pending (BUYING / SELLING)
-          </label>
-        </div>
-        {!trades?.length ? (
-          <div className="empty">No completed trades — <span onClick={() => nav('/import')} style={{ color: 'var(--cyan)', cursor: 'pointer' }}>import your CSV</span> or wait for DINK webhooks.</div>
-        ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Item</th>
-                {!activeAccount && <th>Account</th>}
-                <th>Type</th>
-                <th>Status</th>
-                <th>Qty</th>
-                <th>Price</th>
-                <th>Total</th>
-                <th>Source</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trades.slice(0, 30).map((t, i) => {
-                const isFilled = t.status === 'BOUGHT' || t.status === 'SOLD';
-                return (
-                  <tr key={i} style={{ opacity: isFilled ? 1 : 0.5 }}>
-                    <td className="text-muted" style={{ fontSize: 12 }}>
-                      {t.timestamp ? timeAgo(t.timestamp) : '—'}
-                    </td>
-                    <td style={{ fontWeight: 500 }}>{t.item_name}</td>
-                    {!activeAccount && (
-                      <td className="text-muted" style={{ fontSize: 11 }}>{t.player || '—'}</td>
-                    )}
-                    <td>
-                      <span className={`badge ${t.trade_type === 'BUY' ? 'badge-green' : 'badge-red'}`}>
-                        {t.trade_type}
-                      </span>
+                {trades.map((t, i) => (
+                  <tr key={i}>
+                    <td style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <img src={IMG(t.item_id)} alt="" width={22} height={22}
+                        style={{ imageRendering: 'pixelated' }}
+                        onError={e => { e.target.style.display = 'none'; }} />
+                      {t.item_name}
                     </td>
                     <td>
-                      <span className={`badge ${isFilled ? 'badge-green' : 'badge-yellow'}`} style={{ fontSize: 10 }}>
-                        {t.status}
+                      <span className={`badge ${t.trade_type === 'BUY' ? 'badge-cyan' : 'badge-green'}`}>
+                        {t.trade_type === 'BUY' ? '⬇ BUY' : '⬆ SELL'}
                       </span>
                     </td>
                     <td>{t.quantity?.toLocaleString()}</td>
                     <td className="gp">{formatGP(t.price)}</td>
-                    <td className="gp">{formatGP(t.total_value)}</td>
-                    <td className="text-muted" style={{ fontSize: 11 }}>{t.source || '—'}</td>
+                    <td>
+                      <span className={`badge ${
+                        t.status === 'BOUGHT' ? 'badge-green' :
+                        t.status === 'SOLD' ? 'badge-cyan' :
+                        t.status === 'BUYING' || t.status === 'SELLING' ? 'badge-yellow' : 'badge-red'
+                      }`}>{t.status}</span>
+                    </td>
+                    <td className="text-muted">{t.player}</td>
+                    <td className="text-muted" style={{ fontSize: 11 }}>
+                      <span title={t.timestamp}>{elapsed(t.timestamp)} ago</span>
+                    </td>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>

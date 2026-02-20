@@ -31,6 +31,7 @@ from backend.database import (
     upsert_item_feature,
     get_item,
     find_active_positions,
+    find_pending_sells,
     get_price_history,
 )
 from backend.websocket import manager
@@ -782,10 +783,11 @@ class PositionMonitor:
        - An in-DB Alert record
     """
 
-    CHECK_INTERVAL = 60  # seconds between checks
+    CHECK_INTERVAL = 30  # seconds between checks
     SMALL_CHANGE_PCT = 2.0   # % change to flag on dashboard
     LARGE_CHANGE_PCT = 5.0   # % change to send Discord notification
     COOLDOWN_MINUTES = 15    # minimum minutes between alerts for the same item
+    SELL_DROP_THRESHOLD = 2.0  # % below listed sell price to trigger sell alert
 
     def __init__(self):
         # item_id → {last_alerted_price, last_alerted_at, last_rec_sell}
@@ -1026,6 +1028,155 @@ class PositionMonitor:
             enriched.append(pos)
         return enriched
 
+    async def _get_sell_alert_webhook(self) -> Optional[str]:
+        """Return the dedicated sell-alert webhook URL (or general webhook as fallback)."""
+        def _sync():
+            db = get_db()
+            try:
+                url = get_setting(db, "sell_alert_webhook_url")
+                if url:
+                    return url
+                # Fallback to general webhook if enabled
+                wh = get_setting(db, "discord_webhook")
+                if isinstance(wh, dict):
+                    return wh.get("url") if wh.get("enabled") else None
+                url = get_setting(db, "discord_webhook_url")
+                enabled = get_setting(db, "discord_alerts_enabled", False)
+                return url if url and enabled else None
+            finally:
+                db.close()
+        return await asyncio.to_thread(_sync)
+
+    async def check_selling_offers(self):
+        """Check active SELLING offers against current market price.
+
+        If the current instant-buy price (what buyers pay) has dropped more than
+        SELL_DROP_THRESHOLD% below the player's listed sell price, fire:
+        - WS broadcast so the Portfolio page highlights the row
+        - Discord alert via the dedicated sell-alert webhook
+        - DB Alert record
+        """
+        def _get_sells():
+            db = get_db()
+            try:
+                return find_pending_sells(db)
+            finally:
+                db.close()
+
+        sells = await asyncio.to_thread(_get_sells)
+        if not sells:
+            return
+
+        pricer = self._get_pricer()
+        now = datetime.utcnow()
+        sell_alerts = []
+
+        for sell in sells:
+            item_id = sell["item_id"]
+            listed_price = sell["listed_sell_price"]
+            if not listed_price:
+                continue
+
+            try:
+                def _eval(iid=item_id):
+                    db = get_db()
+                    try:
+                        snaps = get_price_history(db, iid, hours=1)
+                        if not snaps:
+                            return None
+                        latest = snaps[-1]
+                        # instant_buy = what buyers are currently paying (the relevant price for sell offers)
+                        return latest.instant_buy or latest.instant_sell
+                    finally:
+                        db.close()
+
+                current_market = await asyncio.to_thread(_eval)
+                if not current_market:
+                    continue
+
+                drop_pct = (listed_price - current_market) / listed_price * 100
+                if drop_pct < self.SELL_DROP_THRESHOLD:
+                    continue
+
+                # Cooldown check (use a sell-specific state key)
+                state_key = f"sell_{item_id}"
+                state = self._state.get(state_key, {})
+                last_alerted_at = state.get("last_alerted_at")
+                on_cooldown = (
+                    last_alerted_at
+                    and (now - last_alerted_at).total_seconds() < self.COOLDOWN_MINUTES * 60
+                )
+                if on_cooldown:
+                    continue
+
+                alert_msg = (
+                    f"{sell['item_name']} market price dropped {drop_pct:.1f}% below your "
+                    f"listed sell price ({listed_price:,} GP → market {current_market:,} GP). "
+                    f"Consider re-listing at {int(current_market * 0.99):,} GP."
+                )
+
+                sell_alert = {
+                    "item_id": item_id,
+                    "item_name": sell["item_name"],
+                    "listed_sell_price": listed_price,
+                    "current_market_price": current_market,
+                    "drop_pct": round(drop_pct, 1),
+                    "suggested_relist": int(current_market * 0.99),
+                    "quantity": sell["quantity"],
+                    "listed_at": sell["listed_at"],
+                }
+                sell_alerts.append(sell_alert)
+
+                self._state[state_key] = {"last_alerted_at": now}
+
+                # Save DB alert
+                await asyncio.to_thread(
+                    self._save_alert, item_id, sell["item_name"], alert_msg, sell_alert
+                )
+
+                # Discord for drops >= LARGE_CHANGE_PCT
+                if drop_pct >= self.LARGE_CHANGE_PCT:
+                    asyncio.create_task(self._send_discord_sell_alert(sell_alert))
+
+            except Exception as e:
+                logger.debug("PositionMonitor: sell-check error for %s: %s", sell.get("item_name"), e)
+
+        # Broadcast all sell alerts to connected frontends
+        if sell_alerts:
+            await manager.broadcast_json({
+                "type": "selling_price_alert",
+                "timestamp": now.isoformat(),
+                "alerts": sell_alerts,
+            })
+
+    async def _send_discord_sell_alert(self, alert: dict):
+        """Send a Discord embed for a sell offer that has been undercut by the market."""
+        try:
+            webhook_url = await self._get_sell_alert_webhook()
+            if not webhook_url:
+                return
+
+            import requests as _requests
+
+            embed = {
+                "title": f"📉 SELL PRICE DROP: {alert['item_name']}",
+                "color": 0xFF4444,
+                "fields": [
+                    {"name": "🏷️ Listed Sell Price", "value": f"{alert['listed_sell_price']:,} GP", "inline": True},
+                    {"name": "📊 Current Market", "value": f"{alert['current_market_price']:,} GP", "inline": True},
+                    {"name": "📉 Drop", "value": f"{alert['drop_pct']:+.1f}%", "inline": True},
+                    {"name": "💡 Suggested Re-list", "value": f"{alert['suggested_relist']:,} GP", "inline": True},
+                    {"name": "📦 Quantity", "value": f"{alert['quantity']:,}", "inline": True},
+                ],
+                "description": "Market price has dropped below your listed sell price — you may be stuck selling for hours. Consider cancelling and re-listing.",
+                "footer": {"text": "OSRS Flipping AI • Sell Price Watcher"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+            logger.info("Discord sell-price alert sent for %s", alert["item_name"])
+        except Exception as e:
+            logger.error("Failed to send Discord sell alert: %s", e)
+
     async def run_forever(self):
         logger.info("PositionMonitor started (checks every %ds)", self.CHECK_INTERVAL)
         # Wait for initial price data
@@ -1033,6 +1184,7 @@ class PositionMonitor:
         while True:
             try:
                 await self.check_positions()
+                await self.check_selling_offers()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
             await asyncio.sleep(self.CHECK_INTERVAL)
@@ -1272,10 +1424,29 @@ def get_opportunity_notifier() -> OpportunityNotifier:
 _tasks = []
 
 
+async def _seed_sell_alert_webhook():
+    """One-time seed: if sell_alert_webhook_url is unset in DB, write the default."""
+    _SELL_ALERT_DEFAULT = "https://discord.com/api/webhooks/1474337747446796351/EjVW1qDmMl3th8gAQ-ra8idgw3qHVSlQbpt_GqPeZ3bG3-teskzT2NKICLJGdEKsgirJ"
+
+    def _sync():
+        db = get_db()
+        try:
+            existing = get_setting(db, "sell_alert_webhook_url")
+            if not existing:
+                set_setting(db, "sell_alert_webhook_url", _SELL_ALERT_DEFAULT)
+                logger.info("Seeded sell_alert_webhook_url in settings")
+        finally:
+            db.close()
+
+    await asyncio.to_thread(_sync)
+
+
 async def start_background_tasks():
     """Create and start all background asyncio tasks, staggered to avoid
     overloading MongoDB with simultaneous queries."""
     global _tasks
+
+    await _seed_sell_alert_webhook()
 
     collector = PriceCollector()
     feature_computer = FeatureComputer()

@@ -16,7 +16,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, PriceSnapshot
+from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, get_setting, PriceSnapshot
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
 from backend.arbitrage_finder import ArbitrageFinder
@@ -111,9 +111,21 @@ async def list_opportunities(
     # Score all items through the composite scorer (has sync DB calls)
     scored = await asyncio.to_thread(score_opportunities, raw, min_score, limit * 2)
 
+    # Load blocklist once
+    def _get_blocklist():
+        db = get_db()
+        try:
+            return set(get_setting(db, "blacklisted_item_ids") or [])
+        finally:
+            db.close()
+
+    blocklist_ids = await asyncio.to_thread(_get_blocklist)
+
     # Post-filter
     results = []
     for fs in scored:
+        if fs.item_id in blocklist_ids:
+            continue
         if fs.expected_profit is not None and fs.expected_profit < min_profit:
             continue
         if fs.volume_5m < min_volume:

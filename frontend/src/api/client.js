@@ -138,6 +138,10 @@ export const api = {
     const qs = params.toString();
     return fetchJSON(`/positions${qs ? '?' + qs : ''}`);
   },
+  getSellOffers(player) {
+    const qs = player ? `?player=${encodeURIComponent(player)}` : '';
+    return fetchJSON(`/positions/selling${qs}`);
+  },
   dismissPosition(tradeId) {
     return fetchJSON(`/positions/dismiss?trade_id=${tradeId}`, { method: 'POST' });
   },
@@ -222,6 +226,20 @@ export const api = {
   },
 
   // Settings
+  // Blocklist
+  getBlocklist() {
+    return fetchJSON('/blocklist');
+  },
+  setBlocklist(itemIds) {
+    return fetchJSON('/blocklist', {
+      method: 'POST',
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+  },
+  analyzeBlocklist() {
+    return fetchJSON('/blocklist/analyze', { method: 'POST' });
+  },
+
   getSettings() {
     return fetchJSON('/settings');
   },

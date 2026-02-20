@@ -28,6 +28,7 @@ from backend.database import init_db
 from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
 from backend.routers import opportunities, portfolio, analysis, settings, alerts
+from backend.routers import blocklist as blocklist_router
 from backend.auth import (
     router as auth_router, is_configured as auth_configured,
     requires_auth, get_current_user,
@@ -120,6 +121,7 @@ app.include_router(portfolio.router)
 app.include_router(analysis.router)
 app.include_router(settings.router)
 app.include_router(alerts.router)
+app.include_router(blocklist_router.router)
 
 
 # ---------------------------------------------------------------------------

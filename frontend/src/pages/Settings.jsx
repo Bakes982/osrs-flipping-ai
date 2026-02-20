@@ -4,24 +4,32 @@ import { useApi } from '../hooks/useApi';
 
 export default function SettingsPage() {
   const { data: settings, loading, reload } = useApi(() => api.getSettings(), []);
+  const { data: me } = useApi(() => api.getMe(), []);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
 
   // Local state for discord webhook (controlled inputs)
   const [webhookUrl, setWebhookUrl] = useState('');
   const [webhookEnabled, setWebhookEnabled] = useState(false);
+  const [sellAlertWebhook, setSellAlertWebhook] = useState('');
   const [notifyInterval, setNotifyInterval] = useState(30);
   const [riskTolerance, setRiskTolerance] = useState('MEDIUM');
   const [sending, setSending] = useState(false);
   const [testing, setTesting] = useState(false);
+
+  // Security state
+  const [allowedIds, setAllowedIds] = useState([]);
+  const [newDiscordId, setNewDiscordId] = useState('');
 
   // Sync local state when settings load
   useEffect(() => {
     if (settings) {
       setWebhookUrl(settings.discord_webhook?.url || settings.discord_webhook_url || '');
       setWebhookEnabled(settings.discord_webhook?.enabled ?? settings.discord_alerts_enabled ?? false);
+      setSellAlertWebhook(settings.sell_alert_webhook_url || '');
       setNotifyInterval(settings.discord_top5_interval_minutes ?? 30);
       setRiskTolerance(settings.risk_tolerance || 'MEDIUM');
+      setAllowedIds(settings.allowed_discord_ids || []);
     }
   }, [settings]);
 
@@ -36,6 +44,7 @@ export default function SettingsPage() {
       await api.updateSettings({
         discord_webhook: { url: webhookUrl, enabled: webhookEnabled },
         discord_top5_interval_minutes: notifyInterval,
+        sell_alert_webhook_url: sellAlertWebhook,
       });
       showMsg('Discord settings saved!');
       reload();
@@ -43,6 +52,31 @@ export default function SettingsPage() {
       showMsg('Error: ' + e.message, 4000);
     }
     setSaving(false);
+  };
+
+  const addDiscordId = async () => {
+    const trimmed = newDiscordId.trim();
+    if (!trimmed || allowedIds.includes(trimmed)) return;
+    const updated = [...allowedIds, trimmed];
+    setAllowedIds(updated);
+    setNewDiscordId('');
+    try {
+      await api.updateSettings({ allowed_discord_ids: updated });
+      showMsg('Allowed user added!');
+    } catch (e) {
+      showMsg('Error: ' + e.message, 4000);
+    }
+  };
+
+  const removeDiscordId = async (id) => {
+    const updated = allowedIds.filter(x => x !== id);
+    setAllowedIds(updated);
+    try {
+      await api.updateSettings({ allowed_discord_ids: updated });
+      showMsg('User removed.');
+    } catch (e) {
+      showMsg('Error: ' + e.message, 4000);
+    }
   };
 
   const testWebhook = async () => {
@@ -174,6 +208,20 @@ export default function SettingsPage() {
             </button>
           </div>
 
+          <label style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 8 }}>
+            Sell-Alert Webhook URL
+            <input
+              type="password"
+              value={sellAlertWebhook}
+              onChange={e => setSellAlertWebhook(e.target.value)}
+              placeholder="https://discord.com/api/webhooks/... (for sell price drop alerts)"
+              style={inputStyle}
+            />
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              Receives alerts when a sell offer price drops while you're listing. Leave blank to use the main webhook above.
+            </span>
+          </label>
+
           <p className="text-muted" style={{ fontSize: 11, marginTop: 4 }}>
             When enabled, the backend will automatically scan for the best flip opportunities
             and send them to your Discord channel with price charts attached.
@@ -196,6 +244,77 @@ export default function SettingsPage() {
             <option value="HIGH">High (aggressive)</option>
           </select>
         </label>
+      </div>
+
+      {/* Security */}
+      <div className="card" style={{ marginBottom: 24 }}>
+        <h3 style={{ fontSize: 14, marginBottom: 16 }}>🔒 Security — Allowed Users</h3>
+
+        {/* Current user info */}
+        {me && me.id !== 'anonymous' && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16,
+            padding: '10px 14px', background: 'rgba(6,182,212,0.07)', borderRadius: 8,
+            border: '1px solid rgba(6,182,212,0.2)',
+          }}>
+            {me.avatar && (
+              <img
+                src={`https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png?size=40`}
+                alt="" width={36} height={36} style={{ borderRadius: '50%' }}
+              />
+            )}
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>{me.username}</div>
+              <div className="text-muted" style={{ fontSize: 11 }}>Discord ID: {me.id}</div>
+            </div>
+            <span className="badge badge-green" style={{ marginLeft: 'auto' }}>Logged in</span>
+          </div>
+        )}
+
+        <p className="text-muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          Only Discord users in this list can log in. The first user to authenticate is automatically added.
+          Remove yourself only if another owner is already listed.
+        </p>
+
+        {/* List of allowed IDs */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
+          {allowedIds.length === 0 && (
+            <p className="text-muted" style={{ fontSize: 12 }}>
+              No users configured — anyone who authenticates with Discord can log in.
+            </p>
+          )}
+          {allowedIds.map(id => (
+            <div key={id} style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '6px 12px', background: 'var(--bg-secondary)', borderRadius: 6,
+              border: '1px solid var(--border)', fontSize: 12,
+            }}>
+              <span style={{ fontFamily: 'monospace' }}>{id}</span>
+              {id === me?.id && <span className="badge badge-cyan" style={{ margin: '0 8px' }}>You</span>}
+              <button
+                onClick={() => removeDiscordId(id)}
+                style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}
+                title="Remove"
+              >×</button>
+            </div>
+          ))}
+        </div>
+
+        {/* Add new ID */}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            type="text"
+            value={newDiscordId}
+            onChange={e => setNewDiscordId(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && addDiscordId()}
+            placeholder="Discord user ID (18-digit number)"
+            style={{ ...inputStyle, flex: 1, marginTop: 0 }}
+          />
+          <button onClick={addDiscordId} style={btnStyle('#4fc3f7')}>Add</button>
+        </div>
+        <p className="text-muted" style={{ fontSize: 11, marginTop: 8 }}>
+          To find a Discord ID: enable Developer Mode in Discord → right-click any user → Copy User ID.
+        </p>
       </div>
 
       {/* API Settings */}

@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, Briefcase, BarChart3,
-  Brain, Settings, LogOut, Bell, Upload, Users,
+  Brain, Settings, LogOut, Bell, Upload, Users, ShieldOff,
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
@@ -13,6 +13,7 @@ import ModelDashboard from './pages/ModelDashboard';
 import Alerts from './pages/Alerts';
 import SettingsPage from './pages/Settings';
 import Import from './pages/Import';
+import Blocklist from './pages/Blocklist';
 import Login from './pages/Login';
 import { createPriceSocket, api, clearToken } from './api/client';
 import { AccountProvider, useAccount } from './hooks/useAccount';
@@ -26,6 +27,7 @@ const NAV_ITEMS = [
   { path: '/performance', label: 'Performance', icon: BarChart3 },
   { path: '/import', label: 'Import', icon: Upload },
   { path: '/models', label: 'ML Models', icon: Brain },
+  { path: '/blocklist', label: 'Blocklist', icon: ShieldOff },
   { path: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -184,6 +186,7 @@ export default function App() {
             <Route path="/performance" element={<Performance />} />
             <Route path="/import" element={<Import />} />
             <Route path="/models" element={<ModelDashboard />} />
+            <Route path="/blocklist" element={<Blocklist />} />
             <Route path="/settings" element={<SettingsPage />} />
           </Routes>
         </main>

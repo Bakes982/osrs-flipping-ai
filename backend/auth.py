@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 
 from backend import config
+from backend.database import get_db, get_setting, set_setting
 
 logger = logging.getLogger(__name__)
 
@@ -181,12 +182,29 @@ async def callback(code: str):
 
         user = user_resp.json()
 
-    # Check allowlist
-    if config.ALLOWED_DISCORD_IDS and user["id"] not in config.ALLOWED_DISCORD_IDS:
-        logger.warning("Denied login for Discord user %s (%s)", user["username"], user["id"])
-        raise HTTPException(status_code=403, detail="You are not authorised to access this dashboard.")
+    # Check allowlist (env var takes priority; fall back to DB allowlist)
+    user_id = user["id"]
+    if config.ALLOWED_DISCORD_IDS:
+        # Env var is set — hard allowlist, no DB override
+        if user_id not in config.ALLOWED_DISCORD_IDS:
+            logger.warning("Denied login for Discord user %s (%s)", user["username"], user_id)
+            raise HTTPException(status_code=403, detail="You are not authorised to access this dashboard.")
+    else:
+        # Env var is empty — check/manage DB allowlist
+        db = get_db()
+        try:
+            db_allowed: list = get_setting(db, "allowed_discord_ids") or []
+            if not db_allowed:
+                # First user ever — auto-enroll as owner
+                set_setting(db, "allowed_discord_ids", [user_id])
+                logger.info("First-run: auto-enrolled %s (%s) as owner", user["username"], user_id)
+            elif user_id not in db_allowed:
+                logger.warning("Denied login for Discord user %s (%s)", user["username"], user_id)
+                raise HTTPException(status_code=403, detail="You are not authorised to access this dashboard.")
+        finally:
+            db.close()
 
-    logger.info("User logged in: %s (%s)", user["username"], user["id"])
+    logger.info("User logged in: %s (%s)", user["username"], user_id)
 
     # Create signed session token
     session_token = create_token(user)

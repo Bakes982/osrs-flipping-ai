@@ -29,8 +29,10 @@ DEFAULTS: Dict[str, Any] = {
     "price_poll_seconds": 10,
     "discord_webhook_url": "",
     "discord_alerts_enabled": False,
+    "sell_alert_webhook_url": "",   # separate webhook for sell-price-drop alerts
     "tracked_item_ids": [],
     "blacklisted_item_ids": [],
+    "allowed_discord_ids": [],      # list of Discord user ID strings allowed to log in
     "max_investment_per_flip": 50_000_000,
     "ge_tax_rate": 0.02,
 }

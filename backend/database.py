@@ -1072,6 +1072,47 @@ def dismiss_position(db: Database, trade_id: str):
         set_setting(db, "dismissed_positions", dismissed)
 
 
+def find_pending_sells(
+    db: Database,
+    hours: int = 24,
+    player: Optional[str] = None,
+) -> List[Dict]:
+    """Return pending SELLING trades (sell offers posted but not yet filled).
+
+    Args:
+        hours: Only include trades posted within this many hours.
+        player: Filter by player RSN. None returns all players.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)
+
+    query: Dict = {
+        "trade_type": "SELL",
+        "status": "SELLING",
+        "timestamp": {"$gte": cutoff},
+    }
+    if player:
+        query["player"] = player
+
+    docs = db.trades.find(query).sort("timestamp", DESCENDING)
+
+    sells = []
+    for d in docs:
+        trade = Trade.from_doc(d)
+        sells.append({
+            "trade_id": trade.id,
+            "item_id": trade.item_id,
+            "item_name": trade.item_name,
+            "quantity": trade.quantity,
+            "listed_sell_price": trade.price,
+            "total_value": trade.total_value,
+            "listed_at": trade.timestamp.isoformat() if trade.timestamp else None,
+            "player": trade.player,
+            "source": trade.source,
+        })
+    return sells
+
+
 def dismiss_positions_by_source(db: Database, source: str) -> int:
     """Dismiss all active positions from a given source (e.g. 'csv_import')."""
     positions = find_active_positions(db, source=source)
