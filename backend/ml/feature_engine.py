@@ -111,6 +111,12 @@ class FeatureEngine:
         # Historical flip features
         features.update(self._historical_features(flips))
 
+        # Microstructure features (order flow, spread dynamics)
+        features.update(self._microstructure_features(snapshots))
+
+        # Volatility regime features (regime detection, support/resistance)
+        features.update(self._regime_features(snapshots))
+
         return features
 
     # ------------------------------------------------------------------
@@ -319,6 +325,194 @@ class FeatureEngine:
             )
         else:
             features["consistency_score"] = 0.0
+
+        return features
+
+    # ------------------------------------------------------------------
+    # Microstructure Features (order flow, spread dynamics)
+    # ------------------------------------------------------------------
+
+    def _microstructure_features(self, snapshots: List[PriceSnapshot]) -> Dict[str, float]:
+        features: Dict[str, float] = {}
+
+        # --- Order Flow Imbalance (OFI) ---
+        # Measures buying vs selling pressure from volume asymmetry
+        buy_5m, sell_5m = self._buy_sell_volumes(snapshots, minutes=5)
+        buy_15m, sell_15m = self._buy_sell_volumes(snapshots, minutes=15)
+        total_5m = buy_5m + sell_5m
+        total_15m = buy_15m + sell_15m
+        features["ofi_5m"] = (buy_5m - sell_5m) / total_5m if total_5m > 0 else 0.0
+        features["ofi_15m"] = (buy_15m - sell_15m) / total_15m if total_15m > 0 else 0.0
+
+        # --- Spread Volatility ---
+        # High spread volatility = uncertain market, harder to flip
+        cutoff_30m = datetime.utcnow() - timedelta(minutes=30)
+        spreads = []
+        for s in snapshots:
+            if s.timestamp >= cutoff_30m and s.instant_buy and s.instant_sell:
+                if s.instant_sell > 0:
+                    spreads.append((s.instant_buy - s.instant_sell) / s.instant_sell)
+        if len(spreads) >= 3:
+            features["spread_volatility"] = statistics.stdev(spreads)
+            features["spread_mean"] = statistics.mean(spreads)
+        else:
+            features["spread_volatility"] = 0.0
+            features["spread_mean"] = 0.0
+
+        # --- Price Efficiency Ratio ---
+        # Directional movement / total movement. 1.0 = trending, 0.0 = choppy
+        prices_30m = self._extract_prices_in_window(snapshots, minutes=30)
+        if len(prices_30m) >= 5:
+            directional = abs(prices_30m[-1] - prices_30m[0])
+            total_movement = sum(
+                abs(prices_30m[i] - prices_30m[i - 1])
+                for i in range(1, len(prices_30m))
+            )
+            features["efficiency_ratio"] = (
+                directional / total_movement if total_movement > 0 else 0.0
+            )
+        else:
+            features["efficiency_ratio"] = 0.0
+
+        # --- Momentum Acceleration ---
+        # Rate of change of momentum (is the trend accelerating or decelerating?)
+        mom_1x = self._rate_of_change(snapshots, 5)
+        mom_2x = self._rate_of_change(snapshots, 10)
+        features["momentum_acceleration"] = mom_1x - mom_2x
+
+        # --- Volume-Weighted Momentum ---
+        # Weight price changes by volume so high-volume moves count more
+        cutoff_15m = datetime.utcnow() - timedelta(minutes=15)
+        vw_changes = []
+        vw_total_vol = 0.0
+        prev_price = None
+        for s in snapshots:
+            if s.timestamp >= cutoff_15m and s.instant_buy and s.instant_buy > 0:
+                vol = (s.buy_volume or 0) + (s.sell_volume or 0)
+                if prev_price and prev_price > 0 and vol > 0:
+                    change = (s.instant_buy - prev_price) / prev_price
+                    vw_changes.append(change * vol)
+                    vw_total_vol += vol
+                prev_price = s.instant_buy
+        features["volume_weighted_momentum"] = (
+            sum(vw_changes) / vw_total_vol if vw_total_vol > 0 else 0.0
+        )
+
+        # --- Relative Spread Position ---
+        # Current spread relative to recent spread range
+        if len(spreads) >= 5:
+            max_spread = max(spreads)
+            min_spread = min(spreads)
+            current_spread = spreads[-1] if spreads else 0.0
+            spread_range = max_spread - min_spread
+            features["relative_spread_pos"] = (
+                (current_spread - min_spread) / spread_range
+                if spread_range > 0 else 0.5
+            )
+        else:
+            features["relative_spread_pos"] = 0.5
+
+        return features
+
+    # ------------------------------------------------------------------
+    # Volatility Regime Features
+    # ------------------------------------------------------------------
+
+    def _regime_features(self, snapshots: List[PriceSnapshot]) -> Dict[str, float]:
+        features: Dict[str, float] = {}
+
+        # --- Volatility Regime Detection ---
+        # Compare short-term vol to long-term vol to detect regime changes
+        prices_1h = self._extract_prices_in_window(snapshots, minutes=60)
+        prices_4h = self._extract_prices_in_window(snapshots, minutes=240)
+
+        if len(prices_1h) >= 5:
+            returns_1h = [
+                (prices_1h[i] - prices_1h[i - 1]) / prices_1h[i - 1]
+                for i in range(1, len(prices_1h))
+                if prices_1h[i - 1] > 0
+            ]
+            vol_1h = statistics.stdev(returns_1h) if len(returns_1h) >= 2 else 0.0
+        else:
+            vol_1h = 0.0
+
+        if len(prices_4h) >= 10:
+            returns_4h = [
+                (prices_4h[i] - prices_4h[i - 1]) / prices_4h[i - 1]
+                for i in range(1, len(prices_4h))
+                if prices_4h[i - 1] > 0
+            ]
+            vol_4h = statistics.stdev(returns_4h) if len(returns_4h) >= 2 else 0.0
+        else:
+            vol_4h = 0.0
+
+        # Vol ratio > 1 means short-term volatility is elevated (regime shift)
+        features["vol_regime_ratio"] = vol_1h / vol_4h if vol_4h > 0 else 1.0
+        features["realized_vol_1h"] = vol_1h
+        features["realized_vol_4h"] = vol_4h
+
+        # --- Support/Resistance Proximity ---
+        # How close is current price to recent highs/lows (key decision levels)
+        prices_2h = self._extract_prices_in_window(snapshots, minutes=120)
+        current = self._latest_buy_price(snapshots)
+
+        if len(prices_2h) >= 10 and current > 0:
+            high_2h = max(prices_2h)
+            low_2h = min(prices_2h)
+            price_range = high_2h - low_2h
+
+            if price_range > 0:
+                # 0 = at low (support), 1 = at high (resistance)
+                features["support_resistance_pos"] = (current - low_2h) / price_range
+                # Distance to resistance as % (small = near resistance)
+                features["dist_to_resistance_pct"] = (high_2h - current) / current * 100
+                # Distance to support as % (small = near support)
+                features["dist_to_support_pct"] = (current - low_2h) / current * 100
+            else:
+                features["support_resistance_pos"] = 0.5
+                features["dist_to_resistance_pct"] = 0.0
+                features["dist_to_support_pct"] = 0.0
+        else:
+            features["support_resistance_pos"] = 0.5
+            features["dist_to_resistance_pct"] = 0.0
+            features["dist_to_support_pct"] = 0.0
+
+        # --- Mean Reversion Strength ---
+        # How strongly prices revert to mean (measured by autocorrelation of returns)
+        if len(prices_1h) >= 10:
+            returns = [
+                (prices_1h[i] - prices_1h[i - 1]) / prices_1h[i - 1]
+                for i in range(1, len(prices_1h))
+                if prices_1h[i - 1] > 0
+            ]
+            if len(returns) >= 6:
+                # Lag-1 autocorrelation: negative = mean-reverting, positive = trending
+                n = len(returns)
+                mean_r = statistics.mean(returns)
+                var = sum((r - mean_r) ** 2 for r in returns)
+                if var > 0:
+                    cov = sum(
+                        (returns[i] - mean_r) * (returns[i - 1] - mean_r)
+                        for i in range(1, n)
+                    )
+                    features["return_autocorr"] = cov / var
+                else:
+                    features["return_autocorr"] = 0.0
+            else:
+                features["return_autocorr"] = 0.0
+        else:
+            features["return_autocorr"] = 0.0
+
+        # --- Price Concentration ---
+        # What fraction of recent time was price near current level (±1%)
+        if len(prices_1h) >= 5 and current > 0:
+            near_count = sum(
+                1 for p in prices_1h
+                if abs(p - current) / current < 0.01
+            )
+            features["price_concentration"] = near_count / len(prices_1h)
+        else:
+            features["price_concentration"] = 0.0
 
         return features
 
@@ -690,4 +884,22 @@ class FeatureEngine:
             "avg_flip_duration",
             "avg_profit_per_flip",
             "consistency_score",
+            # Microstructure features
+            "ofi_5m",
+            "ofi_15m",
+            "spread_volatility",
+            "spread_mean",
+            "efficiency_ratio",
+            "momentum_acceleration",
+            "volume_weighted_momentum",
+            "relative_spread_pos",
+            # Regime features
+            "vol_regime_ratio",
+            "realized_vol_1h",
+            "realized_vol_4h",
+            "support_resistance_pos",
+            "dist_to_resistance_pct",
+            "dist_to_support_pct",
+            "return_autocorr",
+            "price_concentration",
         ]

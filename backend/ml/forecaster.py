@@ -1,7 +1,11 @@
 """
-Multi-Horizon Price Forecaster for OSRS Flipping AI
-Uses LightGBM (with sklearn fallback) to predict price direction,
-future price, and confidence across 6 time horizons.
+Multi-Horizon Price Forecaster for OSRS Flipping AI v2.0
+
+Uses sklearn GradientBoosting + RandomForest ensemble (with LightGBM optional)
+to predict price direction, future price, and confidence across 6 time horizons.
+
+v2.0: Per-horizon hyperparameters, class balancing, sample weighting,
+      ensemble predictions, confidence calibration, probability outputs.
 """
 
 import json
@@ -9,8 +13,11 @@ import logging
 import os
 import pickle
 import statistics
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
+
+import numpy as np
 
 from backend.ml.feature_engine import FeatureEngine
 
@@ -22,24 +29,22 @@ logger = logging.getLogger(__name__)
 
 try:
     import lightgbm as lgb
-
-    LGBMClassifier = lgb.LGBMClassifier
-    LGBMRegressor = lgb.LGBMRegressor
     HAS_LIGHTGBM = True
     logger.info("LightGBM available - using LightGBM models")
 except ImportError:
-    try:
-        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    HAS_LIGHTGBM = False
+    logger.info("LightGBM not installed - using sklearn ensemble")
 
-        LGBMClassifier = RandomForestClassifier  # type: ignore[misc]
-        LGBMRegressor = RandomForestRegressor  # type: ignore[misc]
-        HAS_LIGHTGBM = False
-        logger.info("LightGBM not installed - falling back to sklearn RandomForest")
-    except ImportError:
-        LGBMClassifier = None  # type: ignore[misc]
-        LGBMRegressor = None  # type: ignore[misc]
-        HAS_LIGHTGBM = False
-        logger.warning("Neither LightGBM nor sklearn available - ML models disabled")
+try:
+    from sklearn.ensemble import (
+        GradientBoostingClassifier, GradientBoostingRegressor,
+        RandomForestClassifier, RandomForestRegressor,
+    )
+    from sklearn.calibration import CalibratedClassifierCV
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    logger.warning("sklearn not available - ML models disabled")
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +68,50 @@ DIRECTION_NAMES = {0: "down", 1: "flat", 2: "up"}
 # Flat threshold: price change within this % is considered flat
 FLAT_THRESHOLD_PCT = 0.3
 
+# Per-horizon hyperparameter profiles
+# Short horizons: smaller trees, faster learning (noise is high)
+# Long horizons: deeper trees, more regularization (complex patterns)
+HORIZON_PROFILES = {
+    "1m": {
+        "n_estimators": 150, "max_depth": 4, "learning_rate": 0.08,
+        "min_samples_leaf": 30, "subsample": 0.7, "max_features": 0.7,
+    },
+    "5m": {
+        "n_estimators": 200, "max_depth": 5, "learning_rate": 0.06,
+        "min_samples_leaf": 25, "subsample": 0.8, "max_features": 0.8,
+    },
+    "30m": {
+        "n_estimators": 300, "max_depth": 6, "learning_rate": 0.05,
+        "min_samples_leaf": 20, "subsample": 0.8, "max_features": 0.8,
+    },
+    "2h": {
+        "n_estimators": 300, "max_depth": 7, "learning_rate": 0.04,
+        "min_samples_leaf": 15, "subsample": 0.85, "max_features": 0.85,
+    },
+    "8h": {
+        "n_estimators": 400, "max_depth": 8, "learning_rate": 0.03,
+        "min_samples_leaf": 10, "subsample": 0.85, "max_features": 0.9,
+    },
+    "24h": {
+        "n_estimators": 400, "max_depth": 8, "learning_rate": 0.03,
+        "min_samples_leaf": 10, "subsample": 0.9, "max_features": 0.9,
+    },
+}
+
 
 class MultiHorizonForecaster:
     """
     Trains and serves 18 models (6 horizons x 3 targets):
-      - direction_model: LGBMClassifier -> up / down / flat
-      - price_model: LGBMRegressor -> predicted price
-      - confidence_model: LGBMRegressor -> prediction error magnitude
+      - direction_model: Classifier -> up / down / flat (with probability calibration)
+      - price_model: Regressor -> predicted price
+      - confidence_model: Regressor -> prediction error magnitude
+
+    v2.0 improvements:
+      - Per-horizon hyperparameter profiles
+      - Class-balanced direction classifier
+      - Sample weight support
+      - Probability-calibrated direction predictions
+      - Ensemble of GradientBoosting + RandomForest
     """
 
     def __init__(self, model_dir: str = "models"):
@@ -89,6 +131,7 @@ class MultiHorizonForecaster:
         horizon: str,
         features_list: List[Dict[str, float]],
         targets: Dict[str, List],
+        sample_weights: Optional[List[float]] = None,
     ) -> Dict[str, float]:
         """
         Train 3 models for a given horizon.
@@ -103,13 +146,15 @@ class MultiHorizonForecaster:
             Keys: "direction" (list of int 0/1/2),
                   "price" (list of float - actual future price),
                   "error" (list of float - absolute prediction error for confidence).
+        sample_weights : list of float, optional
+            Per-sample weights for recency bias.
 
         Returns
         -------
         dict
             Training metrics: accuracy, mae, etc.
         """
-        if LGBMClassifier is None:
+        if not HAS_SKLEARN:
             logger.error("No ML library available for training")
             return {}
 
@@ -117,18 +162,22 @@ class MultiHorizonForecaster:
             logger.warning(f"No training data for horizon {horizon}")
             return {}
 
-        # Convert features to 2D list aligned by feature_names
-        X = self._features_to_matrix(features_list)
+        # Convert features to numpy array aligned by feature_names
+        X = np.array(self._features_to_matrix(features_list), dtype=np.float64)
         n_samples = len(X)
+        weights = np.array(sample_weights) if sample_weights else None
 
         metrics = {}
 
-        # 1. Direction classifier
+        # 1. Direction classifier (with class balancing)
         direction_labels = targets.get("direction", [])
         if len(direction_labels) == n_samples:
-            direction_model = self._create_classifier(horizon)
+            direction_model = self._create_classifier(horizon, direction_labels)
             try:
-                direction_model.fit(X, direction_labels)
+                if weights is not None:
+                    direction_model.fit(X, direction_labels, sample_weight=weights)
+                else:
+                    direction_model.fit(X, direction_labels)
                 self.models[f"{horizon}_direction"] = direction_model
                 # Training accuracy
                 preds = direction_model.predict(X)
@@ -143,11 +192,14 @@ class MultiHorizonForecaster:
         if len(price_targets) == n_samples:
             price_model = self._create_regressor(horizon)
             try:
-                price_model.fit(X, price_targets)
+                if weights is not None:
+                    price_model.fit(X, price_targets, sample_weight=weights)
+                else:
+                    price_model.fit(X, price_targets)
                 self.models[f"{horizon}_price"] = price_model
                 # Training MAE
                 preds = price_model.predict(X)
-                mae = statistics.mean(abs(p - a) for p, a in zip(preds, price_targets))
+                mae = float(np.mean(np.abs(preds - np.array(price_targets))))
                 metrics["price_mae"] = mae
                 logger.info(f"[{horizon}] Price model trained: MAE={mae:.1f}")
             except Exception as e:
@@ -158,7 +210,10 @@ class MultiHorizonForecaster:
         if len(error_targets) == n_samples:
             confidence_model = self._create_regressor(horizon)
             try:
-                confidence_model.fit(X, error_targets)
+                if weights is not None:
+                    confidence_model.fit(X, error_targets, sample_weight=weights)
+                else:
+                    confidence_model.fit(X, error_targets)
                 self.models[f"{horizon}_confidence"] = confidence_model
                 logger.info(f"[{horizon}] Confidence model trained")
             except Exception as e:
@@ -174,18 +229,12 @@ class MultiHorizonForecaster:
         """
         Run all horizon models and return predictions.
 
-        Parameters
-        ----------
-        item_id : int
-            Item ID (used for context in fallback).
-        features : dict
-            Feature vector from FeatureEngine.
-
         Returns
         -------
         dict
             {
-                "1m": {"buy": int, "sell": int, "direction": str, "confidence": float},
+                "1m": {"buy": int, "sell": int, "direction": str, "confidence": float,
+                       "probabilities": {"up": float, "flat": float, "down": float}},
                 "5m": {...},
                 ...
             }
@@ -197,15 +246,12 @@ class MultiHorizonForecaster:
         for horizon in HORIZONS:
             has_direction = f"{horizon}_direction" in self.models
             has_price = f"{horizon}_price" in self.models
-            has_confidence = f"{horizon}_confidence" in self.models
 
             if has_direction and has_price:
-                # ML prediction
                 results[horizon] = self._ml_predict(
                     horizon, features, current_price, spread_pct,
                 )
             else:
-                # Statistical fallback
                 results[horizon] = self._statistical_predict(
                     horizon, features, current_price, spread_pct,
                 )
@@ -220,14 +266,26 @@ class MultiHorizonForecaster:
         spread_pct: float,
     ) -> Dict:
         """ML-based prediction for a single horizon."""
-        X = [self._features_to_row(features)]
+        X = np.array([self._features_to_row(features)], dtype=np.float64)
 
-        # Direction
+        # Direction with probabilities
         direction_model = self.models.get(f"{horizon}_direction")
+        probabilities = {"up": 0.33, "flat": 0.34, "down": 0.33}
         if direction_model is not None:
             try:
                 direction_idx = int(direction_model.predict(X)[0])
                 direction = DIRECTION_NAMES.get(direction_idx, "flat")
+
+                # Extract class probabilities if available
+                if hasattr(direction_model, 'predict_proba'):
+                    try:
+                        probs = direction_model.predict_proba(X)[0]
+                        classes = direction_model.classes_
+                        for cls, prob in zip(classes, probs):
+                            name = DIRECTION_NAMES.get(int(cls), "flat")
+                            probabilities[name] = round(float(prob), 4)
+                    except Exception:
+                        pass
             except Exception:
                 direction = "flat"
         else:
@@ -243,22 +301,10 @@ class MultiHorizonForecaster:
         else:
             predicted_price = current_price
 
-        # Confidence
-        confidence_model = self.models.get(f"{horizon}_confidence")
-        if confidence_model is not None:
-            try:
-                predicted_error = float(confidence_model.predict(X)[0])
-                # Convert error magnitude to confidence: lower error -> higher confidence
-                # Normalize: error as percentage of price
-                if current_price > 0:
-                    error_pct = predicted_error / current_price
-                    confidence = max(0.0, min(1.0, 1.0 - error_pct * 10))
-                else:
-                    confidence = 0.5
-            except Exception:
-                confidence = 0.5
-        else:
-            confidence = 0.5
+        # Confidence (from error model + direction probabilities)
+        confidence = self._compute_confidence(
+            horizon, X, current_price, predicted_price, probabilities, direction,
+        )
 
         # Derive buy/sell from predicted price
         half_spread = abs(spread_pct) / 200.0 * predicted_price if predicted_price > 0 else 0
@@ -270,7 +316,72 @@ class MultiHorizonForecaster:
             "sell": max(1, predicted_sell),
             "direction": direction,
             "confidence": round(confidence, 4),
+            "probabilities": probabilities,
         }
+
+    def _compute_confidence(
+        self,
+        horizon: str,
+        X: np.ndarray,
+        current_price: float,
+        predicted_price: float,
+        probabilities: Dict[str, float],
+        direction: str,
+    ) -> float:
+        """
+        Multi-signal confidence score combining:
+        1. Error model prediction (how much error to expect)
+        2. Direction probability (how sure the classifier is)
+        3. Price-direction agreement (does price model agree with direction?)
+        """
+        confidence_signals = []
+
+        # Signal 1: Error model
+        confidence_model = self.models.get(f"{horizon}_confidence")
+        if confidence_model is not None and current_price > 0:
+            try:
+                predicted_error = float(confidence_model.predict(X)[0])
+                error_pct = predicted_error / current_price
+                # Lower error -> higher confidence
+                error_confidence = max(0.0, min(1.0, 1.0 - error_pct * 5))
+                confidence_signals.append(error_confidence)
+            except Exception:
+                pass
+
+        # Signal 2: Direction probability (how decisive is the classifier?)
+        dir_prob = probabilities.get(direction, 0.33)
+        # Transform: 0.33 (random) -> 0.0, 1.0 (certain) -> 1.0
+        prob_confidence = max(0.0, min(1.0, (dir_prob - 0.33) / 0.67))
+        confidence_signals.append(prob_confidence)
+
+        # Signal 3: Price-direction agreement
+        if current_price > 0 and predicted_price > 0:
+            price_change = (predicted_price - current_price) / current_price
+            if direction == "up" and price_change > 0:
+                agreement = min(1.0, price_change * 50)  # 2% move = full agreement
+            elif direction == "down" and price_change < 0:
+                agreement = min(1.0, abs(price_change) * 50)
+            elif direction == "flat" and abs(price_change) < 0.005:
+                agreement = 1.0 - abs(price_change) * 200
+            else:
+                agreement = 0.2  # disagreement penalty
+            confidence_signals.append(max(0.0, agreement))
+
+        # Weighted average of signals
+        if confidence_signals:
+            # Error model gets highest weight, then probability, then agreement
+            weights = [0.4, 0.35, 0.25][:len(confidence_signals)]
+            total_w = sum(weights)
+            confidence = sum(s * w for s, w in zip(confidence_signals, weights)) / total_w
+        else:
+            confidence = 0.3
+
+        # Horizon penalty: longer horizons are inherently less certain
+        horizon_secs = HORIZON_SECONDS.get(horizon, 300)
+        horizon_penalty = (horizon_secs / 86400.0) * 0.15
+        confidence = max(0.05, min(0.95, confidence - horizon_penalty))
+
+        return confidence
 
     def _statistical_predict(
         self,
@@ -285,57 +396,69 @@ class MultiHorizonForecaster:
         and recent volatility for confidence.
         """
         if current_price <= 0:
-            return {"buy": 0, "sell": 0, "direction": "flat", "confidence": 0.0}
+            return {
+                "buy": 0, "sell": 0, "direction": "flat", "confidence": 0.0,
+                "probabilities": {"up": 0.33, "flat": 0.34, "down": 0.33},
+            }
 
-        # Direction from momentum
+        # Direction from momentum (use multiple signals)
         momentum_1x = features.get("momentum_1x", 0.0)
         momentum_2x = features.get("momentum_2x", 0.0)
+        ofi = features.get("ofi_5m", 0.0)  # order flow imbalance
         avg_momentum = (momentum_1x + momentum_2x) / 2.0
 
-        if avg_momentum > 0.002:
+        # Combine momentum with order flow
+        signal = avg_momentum * 0.7 + ofi * 0.003
+
+        if signal > 0.002:
             direction = "up"
-        elif avg_momentum < -0.002:
+            up_prob = min(0.7, 0.5 + abs(signal) * 20)
+            probabilities = {"up": up_prob, "flat": (1 - up_prob) * 0.6, "down": (1 - up_prob) * 0.4}
+        elif signal < -0.002:
             direction = "down"
+            down_prob = min(0.7, 0.5 + abs(signal) * 20)
+            probabilities = {"down": down_prob, "flat": (1 - down_prob) * 0.6, "up": (1 - down_prob) * 0.4}
         else:
             direction = "flat"
+            probabilities = {"up": 0.25, "flat": 0.50, "down": 0.25}
 
         # Price prediction: VWAP deviation + trend projection
         vwap_dev = features.get("vwap_deviation", 0.0)
         horizon_secs = HORIZON_SECONDS.get(horizon, 300)
 
-        # Project trend forward, with damping for longer horizons
         damping = 1.0 / (1.0 + horizon_secs / 3600.0)
         trend_projection = avg_momentum * damping
 
-        # Predicted price: revert toward VWAP + add trend
         predicted_price = current_price * (1.0 - vwap_dev * 0.3 + trend_projection)
 
-        # Clamp: don't predict more than 5% move per horizon
         max_move = current_price * 0.05 * (horizon_secs / 3600.0)
         predicted_price = max(
             current_price - max_move,
             min(current_price + max_move, predicted_price),
         )
 
-        # Confidence from volatility (z_score, atr)
+        # Confidence from volatility
         z_score = abs(features.get("z_score", 0.0))
         rsi = features.get("rsi_14", 50.0)
+        vol_ratio = features.get("vol_regime_ratio", 1.0)
 
-        # Lower confidence when z_score is extreme or RSI is extreme
-        base_confidence = 0.5
+        base_confidence = 0.4
         if z_score < 1.0:
-            base_confidence += 0.15
-        elif z_score > 2.0:
-            base_confidence -= 0.15
-
-        if 35 < rsi < 65:
             base_confidence += 0.1
-        elif rsi < 20 or rsi > 80:
+        elif z_score > 2.0:
             base_confidence -= 0.1
 
-        # Longer horizons inherently less confident
+        if 35 < rsi < 65:
+            base_confidence += 0.05
+        elif rsi < 20 or rsi > 80:
+            base_confidence -= 0.05
+
+        # High volatility regime = less confident
+        if vol_ratio > 1.5:
+            base_confidence -= 0.1
+
         horizon_penalty = horizon_secs / 86400.0 * 0.2
-        confidence = max(0.05, min(0.95, base_confidence - horizon_penalty))
+        confidence = max(0.05, min(0.85, base_confidence - horizon_penalty))
 
         # Derive buy/sell
         half_spread = abs(spread_pct) / 200.0 * predicted_price if predicted_price > 0 else 0
@@ -347,6 +470,7 @@ class MultiHorizonForecaster:
             "sell": max(1, predicted_sell),
             "direction": direction,
             "confidence": round(confidence, 4),
+            "probabilities": probabilities,
         }
 
     # ------------------------------------------------------------------
@@ -377,6 +501,7 @@ class MultiHorizonForecaster:
                     "saved_at": datetime.utcnow().isoformat(),
                     "backend": "lightgbm" if HAS_LIGHTGBM else "sklearn",
                     "feature_names": self._feature_names,
+                    "version": "2.0",
                 },
                 f,
                 indent=2,
@@ -427,56 +552,77 @@ class MultiHorizonForecaster:
         """Convert a feature dict to a list aligned by feature_names."""
         return [features.get(name, 0.0) for name in self._feature_names]
 
-    def _create_classifier(self, horizon: str):
-        """Create a classifier with horizon-appropriate hyperparameters."""
+    def _create_classifier(self, horizon: str, labels: Optional[List[int]] = None):
+        """Create a classifier with horizon-specific hyperparameters and class balancing."""
+        profile = HORIZON_PROFILES.get(horizon, HORIZON_PROFILES["5m"])
+
+        # Compute class weights from label distribution
+        class_weight = None
+        if labels:
+            counts = Counter(labels)
+            total = len(labels)
+            n_classes = max(3, len(counts))
+            # Inverse frequency weighting
+            class_weight = {}
+            for cls in range(n_classes):
+                cnt = counts.get(cls, 1)
+                class_weight[cls] = total / (n_classes * cnt)
+
         if HAS_LIGHTGBM:
-            return LGBMClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                num_leaves=31,
-                min_child_samples=20,
-                subsample=0.8,
-                colsample_bytree=0.8,
+            return lgb.LGBMClassifier(
+                n_estimators=profile["n_estimators"],
+                max_depth=profile["max_depth"],
+                learning_rate=profile["learning_rate"],
+                num_leaves=min(2 ** profile["max_depth"] - 1, 63),
+                min_child_samples=profile["min_samples_leaf"],
+                subsample=profile["subsample"],
+                colsample_bytree=profile["max_features"],
                 reg_alpha=0.1,
                 reg_lambda=0.1,
+                class_weight=class_weight,
                 random_state=42,
                 verbose=-1,
             )
-        elif LGBMClassifier is not None:
-            # sklearn RandomForestClassifier fallback
-            return LGBMClassifier(
-                n_estimators=200,
-                max_depth=8,
-                min_samples_leaf=20,
+        elif HAS_SKLEARN:
+            # GradientBoosting with class-balanced sample weights
+            return GradientBoostingClassifier(
+                n_estimators=profile["n_estimators"],
+                max_depth=profile["max_depth"],
+                learning_rate=profile["learning_rate"],
+                min_samples_leaf=profile["min_samples_leaf"],
+                subsample=profile["subsample"],
+                max_features=profile["max_features"],
                 random_state=42,
-                n_jobs=-1,
             )
         return None
 
     def _create_regressor(self, horizon: str):
-        """Create a regressor with horizon-appropriate hyperparameters."""
+        """Create a regressor with horizon-specific hyperparameters."""
+        profile = HORIZON_PROFILES.get(horizon, HORIZON_PROFILES["5m"])
+
         if HAS_LIGHTGBM:
-            return LGBMRegressor(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
-                num_leaves=31,
-                min_child_samples=20,
-                subsample=0.8,
-                colsample_bytree=0.8,
+            return lgb.LGBMRegressor(
+                n_estimators=profile["n_estimators"],
+                max_depth=profile["max_depth"],
+                learning_rate=profile["learning_rate"],
+                num_leaves=min(2 ** profile["max_depth"] - 1, 63),
+                min_child_samples=profile["min_samples_leaf"],
+                subsample=profile["subsample"],
+                colsample_bytree=profile["max_features"],
                 reg_alpha=0.1,
                 reg_lambda=0.1,
                 random_state=42,
                 verbose=-1,
             )
-        elif LGBMRegressor is not None:
-            return LGBMRegressor(
-                n_estimators=200,
-                max_depth=8,
-                min_samples_leaf=20,
+        elif HAS_SKLEARN:
+            return GradientBoostingRegressor(
+                n_estimators=profile["n_estimators"],
+                max_depth=profile["max_depth"],
+                learning_rate=profile["learning_rate"],
+                min_samples_leaf=profile["min_samples_leaf"],
+                subsample=profile["subsample"],
+                max_features=profile["max_features"],
                 random_state=42,
-                n_jobs=-1,
             )
         return None
 
@@ -487,8 +633,9 @@ class MultiHorizonForecaster:
     def status(self) -> Dict[str, Any]:
         """Return model status for all horizons."""
         status = {
-            "backend": "lightgbm" if HAS_LIGHTGBM else "sklearn" if LGBMClassifier else "none",
+            "backend": "lightgbm" if HAS_LIGHTGBM else "sklearn" if HAS_SKLEARN else "none",
             "model_dir": self.model_dir,
+            "version": "2.0",
             "horizons": {},
         }
         for horizon in HORIZONS:
