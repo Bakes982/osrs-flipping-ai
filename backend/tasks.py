@@ -333,7 +333,7 @@ class MLScorer:
                 await self.score_items()
             except Exception as e:
                 logger.error("MLScorer tick error: %s", e)
-            await asyncio.sleep(60)
+            await asyncio.sleep(600)  # Every 10 min: 100 items x 6 horizons = 600 inserts/run; was 60s (8,640/day) -> now 144/day predictions
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +350,13 @@ class DataPruner:
     """
 
     def _aggregate_snapshots_to_5m(self, db):
-        """Aggregate raw snapshots older than 3 days into 5-minute candles."""
-        cutoff = datetime.utcnow() - timedelta(days=3)
+        """Aggregate raw snapshots older than 6 hours into 5-minute candles.
+
+        Cutoff is 6h (not 3 days) so snapshots are aggregated before the
+        24h deletion window in _delete_old_snapshots. Previously the 3-day
+        cutoff meant snapshots were deleted at 24h with no candles ever created.
+        """
+        cutoff = datetime.utcnow() - timedelta(hours=6)
 
         # Get distinct item_ids with old data
         item_ids = db.price_snapshots.distinct("item_id", {"timestamp": {"$lt": cutoff}})
@@ -465,7 +470,7 @@ class DataPruner:
         logger.info("Deleted %d old raw snapshots", result.deleted_count)
 
         # Also prune predictions and model metrics to stay under storage quota
-        cutoff_pred = datetime.utcnow() - timedelta(days=3)
+        cutoff_pred = datetime.utcnow() - timedelta(days=1)  # was 3 days; 1 day is enough for outcome recording
         try:
             r2 = db.predictions.delete_many({"timestamp": {"$lt": cutoff_pred}})
             logger.info("Deleted %d old predictions", r2.deleted_count)
@@ -502,13 +507,13 @@ class DataPruner:
         await asyncio.to_thread(_sync_prune)
 
     async def run_forever(self):
-        logger.info("DataPruner started (runs every 6 hours)")
+        logger.info("DataPruner started (runs every 2 hours)")
         while True:
             try:
                 await self.prune()
             except Exception as e:
                 logger.error("DataPruner tick error: %s", e)
-            await asyncio.sleep(6 * 3600)  # every 6 hours
+            await asyncio.sleep(2 * 3600)  # every 2 hours (was 6h; shorter window limits peak accumulation)
 
 
 # ---------------------------------------------------------------------------
@@ -1464,7 +1469,7 @@ async def _emergency_compact_db():
             if result.deleted_count:
                 logger.info("Startup compact: deleted %d stale price_snapshots", result.deleted_count)
             # Also prune old predictions and metrics that accumulate silently
-            cutoff3 = datetime.utcnow() - timedelta(days=3)
+            cutoff3 = datetime.utcnow() - timedelta(days=1)  # match 1-day TTL in DataPruner
             db.predictions.delete_many({"timestamp": {"$lt": cutoff3}})
             db.model_metrics.delete_many({"timestamp": {"$lt": cutoff3}})
         except Exception as e:

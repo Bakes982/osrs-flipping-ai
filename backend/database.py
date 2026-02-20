@@ -473,7 +473,7 @@ def _emergency_prune(db_wrapper):
     """
     from datetime import timedelta
     cutoff_snap   = datetime.utcnow() - timedelta(days=2)
-    cutoff_pred   = datetime.utcnow() - timedelta(days=3)
+    cutoff_pred   = datetime.utcnow() - timedelta(days=1)   # match 1-day TTL in DataPruner
     cutoff_alerts = datetime.utcnow() - timedelta(days=7)
     cutoff_agg    = datetime.utcnow() - timedelta(days=14)
 
