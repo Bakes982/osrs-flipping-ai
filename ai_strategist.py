@@ -189,7 +189,7 @@ def get_flip_recommendations(max_risk: int = 8, min_margin_pct: float = 0.5) -> 
 
 def scan_all_items_for_flips(
     min_price: int = 100_000,
-    max_price: int = 500_000_000,
+    max_price: int = 2_000_000_000,  # was 500M — raised to cover Twisted Bow, Scythe, Elysian etc.
     min_margin_pct: float = 1.0,
     max_risk: int = 7,
     limit: int = 50

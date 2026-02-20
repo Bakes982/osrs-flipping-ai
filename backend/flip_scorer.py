@@ -257,17 +257,22 @@ class FlipScorer:
             fs.vetoed = True
             fs.veto_reasons.append(f"Unprofitable after tax ({rec.expected_profit} GP)")
 
-        # Veto 2: Extremely stale data (>45 min old with low volume)
+        # Veto 2: Extremely stale data
+        # High-value items (>10M) trade infrequently — allow up to 2h stale.
+        # Lower-value items must have fresh data (45 min limit).
         latest = snapshots[-1]
         now = int(time.time())
+        price = rec.instant_buy or 0
+        stale_limit_mins = 120 if price >= 10_000_000 else 45
+        stale_vol_threshold = 2 if price >= 10_000_000 else 5
         if latest.buy_time:
             buy_age = (now - latest.buy_time) / 60
-            if buy_age > 45 and rec.volume_5m < 5:
+            if buy_age > stale_limit_mins and rec.volume_5m < stale_vol_threshold:
                 fs.vetoed = True
                 fs.veto_reasons.append(f"Stale buy price ({buy_age:.0f}m old, vol={rec.volume_5m})")
         if latest.sell_time:
             sell_age = (now - latest.sell_time) / 60
-            if sell_age > 45 and rec.volume_5m < 5:
+            if sell_age > stale_limit_mins and rec.volume_5m < stale_vol_threshold:
                 fs.vetoed = True
                 fs.veto_reasons.append(f"Stale sell price ({sell_age:.0f}m old)")
 
@@ -378,25 +383,44 @@ class FlipScorer:
     def _score_volume(
         self, fs: FlipScore, rec: PriceRecommendation, snapshots: List[PriceSnapshot]
     ) -> float:
-        """Score volume/liquidity. Higher = easier to fill orders."""
-        vol = rec.volume_5m
+        """Score volume/liquidity. Higher = easier to fill orders.
 
-        if vol >= 100:
-            return 100
-        elif vol >= 50:
-            return 90
-        elif vol >= 20:
-            return 75
-        elif vol >= 10:
-            return 60
-        elif vol >= 5:
-            return 40
-        elif vol >= 2:
-            return 20
-        elif vol >= 1:
-            return 10
+        High-value items naturally trade less frequently per 5m window —
+        a 200M item trading once every 5m still represents 200M GP of
+        throughput, equivalent to 20,000 trades of a 10K item.
+        Volume thresholds scale down with price so they aren't unfairly
+        penalised vs cheap high-volume items.
+        """
+        vol = rec.volume_5m
+        price = fs.instant_buy or 1
+
+        # For items >= 50M, even 1-2 trades/5m = very healthy liquidity
+        if price >= 50_000_000:
+            if vol >= 10: return 100
+            elif vol >= 5: return 90
+            elif vol >= 3: return 80
+            elif vol >= 2: return 70
+            elif vol >= 1: return 55
+            else: return 0
+        # 10M-50M: moderate adjustment
+        elif price >= 10_000_000:
+            if vol >= 30: return 100
+            elif vol >= 15: return 90
+            elif vol >= 8:  return 75
+            elif vol >= 4:  return 60
+            elif vol >= 2:  return 40
+            elif vol >= 1:  return 25
+            else: return 0
+        # <10M: original thresholds (high-frequency items need real volume)
         else:
-            return 0
+            if vol >= 100: return 100
+            elif vol >= 50: return 90
+            elif vol >= 20: return 75
+            elif vol >= 10: return 60
+            elif vol >= 5:  return 40
+            elif vol >= 2:  return 20
+            elif vol >= 1:  return 10
+            else: return 0
 
     def _score_freshness(
         self, rec: PriceRecommendation, snapshots: List[PriceSnapshot]

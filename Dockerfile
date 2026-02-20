@@ -21,6 +21,9 @@ COPY quant_analyzer.py .
 COPY user_config.py .
 COPY start_server.py .
 
+# Ensure models directory exists for ML persistence
+RUN mkdir -p /app/models
+
 EXPOSE 8001
 
 CMD ["sh", "-c", "uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8001}"]

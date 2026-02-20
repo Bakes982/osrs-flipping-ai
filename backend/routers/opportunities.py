@@ -100,7 +100,7 @@ async def list_opportunities(
         raw = await asyncio.to_thread(
             scan_all_items_for_flips,
             min_price=max(10_000, min_price),
-            max_price=500_000_000,
+            max_price=2_000_000_000,  # was 500M — raised to 2B to include Twisted Bow, Scythe, Elysian etc.
             min_margin_pct=0.2,
             max_risk=max_risk,
             limit=limit * 4,  # over-fetch for scoring
