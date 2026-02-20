@@ -57,10 +57,15 @@ class PriceCollector:
     Stores PriceSnapshot rows and broadcasts new data to WebSocket clients.
     """
 
+    # Write to MongoDB every 5 minutes (not every 10 seconds).
+    # Broadcast + _price_cache still refresh every 10s.
+    STORE_INTERVAL = 300  # seconds
+
     def __init__(self):
         self._latest_data: Dict = {}
         self._5m_data: Dict = {}
         self._last_5m_fetch: float = 0.0
+        self._last_store: float = 0.0
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -98,10 +103,16 @@ class PriceCollector:
     async def store_snapshots(self) -> int:
         """Store current price data as PriceSnapshot rows.
 
-        Only stores the top ~200 items by volume to avoid filling MongoDB.
-        Returns the number of rows inserted.
+        Stores top 50 items by volume, every 5 minutes (not every 10 seconds).
+        Broadcast + in-memory cache still update every 10s — this only controls
+        MongoDB writes to stay well under the 512 MB Atlas quota.
+        Returns the number of rows inserted (0 if skipped due to throttle).
         """
         if not self._latest_data:
+            return 0
+
+        # Throttle: only write to MongoDB every STORE_INTERVAL seconds
+        if time.time() - self._last_store < self.STORE_INTERVAL:
             return 0
 
         def _sync_store():
@@ -109,7 +120,7 @@ class PriceCollector:
             db = get_db()
             count = 0
             try:
-                # Filter to items with meaningful volume (top ~200)
+                # Filter to items with meaningful volume, keep top 50
                 items_with_volume = []
                 for item_id_str, instant in self._latest_data.items():
                     avg = self._5m_data.get(item_id_str, {})
@@ -117,9 +128,8 @@ class PriceCollector:
                     if vol > 0 and instant.get("high") and instant.get("low"):
                         items_with_volume.append((item_id_str, instant, avg, vol))
 
-                # Sort by volume descending, keep top 200
                 items_with_volume.sort(key=lambda x: x[3], reverse=True)
-                items_with_volume = items_with_volume[:200]
+                items_with_volume = items_with_volume[:100]  # was 200; top-100 covers all meaningful flip targets
 
                 snapshots_list = []
                 for item_id_str, instant, avg, vol in items_with_volume:
@@ -145,7 +155,9 @@ class PriceCollector:
                 db.close()
             return count
 
-        return await asyncio.to_thread(_sync_store)
+        count = await asyncio.to_thread(_sync_store)
+        self._last_store = time.time()
+        return count
 
     async def broadcast(self):
         """Push latest prices to all connected WebSocket clients."""
@@ -447,8 +459,8 @@ class DataPruner:
         logger.info("Created %d 1h aggregate candles, deleted %d old 5m candles", total_created, total_deleted)
 
     def _delete_old_snapshots(self, db):
-        """Delete raw snapshots older than 3 days (already aggregated)."""
-        cutoff = datetime.utcnow() - timedelta(days=3)
+        """Delete raw snapshots older than 24 hours (already aggregated)."""
+        cutoff = datetime.utcnow() - timedelta(hours=24)
         result = db.price_snapshots.delete_many({"timestamp": {"$lt": cutoff}})
         logger.info("Deleted %d old raw snapshots", result.deleted_count)
 
@@ -490,14 +502,13 @@ class DataPruner:
         await asyncio.to_thread(_sync_prune)
 
     async def run_forever(self):
-        logger.info("DataPruner started (runs once per day)")
+        logger.info("DataPruner started (runs every 6 hours)")
         while True:
             try:
                 await self.prune()
             except Exception as e:
                 logger.error("DataPruner tick error: %s", e)
-            # Sleep 24 hours
-            await asyncio.sleep(86400)
+            await asyncio.sleep(6 * 3600)  # every 6 hours
 
 
 # ---------------------------------------------------------------------------
@@ -1438,6 +1449,32 @@ def get_opportunity_notifier() -> OpportunityNotifier:
 _tasks = []
 
 
+async def _emergency_compact_db():
+    """One-time startup cleanup: nuke the accumulated price_snapshots bloat.
+
+    Keeps only the last 24 hours of snapshots. With the new 5-minute write
+    interval that's at most 50 items × 288 writes = 14,400 docs, vs the
+    millions that may be sitting in Atlas right now.
+    """
+    def _sync():
+        db = get_db()
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            result = db.price_snapshots.delete_many({"timestamp": {"$lt": cutoff}})
+            if result.deleted_count:
+                logger.info("Startup compact: deleted %d stale price_snapshots", result.deleted_count)
+            # Also prune old predictions and metrics that accumulate silently
+            cutoff3 = datetime.utcnow() - timedelta(days=3)
+            db.predictions.delete_many({"timestamp": {"$lt": cutoff3}})
+            db.model_metrics.delete_many({"timestamp": {"$lt": cutoff3}})
+        except Exception as e:
+            logger.warning("Startup compact failed (non-fatal): %s", e)
+        finally:
+            db.close()
+
+    await asyncio.to_thread(_sync)
+
+
 async def _seed_sell_alert_webhook():
     """One-time seed: if sell_alert_webhook_url is unset in DB, write the default."""
     _SELL_ALERT_DEFAULT = "https://discord.com/api/webhooks/1474337747446796351/EjVW1qDmMl3th8gAQ-ra8idgw3qHVSlQbpt_GqPeZ3bG3-teskzT2NKICLJGdEKsgirJ"
@@ -1460,6 +1497,8 @@ async def start_background_tasks():
     overloading MongoDB with simultaneous queries."""
     global _tasks
 
+    # Immediately compact the DB to reclaim space before any new writes
+    await _emergency_compact_db()
     await _seed_sell_alert_webhook()
 
     collector = PriceCollector()
