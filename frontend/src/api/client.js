@@ -255,7 +255,7 @@ export const api = {
 // WebSocket with auth
 // ---------------------------------------------------------------------------
 
-export function createPriceSocket(onMessage) {
+export function createPriceSocket(onMessage, onStatusChange) {
   let ws = null;
   let reconnectTimer = null;
 
@@ -264,7 +264,10 @@ export function createPriceSocket(onMessage) {
     const token = getToken();
     const url = token ? `${WS_BASE}/prices?token=${token}` : `${WS_BASE}/prices`;
     ws = new WebSocket(url);
-    ws.onopen = () => console.log('WebSocket connected');
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+      if (onStatusChange) onStatusChange(true);
+    };
     ws.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -273,6 +276,7 @@ export function createPriceSocket(onMessage) {
     };
     ws.onclose = () => {
       console.log('WebSocket disconnected, reconnecting in 5s...');
+      if (onStatusChange) onStatusChange(false);
       reconnectTimer = setTimeout(connect, 5000);
     };
     ws.onerror = () => ws.close();

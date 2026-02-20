@@ -42,6 +42,10 @@ WIKI_BASE = "https://prices.runescape.wiki/api/v1/osrs"
 USER_AGENT = "OSRS-AI-Flipper v2.0 - Discord: bakes982"
 HEADERS = {"User-Agent": USER_AGENT}
 
+# In-memory price cache: item_id_str → {high, low, highTime, lowTime}
+# Populated by PriceCollector every 10s; used as fallback when DB has no snapshots.
+_price_cache: Dict = {}
+
 
 # ---------------------------------------------------------------------------
 # PriceCollector
@@ -71,6 +75,8 @@ class PriceCollector:
             resp = await client.get(f"{WIKI_BASE}/latest")
             resp.raise_for_status()
             self._latest_data = resp.json().get("data", {})
+            # Update global in-memory cache for all items (used by PositionMonitor)
+            _price_cache.update(self._latest_data)
             return self._latest_data
         except Exception as e:
             logger.error("Failed to fetch /latest: %s", e)
@@ -919,16 +925,24 @@ class PositionMonitor:
         db = get_db()
         try:
             snapshots = get_price_history(db, item_id, hours=4)
-            if not snapshots:
-                return None
 
-            latest = snapshots[-1]
-            current_price = latest.instant_buy or latest.instant_sell
-            if not current_price:
-                return None
-
-            rec = pricer.price_item(item_id, snapshots=snapshots)
-            rec_sell = rec.recommended_sell or current_price
+            if snapshots:
+                latest = snapshots[-1]
+                current_price = latest.instant_buy or latest.instant_sell
+                if not current_price:
+                    return None
+                rec = pricer.price_item(item_id, snapshots=snapshots)
+                rec_sell = rec.recommended_sell or current_price
+            else:
+                # No DB snapshots (item not in top-200 volume) — use in-memory cache
+                cached = _price_cache.get(str(item_id))
+                if not cached:
+                    return None
+                current_price = cached.get("high") or cached.get("low")
+                if not current_price:
+                    return None
+                # Without history, SmartPricer can't run — use current market price as target
+                rec_sell = current_price
 
             # P&L from current instant price vs buy price
             pnl_pct = (current_price - buy_price) / buy_price * 100 if buy_price else 0

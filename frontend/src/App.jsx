@@ -77,10 +77,10 @@ export default function App() {
   // Only connect WebSocket if authenticated (or auth not required)
   useEffect(() => {
     if (authRequired && !user) return;
-    const socket = createPriceSocket((data) => {
-      setLivePrices(data);
-      setWsConnected(true);
-    });
+    const socket = createPriceSocket(
+      (data) => setLivePrices(data),
+      (connected) => setWsConnected(connected),
+    );
     return () => socket.close();
   }, [authRequired, user]);
 
