@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import threading
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
@@ -39,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # Module-level start time for uptime reporting
 _START_TIME: float = time.time()
+_TOP_CACHE_TTL_SECONDS = 45
+_TOP_CACHE: Dict[Tuple[str, int, int, int], Tuple[float, List[dict]]] = {}
+_TOP_CACHE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -83,16 +87,34 @@ def _meets_filter(
 
 
 def _to_summary(m: dict) -> FlipSummary:
+    conf = m.get("confidence", 0.0) or 0.0
+    conf_pct = conf * 100.0 if conf <= 1.0 else conf
     return FlipSummary(
         item_id=m["item_id"],
         item_name=m.get("item_name", ""),
+        name=m.get("item_name", ""),
         buy=m.get("recommended_buy", 0),
         sell=m.get("recommended_sell", 0),
         margin=m.get("net_profit", 0),
+        margin_after_tax=m.get("margin_after_tax", m.get("net_profit", 0)),
         roi=m.get("roi_pct", 0),
+        roi_pct=m.get("roi_pct", 0),
+        volatility_1h=m.get("volatility_1h", 0.0),
+        volatility_24h=m.get("volatility_24h", 0.0),
+        liquidity_score=(m.get("liquidity_score", 0.0) or 0.0) * 100.0 if (m.get("liquidity_score", 0.0) or 0.0) <= 1.0 else (m.get("liquidity_score", 0.0) or 0.0),
+        fill_probability=m.get("fill_probability", 0.0),
+        est_fill_time_minutes=m.get("est_fill_time_minutes", m.get("estimated_hold_time", 0)),
+        trend_score=(m.get("trend_score", 0.0) or 0.0) * 100.0 if (m.get("trend_score", 0.0) or 0.0) <= 1.0 else (m.get("trend_score", 0.0) or 0.0),
+        decay_penalty=m.get("decay_penalty", m.get("spread_compression", 0.0)),
+        risk_level=m.get("risk_level", "MEDIUM"),
+        confidence_pct=conf_pct,
+        qty_suggested=m.get("qty_suggested", 0),
+        expected_profit_personal=m.get("expected_profit_personal", m.get("expected_profit", 0)),
+        risk_adjusted_gph_personal=m.get("risk_adjusted_gph_personal", m.get("risk_adjusted_gp_per_hour", 0.0)),
+        final_score=m.get("final_score", m.get("total_score", 0)),
         score=m.get("total_score", 0),
         risk=m.get("risk_score", 5),
-        confidence=m.get("confidence", 1),
+        confidence=conf_pct,
         volume_rating=_volume_rating(m.get("score_volume", 0)),
         estimated_hold_time=m.get("estimated_hold_time", 0),
         gp_per_hour=m.get("gp_per_hour", 0),
@@ -101,9 +123,32 @@ def _to_summary(m: dict) -> FlipSummary:
     )
 
 
+def _cache_get(profile: str, limit: int, min_score: int, min_confidence_pct: int) -> Optional[List[dict]]:
+    key = (profile, limit, min_score, min_confidence_pct)
+    now = time.time()
+    with _TOP_CACHE_LOCK:
+        hit = _TOP_CACHE.get(key)
+        if not hit:
+            return None
+        ts, payload = hit
+        if now - ts > _TOP_CACHE_TTL_SECONDS:
+            _TOP_CACHE.pop(key, None)
+            return None
+        return payload
+
+
+def _cache_set(profile: str, limit: int, min_score: int, min_confidence_pct: int, payload: List[dict]) -> None:
+    key = (profile, limit, min_score, min_confidence_pct)
+    with _TOP_CACHE_LOCK:
+        _TOP_CACHE[key] = (time.time(), payload)
+
+
 async def _fetch_scored_opportunities(
     limit: int = 50,
     min_score: float = 45.0,
+    profile: str = "balanced",
+    min_confidence_pct: float = 0.0,
+    user_capital: int = 10_000_000,
 ) -> List[dict]:
     """Pull currently-scored opportunities from the database."""
     from backend.database import get_db, get_tracked_item_ids, get_price_history, get_item_flips, get_item
@@ -132,8 +177,17 @@ async def _fetch_scored_opportunities(
                         "sell_time": latest.sell_time,
                         "snapshots": snaps,
                         "flip_history": flips,
+                        "risk_profile": profile,
+                        "item_limit": getattr(item, "buy_limit", None) if item else None,
+                        "user_capital": user_capital,
                     })
-                    if not metrics["vetoed"] and metrics["total_score"] >= min_score:
+                    confidence = metrics.get("confidence", 0.0) or 0.0
+                    conf_pct = confidence * 100.0 if confidence <= 1.0 else confidence
+                    if (
+                        not metrics["vetoed"]
+                        and metrics["total_score"] >= min_score
+                        and conf_pct >= min_confidence_pct
+                    ):
                         results.append(metrics)
                 except Exception:
                     continue
@@ -156,16 +210,29 @@ async def _fetch_scored_opportunities(
     ),
 )
 async def get_top_flips(
+    request: Request,
     limit: int = Query(20, ge=1, le=100),
+    profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
     min_score: float = Query(45.0, ge=0, le=100),
     min_roi: float = Query(0.0, ge=0),
+    min_confidence: float = Query(0.0, ge=0, le=100),
     max_risk: float = Query(10.0, ge=0, le=10),
     min_volume: str = Query("LOW", pattern="^(LOW|MEDIUM|HIGH)$"),
     min_price: int = Query(0, ge=0),
     max_price: int = Query(0, ge=0),
     sort_by: str = Query("score", pattern="^(score|roi|gp_per_hour)$"),
 ):
-    all_scored = await _fetch_scored_opportunities(limit=limit * 2, min_score=min_score)
+    ctx = getattr(request.state, "user_ctx", None)
+    active_profile = profile
+    if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
+        active_profile = ctx.risk_profile.value
+
+    all_scored = await _fetch_scored_opportunities(
+        limit=limit * 3,
+        min_score=min_score,
+        profile=active_profile,
+        min_confidence_pct=min_confidence,
+    )
 
     filtered = [
         m for m in all_scored
@@ -189,9 +256,27 @@ async def get_top_flips(
     ),
 )
 async def get_top5_runelite(
+    request: Request,
+    profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
     min_score: float = Query(45.0, ge=0, le=100),
+    min_confidence: float = Query(0.0, ge=0, le=100),
 ):
-    scored = await _fetch_scored_opportunities(limit=5, min_score=min_score)
+    ctx = getattr(request.state, "user_ctx", None)
+    active_profile = profile
+    if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
+        active_profile = ctx.risk_profile.value
+
+    cached = _cache_get(active_profile, 5, int(min_score), int(min_confidence))
+    if cached is not None:
+        scored = cached
+    else:
+        scored = await _fetch_scored_opportunities(
+            limit=5,
+            min_score=min_score,
+            profile=active_profile,
+            min_confidence_pct=min_confidence,
+        )
+        _cache_set(active_profile, 5, int(min_score), int(min_confidence), scored)
     flips = [
         RuneLiteFlip(
             item_id=m["item_id"],
@@ -201,6 +286,8 @@ async def get_top5_runelite(
             net_profit=m.get("net_profit", 0),
             roi_pct=m.get("roi_pct", 0),
             total_score=m.get("total_score", 0),
+            confidence_pct=((m.get("confidence", 0.0) or 0.0) * 100.0) if (m.get("confidence", 0.0) or 0.0) <= 1.0 else (m.get("confidence", 0.0) or 0.0),
+            risk_level=m.get("risk_level", "MEDIUM"),
         )
         for m in scored[:5]
     ]
@@ -214,8 +301,11 @@ async def get_top5_runelite(
     description="Same as /flips/top but with explicit query parameters for every filter.",
 )
 async def get_filtered_flips(
+    request: Request,
+    profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
     limit: int = Query(20, ge=1, le=100),
     min_roi: float = Query(0.0, ge=0),
+    min_confidence: float = Query(0.0, ge=0, le=100),
     max_risk: float = Query(10.0, ge=0, le=10),
     min_volume: str = Query("LOW", pattern="^(LOW|MEDIUM|HIGH)$"),
     min_price: int = Query(0, ge=0),
@@ -224,9 +314,12 @@ async def get_filtered_flips(
     min_score: float = Query(0.0, ge=0, le=100),
 ):
     return await get_top_flips(
+        request=request,
         limit=limit,
+        profile=profile,
         min_score=min_score,
         min_roi=min_roi,
+        min_confidence=min_confidence,
         max_risk=max_risk,
         min_volume=min_volume,
         min_price=min_price,

@@ -168,13 +168,23 @@ def classify_risk(
     score: float,
     volatility_1h: float,
     volume_5m: int,
-    win_rate: Optional[float],
+    win_rate: Optional[float] = None,
 ) -> str:
-    """Return a human-readable risk tier: LOW | MEDIUM | HIGH | VERY_HIGH."""
-    if score >= 65 and volatility_1h < 0.02 and volume_5m >= 10:
+    """Return a risk tier from combined score/volatility/liquidity signals."""
+    # Convert the existing "higher is better score" + market quality into
+    # a normalized risk index in [0, 1], then tier by fixed thresholds.
+    score_component = clamp(1.0 - (score / 100.0), 0.0, 1.0)
+    vol_component = clamp(volatility_1h / 0.03, 0.0, 1.0)
+    liq_component = clamp(1.0 - (volume_5m / 20.0), 0.0, 1.0)
+
+    idx = 0.45 * vol_component + 0.35 * score_component + 0.20 * liq_component
+    if win_rate is not None:
+        idx = clamp(idx + (0.55 - clamp(win_rate, 0.0, 1.0)) * 0.15, 0.0, 1.0)
+
+    if idx < 0.33:
         return "LOW"
-    if score >= 45 and volatility_1h < 0.05 and volume_5m >= 5:
+    if idx <= 0.66:
         return "MEDIUM"
-    if score >= 30:
+    if idx <= 0.85:
         return "HIGH"
     return "VERY_HIGH"

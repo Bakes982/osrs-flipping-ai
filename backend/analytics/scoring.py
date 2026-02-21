@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from backend.analytics.gp_per_hour import risk_adjusted_gph, raw_gp_per_hour
 from backend.analytics.risk import classify_risk
 from backend.core.constants import GE_TAX_RATE, GE_TAX_CAP
+from backend.core.utils import clamp
 from backend.domain.enums import RiskProfile, TrendDirection, VolumeRating
 from backend.domain.models import ItemMetrics, UserContext
 
@@ -142,9 +143,11 @@ def _raw_to_metrics(raw: Dict[str, Any], item_data: Dict[str, Any]) -> ItemMetri
 
     buy   = raw.get("recommended_buy")  or item_data.get("instant_buy",  0) or 0
     sell  = raw.get("recommended_sell") or item_data.get("instant_sell", 0) or 0
-    conf  = raw.get("confidence", 50.0)
+    conf = raw.get("confidence", 0.5)
     if conf is None:
-        conf = 50.0
+        conf = 0.5
+    conf_pct = conf * 100.0 if conf <= 1.0 else float(conf)
+    conf_pct = clamp(conf_pct, 0.0, 100.0)
 
     risk_s = raw.get("risk_score", 5.0)
     if risk_s is None:
@@ -181,7 +184,12 @@ def _raw_to_metrics(raw: Dict[str, Any], item_data: Dict[str, Any]) -> ItemMetri
     else:
         vr = VolumeRating.LOW
 
-    risk_level = classify_risk(risk_s, vol_1h, vol_5m)
+    risk_level = classify_risk(risk_s * 10.0 if risk_s <= 1.0 else risk_s, vol_1h, vol_5m)
+    veto_reason = raw.get("veto_reason", "")
+    if not veto_reason:
+        reasons = raw.get("veto_reasons") or []
+        if reasons:
+            veto_reason = "; ".join(str(r) for r in reasons)
 
     m = ItemMetrics(
         item_id=raw.get("item_id", item_data.get("item_id", 0)),
@@ -193,7 +201,7 @@ def _raw_to_metrics(raw: Dict[str, Any], item_data: Dict[str, Any]) -> ItemMetri
         volatility_1h=vol_1h,
         volatility_24h=vol_24h,
         volume_score=raw.get("score_volume", 0.0) or 0.0,
-        liquidity_score=raw.get("score_volume", 0.0) or 0.0,
+        liquidity_score=(raw.get("liquidity_score", 0.0) or 0.0) * 100.0 if (raw.get("liquidity_score", 0.0) or 0.0) <= 1.0 else (raw.get("liquidity_score", 0.0) or 0.0),
         fill_probability=raw.get("fill_probability", 0.5) or 0.5,
         est_fill_time_minutes=raw.get("estimated_hold_time", 60.0) or 60.0,
         trend_score=raw.get("score_trend", 0.0) or 0.0,
@@ -201,12 +209,12 @@ def _raw_to_metrics(raw: Dict[str, Any], item_data: Dict[str, Any]) -> ItemMetri
         decay_score=raw.get("spread_compression", 0.0) or 0.0,
         risk_level=risk_level,
         risk_score=risk_s,
-        confidence_pct=conf,
-        expected_profit=int(net_p * (conf / 100.0)),
+        confidence_pct=conf_pct,
+        expected_profit=int(raw.get("expected_profit", net_p * (conf_pct / 100.0))),
         risk_adjusted_gp_per_hour=0.0,   # filled after profile overrides
         final_score=raw.get("total_score", 0.0) or 0.0,
         vetoed=raw.get("vetoed", False),
-        veto_reason=raw.get("veto_reason", ""),
+        veto_reason=veto_reason,
         score_spread=raw.get("score_spread", 0.0) or 0.0,
         score_volume=raw.get("score_volume", 0.0) or 0.0,
         score_trend=raw.get("score_trend", 0.0) or 0.0,

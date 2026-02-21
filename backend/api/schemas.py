@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +111,26 @@ class FlipSummary(BaseModel):
 
     item_id: int
     item_name: str
+    name: Optional[str] = None
     buy: int                    # recommended buy price
     sell: int                   # recommended sell price
     margin: int                 # net_profit
+    margin_after_tax: int = 0
     roi: float                  # roi_pct
+    roi_pct: float = 0.0
+    volatility_1h: float = 0.0
+    volatility_24h: float = 0.0
+    liquidity_score: float = 0.0
+    fill_probability: float = 0.0
+    est_fill_time_minutes: float = 0.0
+    trend_score: float = 0.0
+    decay_penalty: float = 0.0
+    risk_level: str = "MEDIUM"
+    confidence_pct: float = 0.0
+    qty_suggested: int = 0
+    expected_profit_personal: int = 0
+    risk_adjusted_gph_personal: float = 0.0
+    final_score: float = 0.0
     score: float                # total_score
     risk: float                 # risk_score
     confidence: float
@@ -204,6 +220,8 @@ class RuneLiteFlip(BaseModel):
     p: int              = Field(alias="net_profit")
     r: float            = Field(alias="roi_pct")
     sc: float           = Field(alias="total_score")
+    c: float            = Field(alias="confidence_pct")
+    rl: str             = Field(alias="risk_level")
 
     class Config:
         populate_by_name = True
@@ -237,9 +255,9 @@ class SettingsResponse(BaseModel):
     settings: Dict[str, Any]
 
 
-class UpdateSettingsRequest(BaseModel):
+class UpdateSettingsRequest(RootModel[Dict[str, Any]]):
     """Partial settings update — only provided keys are updated."""
-    __root__: Dict[str, Any]
+    pass
 
     class Config:
         # Allow direct dict-like access

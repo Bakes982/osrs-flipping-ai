@@ -59,20 +59,22 @@ def risk_adjusted_gph(
     if gp_per_hour <= 0:
         return 0.0
 
-    confidence = max(0.0, min(100.0, confidence_pct)) / 100.0
+    # Accept either 0..1 or 0..100 confidence inputs for compatibility.
+    confidence = confidence_pct / 100.0 if confidence_pct > 1.0 else confidence_pct
+    confidence = max(0.0, min(1.0, confidence))
+    risk_norm = max(0.0, min(1.0, risk_score / 10.0))
 
-    # Scale the risk penalty by profile
-    risk_penalty_scale = {
-        RiskProfile.CONSERVATIVE: 1.5,
-        RiskProfile.BALANCED:     1.0,
-        RiskProfile.AGGRESSIVE:   0.6,
+    # Chunk formula baseline: raw_gph * confidence * (1 - 0.5*risk_score_raw)
+    # where risk_score_raw is 0..1.
+    base = gp_per_hour * confidence * (1.0 - 0.5 * risk_norm)
+
+    # Keep mild profile shaping without violating the baseline behavior.
+    profile_scale = {
+        RiskProfile.CONSERVATIVE: 0.92,
+        RiskProfile.BALANCED: 1.00,
+        RiskProfile.AGGRESSIVE: 1.08,
     }.get(profile, 1.0)
-
-    risk_factor = (risk_score / 10.0) * risk_penalty_scale
-    risk_factor = min(risk_factor, 0.9)  # never zero out completely
-
-    adj = gp_per_hour * confidence * (1.0 - risk_factor)
-    return max(0.0, adj)
+    return max(0.0, base * profile_scale)
 
 
 def expected_profit(
