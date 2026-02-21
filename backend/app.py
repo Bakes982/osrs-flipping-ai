@@ -8,7 +8,6 @@ Run with:
 
 import sys
 import os
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -29,7 +28,6 @@ if _PROJECT_ROOT not in sys.path:
 from backend import config
 from backend.core.logging import configure_logging
 from backend.database import init_db
-from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
 from backend.auth import (
     router as auth_router, is_configured as auth_configured,
@@ -52,23 +50,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once on startup, yields for the lifetime of the app, then cleans up."""
+    if config.RUN_MODE != "api":
+        logger.warning(
+            "backend.app started with RUN_MODE=%s. API mode is expected for this process.",
+            config.RUN_MODE,
+        )
+
     logger.info("Initialising database...")
     init_db()
-
-    # Schedule background tasks to start AFTER uvicorn is fully listening.
-    # Tasks are staggered to avoid all hammering MongoDB simultaneously.
-    async def _delayed_start():
-        await asyncio.sleep(5)
-        logger.info("Starting background tasks (staggered)...")
-        await start_background_tasks()
-
-    asyncio.create_task(_delayed_start())
-    logger.info("Database ready, background tasks scheduled.")
+    logger.info("Database ready.")
 
     yield  # Application is running
-
-    logger.info("Shutting down background tasks...")
-    await stop_background_tasks()
 
 
 # ---------------------------------------------------------------------------

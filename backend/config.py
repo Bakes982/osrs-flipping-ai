@@ -6,6 +6,14 @@ All settings come from environment variables for 12-factor deployment.
 import os
 import secrets
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # MongoDB
 # ---------------------------------------------------------------------------
@@ -39,6 +47,13 @@ ALLOWED_DISCORD_IDS = {
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8001"))
 MODELS_DIR = os.environ.get("MODELS_DIR", "models")
+RUN_MODE = os.environ.get("RUN_MODE", "api").strip().lower()
+
+# Worker runtime options
+WORKER_RETRY_INITIAL_SECONDS = float(os.environ.get("WORKER_RETRY_INITIAL_SECONDS", "2"))
+WORKER_RETRY_MAX_SECONDS = float(os.environ.get("WORKER_RETRY_MAX_SECONDS", "60"))
+WORKER_RUN_ONCE = _env_bool("WORKER_RUN_ONCE", False)
+WORKER_RUN_ONCE_SECONDS = float(os.environ.get("WORKER_RUN_ONCE_SECONDS", "0.05"))
 
 # ---------------------------------------------------------------------------
 # CORS — Starlette mirrors the request Origin when credentials=True + "*",

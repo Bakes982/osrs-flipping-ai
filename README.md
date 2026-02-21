@@ -6,8 +6,10 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 
 1. Create virtual environment and install dependencies.
 2. Copy `.env.example` to `.env` and fill values.
-3. Start backend:
-   `uvicorn backend.app:app --host 0.0.0.0 --port 8001`
+3. Start API service:
+   `RUN_MODE=api uvicorn backend.app:app --host 0.0.0.0 --port 8001`
+4. Start worker service in a second terminal:
+   `RUN_MODE=worker python -m backend.worker`
 
 ## Core endpoints
 
@@ -30,4 +32,17 @@ Run:
 ## QA checklist
 
 See `docs/QA.md`.
+
+## Railway deployment (2 services)
+
+Deploy two Railway services from the same repo:
+
+1. Web/API service:
+   - Start command: `uvicorn backend.app:app --host 0.0.0.0 --port $PORT`
+   - Env: `RUN_MODE=api`
+2. Worker service:
+   - Start command: `python -m backend.worker`
+   - Env: `RUN_MODE=worker`
+
+Both services should share the same `MONGODB_URL` and `DATABASE_NAME`.
 
