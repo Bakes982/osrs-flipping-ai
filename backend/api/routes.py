@@ -38,6 +38,7 @@ from backend.api.schemas import (
 )
 from backend.cache_backend import get_cache_backend
 from backend.flips_cache import compute_scored_opportunities
+from backend.metrics import metrics_snapshot, record_cache_access
 
 logger = logging.getLogger(__name__)
 
@@ -213,11 +214,13 @@ async def get_top_flips(
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
+    request.state.profile_used = active_profile
 
     cache = get_cache_backend()
     cache_ts: Optional[datetime] = None
 
     if fresh == 1:
+        request.state.cache_hit = False
         _enforce_fresh_rate_limit(request, active_profile)
         all_scored = await compute_scored_opportunities(
             limit=100,
@@ -231,13 +234,18 @@ async def get_top_flips(
         cache.set_json(f"flips:top100:{active_profile}", {"ts": ts_iso, "flips": all_scored}, ttl_seconds=ttl)
         cache.set_json(f"flips:top5:{active_profile}", {"ts": ts_iso, "flips": all_scored[:5]}, ttl_seconds=ttl)
         cache.set("flips:last_updated_ts", ts_iso, ttl_seconds=ttl)
+        record_cache_access(False)
     else:
         cache_ts, all_scored = _load_cached_flip_payload(f"flips:top100:{active_profile}")
         if all_scored is None:
+            request.state.cache_hit = False
+            record_cache_access(False)
             raise HTTPException(
                 status_code=503,
                 detail="Top list cache is not ready yet. Retry shortly or use fresh=1.",
             )
+        request.state.cache_hit = True
+        record_cache_access(True)
 
     filtered = [
         m for m in all_scored
@@ -277,10 +285,15 @@ async def get_top5_runelite(
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
+    request.state.profile_used = active_profile
 
     cache_ts, scored = _load_cached_flip_payload(f"flips:top5:{active_profile}")
     if scored is None:
+        request.state.cache_hit = False
+        record_cache_access(False)
         raise HTTPException(status_code=503, detail="Top-5 cache not warmed yet")
+    request.state.cache_hit = True
+    record_cache_access(True)
 
     flips = [
         RuneLiteFlip(
@@ -383,6 +396,7 @@ system_router = APIRouter(tags=["system"])
 )
 async def health_check():
     db_status = "ok"
+    db_connected = True
     try:
         from backend.database import get_db
         db = get_db()
@@ -396,13 +410,39 @@ async def health_check():
         db.close()
     except Exception as exc:
         db_status = f"error: {exc}"
+        db_connected = False
 
     from backend.tasks import _tasks  # noqa: PLC0415
+    cache_backend_name = "none"
+    last_poll_ts: Optional[datetime] = None
+    items_scored_count_last_run = 0
+    try:
+        cache = get_cache_backend()
+        cache_backend_name = getattr(cache, "backend", "none")
+        raw_last_poll = cache.get("flips:last_updated_ts")
+        last_poll_ts = _parse_cache_ts(raw_last_poll)
+        for profile in ("conservative", "balanced", "aggressive"):
+            stats = cache.get_json(f"flips:stats:{profile}") or {}
+            try:
+                items_scored_count_last_run += int(stats.get("count", 0) or 0)
+            except Exception:
+                continue
+    except Exception:
+        cache_backend_name = "none"
+
+    metrics = metrics_snapshot()
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
+        db_connected=db_connected,
         background_tasks=len(_tasks),
         uptime_seconds=round(time.time() - _START_TIME, 1),
+        last_poll_ts=last_poll_ts,
+        items_scored_count_last_run=items_scored_count_last_run,
+        cache_backend=cache_backend_name,
+        cache_hit_rate=float(metrics["cache_hit_rate"]),
+        alert_sent_count=int(metrics["alert_sent_count"]),
+        errors_last_hour=int(metrics["errors_last_hour"]),
     )
 
 

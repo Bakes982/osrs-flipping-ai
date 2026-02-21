@@ -247,8 +247,15 @@ class HealthResponse(BaseModel):
     status: str
     version: str = "2.0.0"
     db: str = "ok"
+    db_connected: bool = True
     background_tasks: int = 0
     uptime_seconds: float = 0.0
+    last_poll_ts: Optional[datetime] = None
+    items_scored_count_last_run: int = 0
+    cache_backend: str = "none"
+    cache_hit_rate: float = 0.0
+    alert_sent_count: int = 0
+    errors_last_hour: int = 0
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 

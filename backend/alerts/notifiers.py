@@ -22,6 +22,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from backend.metrics import increment_alert_sent_count
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +83,7 @@ class DiscordNotifier(Notifier):
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(self._url, json={"embeds": [embed]})
                 resp.raise_for_status()
+            increment_alert_sent_count()
             return True
         except Exception as exc:
             logger.error("DiscordNotifier: %s", exc)

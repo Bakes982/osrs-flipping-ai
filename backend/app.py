@@ -9,6 +9,9 @@ Run with:
 import sys
 import os
 import logging
+import json
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 import traceback
@@ -35,6 +38,7 @@ from backend.auth import (
 )
 from backend.domain.models import UserContext
 from backend.domain.enums import RiskProfile
+from backend.metrics import record_error
 
 # ---------------------------------------------------------------------------
 # Logging — use the centralised configurator (Phase 8)
@@ -105,6 +109,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "detail": str(exc),
             "type": type(exc).__name__,
             "path": request.url.path,
+            "request_id": getattr(request.state, "request_id", None),
             "traceback": tb,
         },
     )
@@ -179,6 +184,31 @@ async def user_context_middleware(request: Request, call_next):
 
     request.state.user_ctx = ctx
     return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+
+    response = await call_next(request)
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    if response.status_code >= 500:
+        record_error()
+
+    payload = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "cache_hit": getattr(request.state, "cache_hit", None),
+        "profile": getattr(request.state, "profile_used", None),
+    }
+    logger.info("request_log %s", json.dumps(payload, separators=(",", ":")))
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # ---------------------------------------------------------------------------

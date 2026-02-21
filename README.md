@@ -27,6 +27,11 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 `/flips/top5` is cache-only and served from precomputed worker results.  
 `/flips/top` is cache-first; use `?fresh=1` for live recompute (rate-limited).
 
+## Observability
+
+- `/health` includes DB connectivity, cache backend, last poll timestamp, scored item count, cache hit rate, alert sent count, and errors in the last hour.
+- API logs include structured request data: `request_id`, `method`, `path`, `status_code`, `latency_ms`, `cache_hit`, `profile`.
+
 ## Load test
 
 Run:
