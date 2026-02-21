@@ -263,6 +263,17 @@ class HealthResponse(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
+class StatusResponse(BaseModel):
+    status: str
+    worker_ok: bool = False
+    last_poll_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    items_scored_count: int = 0
+    cache_backend: str = "none"
+    profile_counts: Dict[str, int] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------

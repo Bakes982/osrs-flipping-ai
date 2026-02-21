@@ -65,6 +65,7 @@ TOP_REQUIRE_API_KEY = _env_bool("TOP_REQUIRE_API_KEY", False)
 WORKER_CIRCUIT_FAILURE_THRESHOLD = int(os.environ.get("WORKER_CIRCUIT_FAILURE_THRESHOLD", "5"))
 WORKER_CIRCUIT_OPEN_SECONDS = int(os.environ.get("WORKER_CIRCUIT_OPEN_SECONDS", "300"))
 SCORE_STALE_MAX_MINUTES = int(os.environ.get("SCORE_STALE_MAX_MINUTES", "45"))
+WORKER_OK_MAX_AGE_SECONDS = int(os.environ.get("WORKER_OK_MAX_AGE_SECONDS", "180"))
 
 # ---------------------------------------------------------------------------
 # CORS — Starlette mirrors the request Origin when credentials=True + "*",

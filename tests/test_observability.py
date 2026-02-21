@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.responses import Response
@@ -100,3 +100,38 @@ async def test_request_logging_middleware_counts_server_errors():
     await request_logging_middleware(request, _fail)
     assert metrics_snapshot()["errors_last_hour"] == 1
 
+
+@pytest.mark.asyncio
+async def test_runtime_status_live_when_cache_fresh(monkeypatch):
+    cache = MemoryCacheBackend()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cache.set("flips:last_updated_ts", now_iso, ttl_seconds=60)
+    cache.set_json("flips:stats:conservative", {"count": 1}, ttl_seconds=60)
+    cache.set_json("flips:stats:balanced", {"count": 2}, ttl_seconds=60)
+    cache.set_json("flips:stats:aggressive", {"count": 3}, ttl_seconds=60)
+
+    monkeypatch.setattr(routes, "get_cache_backend", lambda: cache)
+    monkeypatch.setattr(routes.config, "WORKER_OK_MAX_AGE_SECONDS", 180)
+
+    status = await routes.runtime_status()
+    assert status.worker_ok is True
+    assert status.status == "live"
+    assert status.items_scored_count == 6
+    assert status.profile_counts["balanced"] == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_stale_when_cache_old(monkeypatch):
+    cache = MemoryCacheBackend()
+    old_iso = (datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=10)).isoformat()
+    cache.set("flips:last_updated_ts", old_iso, ttl_seconds=600)
+    cache.set_json("flips:stats:conservative", {"count": 1}, ttl_seconds=600)
+    cache.set_json("flips:stats:balanced", {"count": 1}, ttl_seconds=600)
+    cache.set_json("flips:stats:aggressive", {"count": 1}, ttl_seconds=600)
+
+    monkeypatch.setattr(routes, "get_cache_backend", lambda: cache)
+    monkeypatch.setattr(routes.config, "WORKER_OK_MAX_AGE_SECONDS", 60)
+
+    status = await routes.runtime_status()
+    assert status.worker_ok is False
+    assert status.status == "stale"

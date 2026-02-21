@@ -35,6 +35,7 @@ from backend.api.schemas import (
     PortfolioAllocationResponse,
     OptimizePortfolioRequest,
     HealthResponse,
+    StatusResponse,
 )
 from backend.api_key_auth import resolve_api_key_owner
 from backend.cache_backend import get_cache_backend
@@ -280,6 +281,31 @@ def _enforce_plugin_rate_limit(bucket: str, identity: str, limit_per_minute: int
         )
 
 
+def _cache_runtime_summary() -> Tuple[Optional[datetime], Optional[int], int, Dict[str, int], str]:
+    cache_backend_name = "none"
+    last_poll_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    items_scored_count = 0
+    profile_counts: Dict[str, int] = {}
+    try:
+        cache = get_cache_backend()
+        cache_backend_name = getattr(cache, "backend", "none")
+        raw_last_poll = cache.get("flips:last_updated_ts")
+        last_poll_ts = _parse_cache_ts(raw_last_poll)
+        cache_age_seconds = _cache_age_seconds(last_poll_ts)
+        for profile in ("conservative", "balanced", "aggressive"):
+            stats = cache.get_json(f"flips:stats:{profile}") or {}
+            try:
+                count = int(stats.get("count", 0) or 0)
+            except Exception:
+                count = 0
+            profile_counts[profile] = count
+            items_scored_count += count
+    except Exception:
+        cache_backend_name = "none"
+    return last_poll_ts, cache_age_seconds, items_scored_count, profile_counts, cache_backend_name
+
+
 @flip_router.get(
     "/top",
     response_model=FlipsTopResponse,
@@ -514,22 +540,7 @@ async def health_check():
         db_connected = False
 
     from backend.tasks import _tasks  # noqa: PLC0415
-    cache_backend_name = "none"
-    last_poll_ts: Optional[datetime] = None
-    items_scored_count_last_run = 0
-    try:
-        cache = get_cache_backend()
-        cache_backend_name = getattr(cache, "backend", "none")
-        raw_last_poll = cache.get("flips:last_updated_ts")
-        last_poll_ts = _parse_cache_ts(raw_last_poll)
-        for profile in ("conservative", "balanced", "aggressive"):
-            stats = cache.get_json(f"flips:stats:{profile}") or {}
-            try:
-                items_scored_count_last_run += int(stats.get("count", 0) or 0)
-            except Exception:
-                continue
-    except Exception:
-        cache_backend_name = "none"
+    last_poll_ts, _cache_age, items_scored_count_last_run, _profile_counts, cache_backend_name = _cache_runtime_summary()
 
     metrics = metrics_snapshot()
     return HealthResponse(
@@ -544,6 +555,29 @@ async def health_check():
         cache_hit_rate=float(metrics["cache_hit_rate"]),
         alert_sent_count=int(metrics["alert_sent_count"]),
         errors_last_hour=int(metrics["errors_last_hour"]),
+    )
+
+
+@system_router.get(
+    "/status",
+    response_model=StatusResponse,
+    summary="Worker/cache runtime status",
+)
+async def runtime_status():
+    last_poll_ts, cache_age_seconds, items_scored_count, profile_counts, cache_backend_name = _cache_runtime_summary()
+    worker_ok = (
+        cache_age_seconds is not None
+        and cache_age_seconds <= max(10, int(config.WORKER_OK_MAX_AGE_SECONDS))
+    )
+    status = "live" if worker_ok else "stale"
+    return StatusResponse(
+        status=status,
+        worker_ok=worker_ok,
+        last_poll_ts=last_poll_ts,
+        cache_age_seconds=cache_age_seconds,
+        items_scored_count=items_scored_count,
+        cache_backend=cache_backend_name,
+        profile_counts=profile_counts,
     )
 
 

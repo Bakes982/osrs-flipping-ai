@@ -23,6 +23,7 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 - `PATCH /api/user/alerts/settings`
 - `GET /api/user/alerts/test`
 - `GET /health`
+- `GET /status`
 
 `/flips/top5` is cache-only and served from precomputed worker results.  
 `/flips/top` is cache-first; use `?fresh=1` for live recompute (rate-limited).
@@ -30,6 +31,7 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 ## Observability
 
 - `/health` includes DB connectivity, cache backend, last poll timestamp, scored item count, cache hit rate, alert sent count, and errors in the last hour.
+- `/status` is UI-friendly runtime state: `worker_ok`, `last_poll_ts`, `cache_age_seconds`, `items_scored_count`, `profile_counts`.
 - API logs include structured request data: `request_id`, `method`, `path`, `status_code`, `latency_ms`, `cache_hit`, `profile`.
 
 ## Plugin auth and limits
