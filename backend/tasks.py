@@ -709,6 +709,8 @@ class AlertMonitor:
         PRICE_DROP_THRESHOLD = 3.0       # % below 5m average to qualify
         COOLDOWN_MINUTES     = 30        # suppress repeat alerts for same item
 
+        dump_webhook_url = self._get_dump_alert_webhook_sync(db)
+
         for item_id_str, instant in _price_cache.items():
             try:
                 five_m = _5m_cache.get(item_id_str, {})
@@ -807,8 +809,55 @@ class AlertMonitor:
                     "Dump alert [severity %.1f]: %s — %.1f%% drop, %d sold vs %d bought",
                     severity, item_name, price_drop_pct, sell_vol, buy_vol,
                 )
+                if dump_webhook_url:
+                    self._send_discord_dump_alert_sync(dump_webhook_url, alert)
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
+
+    def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
+        """Return dedicated dump-alert webhook URL (fallback to general)."""
+        try:
+            url = get_setting(db, "dump_alert_webhook_url")
+            if url:
+                return str(url).strip()
+
+            wh = get_setting(db, "discord_webhook")
+            if isinstance(wh, dict):
+                if wh.get("enabled", False) and wh.get("url"):
+                    return str(wh.get("url")).strip()
+
+            url = get_setting(db, "discord_webhook_url")
+            enabled = get_setting(db, "discord_alerts_enabled", False)
+            if url and enabled:
+                return str(url).strip()
+        except Exception as e:
+            logger.debug("Dump webhook lookup failed: %s", e)
+        return None
+
+    def _send_discord_dump_alert_sync(self, webhook_url: str, alert: Alert) -> None:
+        """Send dump alert embed to Discord webhook (sync)."""
+        try:
+            import requests as _requests
+
+            d = alert.data or {}
+            embed = {
+                "title": f"📉 DUMP DETECTED: {alert.item_name}",
+                "color": 0xE74C3C,
+                "description": alert.message,
+                "fields": [
+                    {"name": "Sell Ratio", "value": f"{(d.get('sell_ratio', 0.0) * 100):.0f}%", "inline": True},
+                    {"name": "Price Drop", "value": f"{d.get('price_drop_pct', 0)}%", "inline": True},
+                    {"name": "Profit / item", "value": f"{d.get('profit_per_item', 0):,} GP", "inline": True},
+                    {"name": "Sold 5m", "value": f"{d.get('sell_volume', 0):,}", "inline": True},
+                    {"name": "Bought 5m", "value": f"{d.get('buy_volume', 0):,}", "inline": True},
+                    {"name": "Dump GP 5m", "value": f"{d.get('dump_gp_total', 0):,} GP", "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI • Dump Detector"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.debug("Failed to send dump Discord alert: %s", e)
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
