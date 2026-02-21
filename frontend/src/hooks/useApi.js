@@ -1,11 +1,13 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useContext } from 'react';
+import { ErrorContext } from '../components/ErrorPanel';
 
-export function useApi(fetchFn, deps = [], interval = null) {
+export function useApi(fetchFn, deps = [], interval = null, label = '') {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [errorObj, setErrorObj] = useState(null);
   const mountedRef = useRef(true);
   const initialLoadDone = useRef(false);
+  const errorCtx = useContext(ErrorContext);
 
   const load = useCallback(async () => {
     try {
@@ -17,11 +19,15 @@ export function useApi(fetchFn, deps = [], interval = null) {
       const result = await fetchFn();
       if (mountedRef.current) {
         setData(result);
-        setError(null);
+        setErrorObj(null);
         initialLoadDone.current = true;
       }
     } catch (e) {
-      if (mountedRef.current) setError(e.message);
+      if (mountedRef.current) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        setErrorObj(err);
+        if (errorCtx) errorCtx.addError(err, label);
+      }
     } finally {
       if (mountedRef.current) setLoading(false);
     }
@@ -43,5 +49,6 @@ export function useApi(fetchFn, deps = [], interval = null) {
     };
   }, [load, interval]);
 
-  return { data, loading, error, reload: load };
+  // `error` is a string for backward compatibility; `errorObj` has the full Error
+  return { data, loading, error: errorObj?.message || null, errorObj, reload: load };
 }

@@ -17,6 +17,7 @@ import Blocklist from './pages/Blocklist';
 import Login from './pages/Login';
 import { createPriceSocket, api, clearToken } from './api/client';
 import { AccountProvider, useAccount } from './hooks/useAccount';
+import { ErrorProvider } from './components/ErrorPanel';
 import './App.css';
 
 const NAV_ITEMS = [
@@ -122,6 +123,7 @@ export default function App() {
   }
 
   return (
+    <ErrorProvider>
     <AccountProvider>
     <BrowserRouter>
       <div className="app">
@@ -193,5 +195,6 @@ export default function App() {
       </div>
     </BrowserRouter>
     </AccountProvider>
+    </ErrorProvider>
   );
 }
