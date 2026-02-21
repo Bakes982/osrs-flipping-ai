@@ -46,6 +46,10 @@ HEADERS = {"User-Agent": USER_AGENT}
 # Populated by PriceCollector every 10s; used as fallback when DB has no snapshots.
 _price_cache: Dict = {}
 
+# In-memory 5-minute cache: item_id_str → {avgHighPrice, avgLowPrice, highPriceVolume, lowPriceVolume}
+# Populated by PriceCollector every 60s alongside the /5m fetch.
+_5m_cache: Dict = {}
+
 
 # ---------------------------------------------------------------------------
 # PriceCollector
@@ -95,6 +99,8 @@ class PriceCollector:
             resp.raise_for_status()
             self._5m_data = resp.json().get("data", {})
             self._last_5m_fetch = time.time()
+            # Expose globally so AlertMonitor can access volume data for dump detection
+            _5m_cache.update(self._5m_data)
             return self._5m_data
         except Exception as e:
             logger.error("Failed to fetch /5m: %s", e)
@@ -677,54 +683,131 @@ class AlertMonitor:
             set_setting(db, "price_alerts", new_targets)
 
     def _check_dump_alerts_sync(self, db):
-        """Detect items experiencing rapid price drops (>5% in 15 min). Sync version."""
-        item_ids = get_tracked_item_ids(db)
+        """Detect bot dump events across all ~6000 tradeable items.
+
+        A dump is identified by two simultaneous signals in the /5m data:
+          1. Sell volume >> buy volume  — someone is mass-selling (bots dumping)
+          2. Current price < 5m average — the selling has already pushed the price down
+
+        Both signals together give high confidence that the drop is temporary and
+        will recover once the dump is absorbed, creating a buy opportunity.
+
+        Does NOT rely on MongoDB snapshots — uses the in-memory _price_cache (latest,
+        updated every 10s) and _5m_cache (5m averages + volumes, updated every 60s).
+        This means we can check every item on the GE, not just tracked ones.
+        """
+        if not _price_cache or not _5m_cache:
+            return  # Caches not populated yet
+
         now = datetime.utcnow()
-        cutoff_15m = now - timedelta(minutes=15)
 
-        # Only check top 50 items to limit DB load
-        for item_id in item_ids[:50]:
+        # Thresholds (tuned for OSRS GE dump catching)
+        MIN_ITEM_VALUE       = 50_000    # GP — ignore cheap junk (too noisy)
+        MIN_SELL_VOLUME      = 50        # items — minimum meaningful dump size
+        SELL_RATIO_THRESHOLD = 0.65      # 65%+ of 5m volume must be selling
+        PRICE_DROP_THRESHOLD = 3.0       # % below 5m average to qualify
+        COOLDOWN_MINUTES     = 30        # suppress repeat alerts for same item
+
+        for item_id_str, instant in _price_cache.items():
             try:
-                docs = db.price_snapshots.find(
-                    {"item_id": item_id, "timestamp": {"$gte": cutoff_15m}}
-                ).sort("timestamp", 1)
-                snaps = [PriceSnapshot.from_doc(d) for d in docs]
+                five_m = _5m_cache.get(item_id_str, {})
 
-                if len(snaps) < 5:
+                # Current instant prices
+                instant_sell = instant.get("low")   # what you get selling right now
+                instant_buy  = instant.get("high")  # what you pay buying right now
+
+                # 5-minute averaged prices and volumes
+                avg_sell  = five_m.get("avgLowPrice")
+                avg_buy   = five_m.get("avgHighPrice")
+                sell_vol  = five_m.get("lowPriceVolume", 0) or 0   # items sold last 5m
+                buy_vol   = five_m.get("highPriceVolume", 0) or 0  # items bought last 5m
+
+                # Must have valid data
+                if not instant_sell or not avg_sell or avg_sell <= 0:
                     continue
 
-                prices = [s.instant_buy for s in snaps if s.instant_buy and s.instant_buy > 0]
-                if len(prices) < 5:
+                # Skip cheap items (junk / noise)
+                if avg_sell < MIN_ITEM_VALUE:
                     continue
 
-                first_price = prices[0]
-                last_price = prices[-1]
-                change_pct = (last_price - first_price) / first_price * 100
+                # Must have enough volume to be meaningful
+                total_vol = sell_vol + buy_vol
+                if total_vol < MIN_SELL_VOLUME or sell_vol < MIN_SELL_VOLUME:
+                    continue
 
-                if change_pct < -5:
-                    # Check we haven't alerted for this item in last 30 min
-                    recent_alert = db.alerts.find_one({
-                        "item_id": item_id,
-                        "alert_type": "dump",
-                        "timestamp": {"$gte": now - timedelta(minutes=30)},
-                    })
-                    if recent_alert:
-                        continue
+                # === DUMP SIGNAL 1: volume imbalance ===
+                # Most of the 5m volume is sell-side (bots dumping)
+                sell_ratio = sell_vol / total_vol
+                if sell_ratio < SELL_RATIO_THRESHOLD:
+                    continue
 
-                    item_row = get_item(db, item_id)
-                    item_name = item_row.name if item_row else f"Item {item_id}"
+                # === DUMP SIGNAL 2: price below 5m average ===
+                # Selling pressure has already pushed price below the recent average
+                price_drop_pct = (avg_sell - instant_sell) / avg_sell * 100
+                if price_drop_pct < PRICE_DROP_THRESHOLD:
+                    continue
 
-                    alert = Alert(
-                        item_id=item_id,
-                        item_name=item_name,
-                        alert_type="dump",
-                        message=f"{item_name} dropping {change_pct:.1f}% in 15min ({first_price:,} -> {last_price:,})",
-                        data={"change_pct": round(change_pct, 1), "from_price": first_price, "to_price": last_price},
-                    )
-                    insert_alert(db, alert)
-                    logger.info("Dump alert: %s", alert.message)
-            except Exception:
-                pass
+                # Both signals confirmed — this looks like a bot dump
+                item_id = int(item_id_str)
+
+                # Cooldown: don't spam alerts for the same item
+                recent_alert = db.alerts.find_one({
+                    "item_id": item_id,
+                    "alert_type": "dump",
+                    "timestamp": {"$gte": now - timedelta(minutes=COOLDOWN_MINUTES)},
+                })
+                if recent_alert:
+                    continue
+
+                # Item name (may not be in DB if it's not a top-100 item)
+                item_row = get_item(db, item_id)
+                item_name = item_row.name if item_row else f"Item {item_id}"
+
+                # Recovery metrics
+                # If price snaps back to 5m average after you buy at instant_sell:
+                #   profit = avg_sell - instant_sell - GE_tax
+                ge_tax = int(min(avg_sell * 0.01, 5_000_000))  # 1% buyer's side
+                profit_per_item = int(avg_sell - instant_sell - ge_tax)
+
+                # Total GP being dumped in this 5m window
+                dump_gp_total = int(sell_vol * instant_sell)
+
+                # Severity score 1-10: combines drop depth and volume imbalance
+                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
+
+                alert = Alert(
+                    item_id=item_id,
+                    item_name=item_name,
+                    alert_type="dump",
+                    message=(
+                        f"{item_name}: {price_drop_pct:.1f}% below 5m avg "
+                        f"({instant_sell:,} vs avg {avg_sell:,} GP) — "
+                        f"{sell_vol:,} sold vs {buy_vol:,} bought ({sell_ratio:.0%} sell ratio) — "
+                        f"~{profit_per_item:+,} GP/item recovery potential"
+                    ),
+                    data={
+                        "dump_type":         "volume_dump",
+                        "instant_sell":      instant_sell,
+                        "instant_buy":       instant_buy,
+                        "avg_sell":          avg_sell,
+                        "avg_buy":           avg_buy,
+                        "price_drop_pct":    round(price_drop_pct, 1),
+                        "sell_volume":       sell_vol,
+                        "buy_volume":        buy_vol,
+                        "sell_ratio":        round(sell_ratio, 2),
+                        "recovery_gp":       int(avg_sell - instant_sell),
+                        "profit_per_item":   profit_per_item,
+                        "dump_gp_total":     dump_gp_total,
+                        "severity":          severity,
+                    },
+                )
+                insert_alert(db, alert)
+                logger.info(
+                    "Dump alert [severity %.1f]: %s — %.1f%% drop, %d sold vs %d bought",
+                    severity, item_name, price_drop_pct, sell_vol, buy_vol,
+                )
+            except Exception as e:
+                logger.debug("Dump check error for item %s: %s", item_id_str, e)
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
