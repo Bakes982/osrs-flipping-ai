@@ -990,8 +990,15 @@ class PositionMonitor:
                         "last_rec_sell": rec_sell,
                     }
 
-                    # Discord for large moves
-                    if abs(change_from_alert) >= self.LARGE_CHANGE_PCT:
+                    # Discord for large moves:
+                    # - PRICE DROP: always notify (losing more is always actionable)
+                    # - PRICE RISE: only notify if the position has crossed into profit.
+                    #   A bounce from -74% to -73% is noise, not a signal.
+                    is_now_profitable = update.get("pnl_pct", -1) >= 0
+                    should_discord = abs(change_from_alert) >= self.LARGE_CHANGE_PCT and (
+                        change_from_alert < 0 or is_now_profitable
+                    )
+                    if should_discord:
                         asyncio.create_task(
                             self._send_discord_position_alert(pos, update, change_from_alert)
                         )
@@ -1103,8 +1110,14 @@ class PositionMonitor:
 
             import requests as _requests
 
-            direction = "\U0001f4c9 PRICE DROP" if change_pct < 0 else "\U0001f4c8 PRICE RISE"
-            color = 0xFF4444 if change_pct < 0 else 0x44FF44
+            pnl_pct = update.get("pnl_pct", 0)
+            if change_pct < 0:
+                direction = "\U0001f4c9 PRICE DROP"
+                color = 0xFF4444
+            else:
+                # Only reaches here when pnl_pct >= 0 (gated in check_positions)
+                direction = "\U0001f4b0 NOW PROFITABLE \u2014 CONSIDER SELLING"
+                color = 0x00FF88
 
             embed = {
                 "title": f"{direction}: {pos['item_name']}",
