@@ -14,10 +14,8 @@ from typing import List, Optional, Dict, Tuple
 from backend.database import (
     get_db, PriceSnapshot, FlipHistory, get_price_history, get_item_flips,
 )
-
-# GE Tax constants
-GE_TAX_RATE = 0.02
-GE_TAX_CAP = 5_000_000
+# GE Tax constants — canonical source is backend.core.constants
+from backend.core.constants import GE_TAX_RATE, GE_TAX_CAP
 
 
 class Trend(Enum):

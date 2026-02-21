@@ -27,23 +27,19 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from backend import config
+from backend.core.logging import configure_logging
 from backend.database import init_db
 from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
-from backend.routers import opportunities, portfolio, analysis, settings, alerts
-from backend.routers import blocklist as blocklist_router
 from backend.auth import (
     router as auth_router, is_configured as auth_configured,
     requires_auth, get_current_user,
 )
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — use the centralised configurator (Phase 8)
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -143,12 +139,10 @@ async def auth_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 app.include_router(auth_router)
-app.include_router(opportunities.router)
-app.include_router(portfolio.router)
-app.include_router(analysis.router)
-app.include_router(settings.router)
-app.include_router(alerts.router)
-app.include_router(blocklist_router.router)
+
+# Register all routers (existing + new Phase 4/5/7/8 endpoints)
+from backend.api.routes import register_routes
+register_routes(app)
 
 
 # ---------------------------------------------------------------------------
