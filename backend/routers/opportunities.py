@@ -35,7 +35,7 @@ _sizer = PositionSizer()
 def _fetch_wiki_snapshot(item_id: int):
     """Fetch current prices from OSRS Wiki API → PriceSnapshot."""
     import requests
-    from datetime import datetime, timezone
+    from datetime import datetime
     try:
         resp = requests.get(
             "https://prices.runescape.wiki/api/v1/osrs/latest",
@@ -49,7 +49,7 @@ def _fetch_wiki_snapshot(item_id: int):
             item_id=item_id,
             instant_buy=d["high"],
             instant_sell=d["low"],
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.utcnow(),
             buy_volume=d.get("highPriceVolume", 0),
             sell_volume=d.get("lowPriceVolume", 0),
         )

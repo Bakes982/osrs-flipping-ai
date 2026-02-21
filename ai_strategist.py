@@ -240,8 +240,8 @@ def scan_all_items_for_flips(
         if not high or not low:
             continue
 
-        # Filter by price range
-        if low < min_price or high > max_price:
+        # Filter by price range (filter on buy price / high, not sell price)
+        if high < min_price or high > max_price:
             continue
 
         # Quick margin check (before expensive analysis)
