@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from backend import config
 from backend.database import (
     get_db,
     PriceSnapshot,
@@ -72,6 +73,28 @@ class PriceCollector:
         self._last_5m_fetch: float = 0.0
         self._last_store: float = 0.0
         self._client: Optional[httpx.AsyncClient] = None
+        self._consecutive_upstream_failures: int = 0
+        self._circuit_open_until_ts: float = 0.0
+        self._failure_threshold = max(1, int(config.WORKER_CIRCUIT_FAILURE_THRESHOLD))
+        self._circuit_open_seconds = max(10, int(config.WORKER_CIRCUIT_OPEN_SECONDS))
+        self._last_circuit_log_ts: float = 0.0
+
+    def _is_circuit_open(self) -> bool:
+        return time.time() < self._circuit_open_until_ts
+
+    def _record_upstream_success(self) -> None:
+        self._consecutive_upstream_failures = 0
+
+    def _record_upstream_failure(self, endpoint: str, exc: Exception) -> None:
+        self._consecutive_upstream_failures += 1
+        logger.error("Failed to fetch %s: %s", endpoint, exc)
+        if self._consecutive_upstream_failures >= self._failure_threshold:
+            self._circuit_open_until_ts = time.time() + self._circuit_open_seconds
+            self._consecutive_upstream_failures = 0
+            logger.error(
+                "PriceCollector circuit opened for %ss after repeated upstream failures",
+                self._circuit_open_seconds,
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -80,6 +103,8 @@ class PriceCollector:
 
     async def fetch_latest(self) -> Dict:
         """Fetch instant prices from /latest."""
+        if self._is_circuit_open():
+            return self._latest_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/latest")
@@ -87,13 +112,16 @@ class PriceCollector:
             self._latest_data = resp.json().get("data", {})
             # Update global in-memory cache for all items (used by PositionMonitor)
             _price_cache.update(self._latest_data)
+            self._record_upstream_success()
             return self._latest_data
         except Exception as e:
-            logger.error("Failed to fetch /latest: %s", e)
+            self._record_upstream_failure("/latest", e)
             return self._latest_data
 
     async def fetch_5m(self) -> Dict:
         """Fetch 5-minute averaged prices from /5m."""
+        if self._is_circuit_open():
+            return self._5m_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/5m")
@@ -102,9 +130,10 @@ class PriceCollector:
             self._last_5m_fetch = time.time()
             # Expose globally so AlertMonitor can access volume data for dump detection
             _5m_cache.update(self._5m_data)
+            self._record_upstream_success()
             return self._5m_data
         except Exception as e:
-            logger.error("Failed to fetch /5m: %s", e)
+            self._record_upstream_failure("/5m", e)
             return self._5m_data
 
     async def store_snapshots(self) -> int:
@@ -197,6 +226,16 @@ class PriceCollector:
         logger.info("PriceCollector started")
         while True:
             try:
+                if self._is_circuit_open():
+                    now = time.time()
+                    # Log at most once every 15s while open.
+                    if now - self._last_circuit_log_ts > 15:
+                        remaining = int(max(0, self._circuit_open_until_ts - now))
+                        logger.warning("PriceCollector circuit open; retry in %ss", remaining)
+                        self._last_circuit_log_ts = now
+                    await asyncio.sleep(2)
+                    continue
+
                 await self.fetch_latest()
 
                 # Fetch 5m data every 60 seconds

@@ -14,6 +14,14 @@ from backend.database import get_db, get_item, get_item_flips, get_price_history
 from backend.prediction.scoring import calculate_flip_metrics
 
 
+def _snapshot_ts(snapshot) -> datetime | None:
+    for attr in ("timestamp", "ts", "time"):
+        v = getattr(snapshot, attr, None) if not isinstance(snapshot, dict) else snapshot.get(attr)
+        if isinstance(v, datetime):
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    return None
+
+
 def compute_scored_opportunities_sync(
     limit: int = 100,
     min_score: float = 45.0,
@@ -33,6 +41,13 @@ def compute_scored_opportunities_sync(
                 flips = get_item_flips(db, item_id, days=30)
                 item = get_item(db, item_id)
                 latest = snaps[-1]
+                latest_ts = _snapshot_ts(latest)
+                if latest_ts is not None:
+                    age_min = (datetime.now(timezone.utc) - latest_ts).total_seconds() / 60.0
+                    if age_min > max(1, int(config.SCORE_STALE_MAX_MINUTES)):
+                        continue
+                if not latest.instant_buy or not latest.instant_sell:
+                    continue
                 metrics = calculate_flip_metrics(
                     {
                         "item_id": item_id,
@@ -122,4 +137,3 @@ async def warm_flip_caches(
     min_confidence_pct: float = 0.0,
 ) -> Dict[str, int]:
     return await asyncio.to_thread(warm_flip_caches_sync, profiles, min_score, min_confidence_pct)
-

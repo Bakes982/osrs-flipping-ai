@@ -379,11 +379,19 @@ def calculate_flip_metrics(item_data: dict) -> dict:
     if volume_5m <= 0:
         vetoed = True
         veto_reasons.append("Zero 5-min volume")
-    if fill_probability < 0.2 and profile in {"conservative", "balanced"}:
-        final_score = min(final_score, 30)
+    profile_fill_thresholds = {"conservative": 0.60, "balanced": 0.45, "aggressive": 0.30}
+    fill_min = profile_fill_thresholds.get(profile, 0.45)
+    if fill_probability < fill_min:
+        final_score = min(final_score, 30 if profile != "aggressive" else 40)
+        veto_reasons.append(f"Low fill probability for {profile} profile")
+        if fill_probability < max(0.10, fill_min * 0.4):
+            vetoed = True
     if spread_pct_now >= float(item_data.get("spread_max_pct") or 0.20):
         vetoed = True
         veto_reasons.append("Spread too wide")
+    if decay_penalty >= float(item_data.get("decay_spike_threshold") or 0.85):
+        final_score = min(final_score, 20)
+        veto_reasons.append("Spread compression spike")
 
     latest_ts = int(points[-1]["ts"].timestamp()) if points else now_ts
     stale_minutes = safe_div(now_ts - latest_ts, 60.0)

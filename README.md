@@ -47,6 +47,15 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 - `badges`: compact tags like `SAFE`, `FAST`, `VOLATILE`, `HIGH_ROI`
 - `confidence_pct`: always normalized to 0–100
 
+## Data guardrails
+
+- Worker uses a circuit breaker on repeated upstream fetch failures (`WORKER_CIRCUIT_FAILURE_THRESHOLD`, `WORKER_CIRCUIT_OPEN_SECONDS`).
+- Scoring excludes stale snapshots (`SCORE_STALE_MAX_MINUTES`) and enforces stricter veto/penalty rules for:
+  - non-positive margin after tax
+  - low fill probability by profile
+  - wide spreads
+  - spread-compression spikes
+
 ## Load test
 
 Run:
