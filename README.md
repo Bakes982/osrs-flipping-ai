@@ -40,6 +40,13 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
   - `/flips/top5`: `TOP5_RATE_LIMIT_PER_MINUTE` (default `60`)
   - `/flips/top`: `TOP_RATE_LIMIT_PER_MINUTE` (default `20`)
 
+## Explainability fields
+
+`/flips/top` and `/flips/top5` include:
+- `reasons`: short human-readable rationale strings
+- `badges`: compact tags like `SAFE`, `FAST`, `VOLATILE`, `HIGH_ROI`
+- `confidence_pct`: always normalized to 0–100
+
 ## Load test
 
 Run:

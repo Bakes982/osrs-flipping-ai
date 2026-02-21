@@ -84,6 +84,9 @@ async def test_top5_cache_only_does_not_trigger_live_compute(monkeypatch):
     assert len(response.flips) == 1
     assert response.profile_used == "balanced"
     assert response.cache_ts is not None
+    assert response.flips[0].c == 91.0
+    assert len(response.flips[0].reasons) >= 1
+    assert len(response.flips[0].badges) >= 1
 
 
 @pytest.mark.asyncio
@@ -120,6 +123,9 @@ async def test_top_uses_cache_when_not_fresh(monkeypatch):
     assert response.count == 1
     assert response.profile_used == "balanced"
     assert response.cache_age_seconds is not None
+    assert response.flips[0].confidence_pct == 91.0
+    assert len(response.flips[0].reasons) >= 1
+    assert len(response.flips[0].badges) >= 1
 
 
 @pytest.mark.asyncio
@@ -169,3 +175,9 @@ async def test_top_fresh_rate_limit(monkeypatch):
             sort_by="score",
         )
     assert exc.value.status_code == 429
+
+
+def test_confidence_pct_helper_normalizes_to_100_scale():
+    assert routes._confidence_pct({"confidence": 0.87}) == 87.0
+    assert routes._confidence_pct({"confidence_pct": 92}) == 92.0
+    assert routes._confidence_pct({"confidence_pct": 0.92}) == 92.0

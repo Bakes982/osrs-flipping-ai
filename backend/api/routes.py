@@ -92,8 +92,8 @@ def _meets_filter(
 
 
 def _to_summary(m: dict) -> FlipSummary:
-    conf = m.get("confidence", 0.0) or 0.0
-    conf_pct = conf * 100.0 if conf <= 1.0 else conf
+    conf_pct = _confidence_pct(m)
+    reasons, badges = _explain_flip(m)
     return FlipSummary(
         item_id=m["item_id"],
         item_name=m.get("item_name", ""),
@@ -125,7 +125,67 @@ def _to_summary(m: dict) -> FlipSummary:
         gp_per_hour=m.get("gp_per_hour", 0),
         trend=m.get("trend", "NEUTRAL"),
         vetoed=m.get("vetoed", False),
+        reasons=reasons,
+        badges=badges,
     )
+
+
+def _confidence_pct(metric: dict) -> float:
+    conf_pct = metric.get("confidence_pct")
+    if conf_pct is not None:
+        try:
+            conf = float(conf_pct)
+            if conf <= 1.0:
+                conf *= 100.0
+            return max(0.0, min(100.0, conf))
+        except Exception:
+            pass
+    conf = metric.get("confidence", 0.0) or 0.0
+    conf = float(conf)
+    if conf <= 1.0:
+        conf *= 100.0
+    return max(0.0, min(100.0, conf))
+
+
+def _explain_flip(metric: dict) -> Tuple[List[str], List[str]]:
+    reasons: List[str] = []
+    badges: List[str] = []
+
+    fill_probability = float(metric.get("fill_probability", 0.0) or 0.0)
+    if fill_probability >= 0.8:
+        reasons.append("High liquidity and fast fills")
+        badges.append("FAST")
+
+    decay_penalty = float(metric.get("decay_penalty", metric.get("spread_compression", 0.0)) or 0.0)
+    if decay_penalty <= 0.2:
+        reasons.append("Stable spread (low compression)")
+        badges.append("SAFE")
+
+    trend_score = float(metric.get("trend_score", 0.0) or 0.0)
+    if trend_score > 1.0:
+        trend_score = trend_score / 100.0
+    if trend_score >= 0.55:
+        reasons.append("Positive trend (EMA crossover)")
+
+    risk_adj_gph = float(metric.get("risk_adjusted_gph_personal", metric.get("risk_adjusted_gp_per_hour", 0.0)) or 0.0)
+    if risk_adj_gph >= 250_000:
+        reasons.append("High risk-adjusted GP/h")
+
+    roi_pct = float(metric.get("roi_pct", 0.0) or 0.0)
+    if roi_pct >= 5.0:
+        badges.append("HIGH_ROI")
+
+    risk_score = float(metric.get("risk_score", 5.0) or 5.0)
+    if risk_score >= 6.5:
+        badges.append("VOLATILE")
+
+    # Avoid empty reasons so UI always has text to show.
+    if not reasons:
+        reasons.append("Balanced margin, confidence, and risk profile")
+    if not badges:
+        badges.append("WATCH")
+
+    return reasons[:4], badges[:4]
 
 
 def _parse_cache_ts(ts_value: object) -> Optional[datetime]:
@@ -332,20 +392,24 @@ async def get_top5_runelite(
     request.state.cache_hit = True
     record_cache_access(True)
 
-    flips = [
-        RuneLiteFlip(
-            item_id=m["item_id"],
-            item_name=m.get("item_name", ""),
-            recommended_buy=m.get("recommended_buy", 0),
-            recommended_sell=m.get("recommended_sell", 0),
-            net_profit=m.get("net_profit", 0),
-            roi_pct=m.get("roi_pct", 0),
-            total_score=m.get("total_score", 0),
-            confidence_pct=((m.get("confidence", 0.0) or 0.0) * 100.0) if (m.get("confidence", 0.0) or 0.0) <= 1.0 else (m.get("confidence", 0.0) or 0.0),
-            risk_level=m.get("risk_level", "MEDIUM"),
+    flips = []
+    for m in scored[:5]:
+        reasons, badges = _explain_flip(m)
+        flips.append(
+            RuneLiteFlip(
+                item_id=m["item_id"],
+                item_name=m.get("item_name", ""),
+                recommended_buy=m.get("recommended_buy", 0),
+                recommended_sell=m.get("recommended_sell", 0),
+                net_profit=m.get("net_profit", 0),
+                roi_pct=m.get("roi_pct", 0),
+                total_score=m.get("total_score", 0),
+                confidence_pct=_confidence_pct(m),
+                risk_level=m.get("risk_level", "MEDIUM"),
+                reasons=reasons,
+                badges=badges,
+            )
         )
-        for m in scored[:5]
-    ]
     return RuneLiteTop5Response(
         ts=int(time.time()),
         flips=flips,

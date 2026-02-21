@@ -138,6 +138,8 @@ class FlipSummary(BaseModel):
     estimated_hold_time: int    # minutes
     gp_per_hour: float
     trend: str
+    reasons: List[str] = Field(default_factory=list)
+    badges: List[str] = Field(default_factory=list)
     vetoed: bool = False
 
 
@@ -225,6 +227,8 @@ class RuneLiteFlip(BaseModel):
     sc: float           = Field(alias="total_score")
     c: float            = Field(alias="confidence_pct")
     rl: str             = Field(alias="risk_level")
+    reasons: List[str] = Field(default_factory=list)
+    badges: List[str] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True
