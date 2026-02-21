@@ -375,7 +375,13 @@ async def health_check():
     try:
         from backend.database import get_db
         db = get_db()
-        db.db.command("ping")
+        # Database wrapper stores pymongo database on `_db`.
+        if hasattr(db, "_db"):
+            db._db.command("ping")
+        elif hasattr(db, "db"):
+            db.db.command("ping")
+        else:
+            raise RuntimeError("Unsupported database wrapper (missing _db/db)")
         db.close()
     except Exception as exc:
         db_status = f"error: {exc}"
