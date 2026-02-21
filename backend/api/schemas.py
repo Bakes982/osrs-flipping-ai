@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +237,9 @@ class SettingsResponse(BaseModel):
     settings: Dict[str, Any]
 
 
-class UpdateSettingsRequest(BaseModel):
+class UpdateSettingsRequest(RootModel[Dict[str, Any]]):
     """Partial settings update — only provided keys are updated."""
-    __root__: Dict[str, Any]
+    pass
 
     class Config:
         # Allow direct dict-like access
