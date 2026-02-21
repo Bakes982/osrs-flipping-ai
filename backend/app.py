@@ -35,6 +35,8 @@ from backend.auth import (
     router as auth_router, is_configured as auth_configured,
     requires_auth, get_current_user,
 )
+from backend.domain.models import UserContext
+from backend.domain.enums import RiskProfile
 
 # ---------------------------------------------------------------------------
 # Logging — use the centralised configurator (Phase 8)
@@ -131,6 +133,59 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Not authenticated. Visit /api/auth/login to sign in."},
             )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def user_context_middleware(request: Request, call_next):
+    """
+    Resolve the authenticated user's risk profile and personalisation data,
+    then attach a ``UserContext`` to ``request.state.user_ctx``.
+
+    Downstream route handlers can access it via::
+
+        ctx: UserContext = request.state.user_ctx
+
+    Falls back to ``UserContext.anonymous()`` (balanced, no personalisation)
+    for unauthenticated requests or when the users collection has no record.
+    """
+    ctx = UserContext.anonymous()
+    try:
+        user = get_current_user(request)
+        if user and user.get("id"):
+            uid = user["id"]
+            ctx.user_id  = uid
+            ctx.username = user.get("username")
+            # Load user document from DB for risk profile + calibration
+            try:
+                from backend.database import get_db
+                db = get_db()
+                doc = db.db["users"].find_one(
+                    {"_id": uid},
+                    {"risk_profile": 1, "profit_multiplier": 1,
+                     "hold_multiplier": 1, "item_affinity": 1,
+                     "category_affinity": 1},
+                )
+                if doc:
+                    try:
+                        ctx.risk_profile = RiskProfile(doc.get("risk_profile", "balanced"))
+                    except ValueError:
+                        ctx.risk_profile = RiskProfile.BALANCED
+                    ctx.profit_multiplier = float(doc.get("profit_multiplier", 1.0) or 1.0)
+                    ctx.hold_multiplier   = float(doc.get("hold_multiplier",   1.0) or 1.0)
+                    raw_aff = doc.get("item_affinity", {}) or {}
+                    ctx.item_affinity = {
+                        int(k): float(v) for k, v in raw_aff.items()
+                        if k.isdigit()
+                    }
+                    raw_cat = doc.get("category_affinity", {}) or {}
+                    ctx.category_affinity = {str(k): float(v) for k, v in raw_cat.items()}
+            except Exception as db_exc:
+                logger.debug("user_context_middleware: DB lookup failed: %s", db_exc)
+    except Exception as exc:
+        logger.debug("user_context_middleware: %s", exc)
+
+    request.state.user_ctx = ctx
     return await call_next(request)
 
 

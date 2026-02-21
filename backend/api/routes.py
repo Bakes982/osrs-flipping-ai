@@ -308,6 +308,7 @@ def register_routes(app: FastAPI) -> None:
     # Existing routers (retain their own prefixes)
     from backend.routers import opportunities, portfolio, analysis, settings, alerts
     from backend.routers import blocklist as blocklist_router
+    from backend.routers import user_profile
 
     app.include_router(opportunities.router)
     app.include_router(portfolio.router)
@@ -315,6 +316,7 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(settings.router)
     app.include_router(alerts.router)
     app.include_router(blocklist_router.router)
+    app.include_router(user_profile.router)
 
     # New unified endpoints
     app.include_router(flip_router)
