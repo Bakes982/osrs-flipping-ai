@@ -31,6 +31,7 @@ from backend.database import (
     upsert_item_feature,
     get_item,
     find_active_positions,
+    dismiss_position,
     find_pending_sells,
     get_price_history,
 )
@@ -1303,16 +1304,86 @@ class PositionMonitor:
         except Exception as e:
             logger.error("Failed to send Discord sell alert: %s", e)
 
+    def _auto_archive_stale_positions(self):
+        """Auto-dismiss positions that have been open longer than the configured
+        archive threshold.  Runs once on startup and every 6 hours.
+
+        A position is considered stale when:
+          - Its timestamp is older than `position_auto_archive_days` days
+          - It still has no matching sell (i.e. it is still "active")
+
+        This cleans up ghost positions caused by:
+          - Dink missing the SELL webhook while you were offline
+          - CSV imports of old trades that were already completed
+          - Items sold for a loss before the plugin was installed
+
+        The threshold is stored in the ``position_auto_archive_days`` setting.
+        A value of 0 disables auto-archiving.
+        """
+        db = get_db()
+        try:
+            days = get_setting(db, "position_auto_archive_days", default=7)
+            if not days or int(days) <= 0:
+                return
+
+            cutoff = datetime.utcnow() - timedelta(days=int(days))
+            positions = find_active_positions(db)
+            archived = 0
+
+            for pos in positions:
+                bought_at_raw = pos.get("bought_at")
+                if not bought_at_raw:
+                    continue
+                # bought_at is stored as an ISO string by find_active_positions
+                try:
+                    ts = datetime.fromisoformat(bought_at_raw.replace("Z", "+00:00"))
+                    # Normalise to naive UTC for comparison
+                    if ts.tzinfo is not None:
+                        ts = ts.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    dismiss_position(db, pos["trade_id"])
+                    archived += 1
+                    age_days = (datetime.utcnow() - ts).days
+                    logger.info(
+                        "Auto-archived stale position: %s (opened %s, %d days old)",
+                        pos.get("item_name", pos.get("item_id")),
+                        ts.strftime("%Y-%m-%d"),
+                        age_days,
+                    )
+
+            if archived:
+                logger.info("Auto-archive complete: dismissed %d stale position(s)", archived)
+        except Exception as e:
+            logger.error("Auto-archive error: %s", e)
+        finally:
+            db.close()
+
     async def run_forever(self):
         logger.info("PositionMonitor started (checks every %ds)", self.CHECK_INTERVAL)
         # Wait for initial price data
         await asyncio.sleep(45)
+
+        # Run auto-archive on startup, then every 6 hours
+        archive_interval = 6 * 3600
+        last_archive = 0.0
+
         while True:
             try:
                 await self.check_positions()
                 await self.check_selling_offers()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
+
+            # Periodic auto-archive (non-blocking, runs in thread pool)
+            if time.time() - last_archive >= archive_interval:
+                try:
+                    await asyncio.to_thread(self._auto_archive_stale_positions)
+                    last_archive = time.time()
+                except Exception as e:
+                    logger.error("PositionMonitor auto-archive error: %s", e)
+
             await asyncio.sleep(self.CHECK_INTERVAL)
 
 

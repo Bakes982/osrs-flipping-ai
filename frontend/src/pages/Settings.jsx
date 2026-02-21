@@ -16,6 +16,7 @@ export default function SettingsPage() {
   const [riskTolerance, setRiskTolerance] = useState('MEDIUM');
   const [sending, setSending] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [autoArchiveDays, setAutoArchiveDays] = useState(7);
 
   // Security state
   const [allowedIds, setAllowedIds] = useState([]);
@@ -30,6 +31,7 @@ export default function SettingsPage() {
       setNotifyInterval(settings.discord_top5_interval_minutes ?? 30);
       setRiskTolerance(settings.risk_tolerance || 'MEDIUM');
       setAllowedIds(settings.allowed_discord_ids || []);
+      setAutoArchiveDays(settings.position_auto_archive_days ?? 7);
     }
   }, [settings]);
 
@@ -244,6 +246,44 @@ export default function SettingsPage() {
             <option value="HIGH">High (aggressive)</option>
           </select>
         </label>
+      </div>
+
+      {/* Portfolio auto-archive */}
+      <div className="card" style={{ marginBottom: 24 }}>
+        <h3 style={{ fontSize: 14, marginBottom: 8 }}>🗂️ Position Auto-Archive</h3>
+        <p className="text-muted" style={{ fontSize: 12, marginBottom: 12 }}>
+          Positions (BUY trades) that haven't been matched to a sell after this many days are
+          automatically dismissed. This clears ghost positions caused by the Dink plugin missing
+          a sell event, or CSV imports of already-completed trades.
+          Set to <strong>0</strong> to disable.
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <select
+            value={autoArchiveDays}
+            onChange={async e => {
+              const val = Number(e.target.value);
+              setAutoArchiveDays(val);
+              try {
+                await api.updateSettings({ position_auto_archive_days: val });
+                showMsg(val === 0 ? 'Auto-archive disabled.' : `Auto-archive set to ${val} days.`);
+              } catch (err) {
+                showMsg('Error: ' + err.message, 4000);
+              }
+            }}
+            style={{ ...inputStyle, width: 'auto', marginTop: 0 }}
+          >
+            <option value={0}>Disabled</option>
+            <option value={3}>3 days</option>
+            <option value={7}>7 days (default)</option>
+            <option value={14}>14 days</option>
+            <option value={30}>30 days</option>
+          </select>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            {autoArchiveDays === 0
+              ? 'Positions will never auto-expire — dismiss them manually.'
+              : `Positions older than ${autoArchiveDays} days will be auto-dismissed every 6 hours.`}
+          </span>
+        </div>
       </div>
 
       {/* Security */}
