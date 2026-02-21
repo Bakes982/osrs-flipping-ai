@@ -195,8 +195,10 @@ def calculate_flip_metrics(item_data: dict) -> dict:
     item_id = int(item_data.get("item_id", 0) or 0)
     item_name = str(item_data.get("item_name", f"Item {item_id}"))
 
-    high_now = int(item_data.get("instant_buy") or item_data.get("sell") or 0)
-    low_now = int(item_data.get("instant_sell") or item_data.get("buy") or 0)
+    raw_high = int(item_data.get("instant_buy") or item_data.get("sell") or 0)
+    raw_low = int(item_data.get("instant_sell") or item_data.get("buy") or 0)
+    high_now = raw_high
+    low_now = raw_low
     if high_now > 0 and low_now > 0 and high_now < low_now:
         high_now, low_now = low_now, high_now
     if high_now <= 0 or low_now <= 0:
@@ -205,6 +207,7 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         out["veto_reasons"] = ["Missing or invalid buy/sell prices"]
         return out
 
+    volume_5m = int(item_data.get("volume_5m") or 0)
     spread_now = high_now - low_now
     spread_pct_now = safe_div(spread_now, max(low_now, 1))
 
@@ -344,19 +347,44 @@ def calculate_flip_metrics(item_data: dict) -> dict:
     final_score_01 = clamp(base - penalty, 0.0, 1.0)
     final_score = round(final_score_01 * 100.0)
 
+    # Backward-compatible freshness scoring based on timestamp age.
+    now_ts = int(datetime.utcnow().timestamp())
+    buy_time = int(item_data.get("buy_time") or now_ts)
+    sell_time = int(item_data.get("sell_time") or now_ts)
+    age_min = max(now_ts - buy_time, now_ts - sell_time) / 60.0
+    if age_min < 2:
+        freshness_score = 100.0
+    elif age_min < 5:
+        freshness_score = 90.0
+    elif age_min < 10:
+        freshness_score = 75.0
+    elif age_min < 15:
+        freshness_score = 60.0
+    elif age_min < 30:
+        freshness_score = 40.0
+    elif age_min < 60:
+        freshness_score = 20.0
+    else:
+        freshness_score = 5.0
+
     veto_reasons: List[str] = []
     vetoed = False
+    if raw_high > 0 and raw_low > 0 and raw_high <= raw_low:
+        vetoed = True
+        veto_reasons.append("Inverted spread (buy <= sell)")
     if margin_after_tax <= 0:
         final_score = min(final_score, 5)
         vetoed = True
         veto_reasons.append("Non-positive margin after tax")
+    if volume_5m <= 0:
+        vetoed = True
+        veto_reasons.append("Zero 5-min volume")
     if fill_probability < 0.2 and profile in {"conservative", "balanced"}:
         final_score = min(final_score, 30)
-    if spread_pct_now > float(item_data.get("spread_max_pct") or 0.20):
+    if spread_pct_now >= float(item_data.get("spread_max_pct") or 0.20):
         vetoed = True
         veto_reasons.append("Spread too wide")
 
-    now_ts = int(datetime.utcnow().timestamp())
     latest_ts = int(points[-1]["ts"].timestamp()) if points else now_ts
     stale_minutes = safe_div(now_ts - latest_ts, 60.0)
     stale_data = stale_minutes > _cfg_float("STALE_MINUTES", 45.0)
@@ -393,7 +421,7 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         "avg_profit": None,
         "score_spread": round(margin_norm * 100.0, 2),
         "score_volume": round(liquidity_score * 100.0, 2),
-        "score_freshness": round(freq_score * 100.0, 2),
+        "score_freshness": round(freshness_score, 2),
         "score_trend": round(trend_score_01 * 100.0, 2),
         "score_history": 50.0,
         "score_stability": round(spread_stability * 100.0, 2),

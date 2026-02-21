@@ -177,14 +177,14 @@ def classify_risk(
     vol_component = clamp(volatility_1h / 0.03, 0.0, 1.0)
     liq_component = clamp(1.0 - (volume_5m / 20.0), 0.0, 1.0)
 
-    idx = 0.45 * vol_component + 0.35 * score_component + 0.20 * liq_component
+    idx = 0.40 * vol_component + 0.30 * score_component + 0.30 * liq_component
     if win_rate is not None:
         idx = clamp(idx + (0.55 - clamp(win_rate, 0.0, 1.0)) * 0.15, 0.0, 1.0)
 
     if idx < 0.33:
         return "LOW"
-    if idx <= 0.66:
+    if idx <= 0.70:
         return "MEDIUM"
-    if idx <= 0.85:
+    if idx <= 0.88:
         return "HIGH"
     return "VERY_HIGH"
