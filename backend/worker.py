@@ -18,6 +18,7 @@ from typing import Awaitable, Callable
 from backend import config
 from backend.core.logging import configure_logging
 from backend.database import init_db
+from backend.flips_cache import warm_flip_caches
 from backend.tasks import start_background_tasks, stop_background_tasks
 
 logger = logging.getLogger(__name__)
@@ -70,12 +71,33 @@ async def _run_worker_session(
     """
     init_db()
     await start_fn()
+    cache_warm_task = asyncio.create_task(_cache_warm_loop(stop_event))
     logger.info("Worker session started.")
     try:
         await stop_event.wait()
     finally:
+        cache_warm_task.cancel()
+        await asyncio.gather(cache_warm_task, return_exceptions=True)
         logger.info("Stopping worker background tasks...")
         await stop_fn()
+
+
+async def _cache_warm_loop(stop_event: asyncio.Event) -> None:
+    """Warm top-list caches periodically so API endpoints remain cache-only fast."""
+    interval_seconds = max(5, int(config.FLIPS_CACHE_WARM_INTERVAL_SECONDS))
+    while not stop_event.is_set():
+        try:
+            warmed = await warm_flip_caches()
+            logger.info("Cache warm complete: %s", warmed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Cache warm failed")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
 
 
 async def run_worker_forever(
@@ -136,4 +158,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

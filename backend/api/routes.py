@@ -20,11 +20,12 @@ import asyncio
 import logging
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
+from backend import config
 from backend.api.schemas import (
     FlipMetricsResponse,
     FlipSummary,
@@ -35,14 +36,15 @@ from backend.api.schemas import (
     OptimizePortfolioRequest,
     HealthResponse,
 )
+from backend.cache_backend import get_cache_backend
+from backend.flips_cache import compute_scored_opportunities
 
 logger = logging.getLogger(__name__)
 
 # Module-level start time for uptime reporting
 _START_TIME: float = time.time()
-_TOP_CACHE_TTL_SECONDS = 45
-_TOP_CACHE: Dict[Tuple[str, int, int, int], Tuple[float, List[dict]]] = {}
-_TOP_CACHE_LOCK = threading.Lock()
+_FRESH_RATE_STATE: Dict[Tuple[str, str], Tuple[int, int]] = {}
+_FRESH_RATE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -123,81 +125,65 @@ def _to_summary(m: dict) -> FlipSummary:
     )
 
 
-def _cache_get(profile: str, limit: int, min_score: int, min_confidence_pct: int) -> Optional[List[dict]]:
-    key = (profile, limit, min_score, min_confidence_pct)
-    now = time.time()
-    with _TOP_CACHE_LOCK:
-        hit = _TOP_CACHE.get(key)
-        if not hit:
-            return None
-        ts, payload = hit
-        if now - ts > _TOP_CACHE_TTL_SECONDS:
-            _TOP_CACHE.pop(key, None)
-            return None
-        return payload
-
-
-def _cache_set(profile: str, limit: int, min_score: int, min_confidence_pct: int, payload: List[dict]) -> None:
-    key = (profile, limit, min_score, min_confidence_pct)
-    with _TOP_CACHE_LOCK:
-        _TOP_CACHE[key] = (time.time(), payload)
-
-
-async def _fetch_scored_opportunities(
-    limit: int = 50,
-    min_score: float = 45.0,
-    profile: str = "balanced",
-    min_confidence_pct: float = 0.0,
-    user_capital: int = 10_000_000,
-) -> List[dict]:
-    """Pull currently-scored opportunities from the database."""
-    from backend.database import get_db, get_tracked_item_ids, get_price_history, get_item_flips, get_item
-    from backend.prediction.scoring import calculate_flip_metrics
-
-    def _sync() -> List[dict]:
-        db = get_db()
-        results = []
+def _parse_cache_ts(ts_value: object) -> Optional[datetime]:
+    if ts_value is None:
+        return None
+    if isinstance(ts_value, datetime):
+        return ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=timezone.utc)
+    if isinstance(ts_value, (int, float)):
         try:
-            item_ids = get_tracked_item_ids(db)
-            for item_id in item_ids[:200]:
-                try:
-                    snaps = get_price_history(db, item_id, hours=4)
-                    if not snaps:
-                        continue
-                    flips = get_item_flips(db, item_id, days=30)
-                    item = get_item(db, item_id)
-                    latest = snaps[-1]
-                    metrics = calculate_flip_metrics({
-                        "item_id": item_id,
-                        "item_name": item.name if item else f"Item {item_id}",
-                        "instant_buy": latest.instant_buy,
-                        "instant_sell": latest.instant_sell,
-                        "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
-                        "buy_time": latest.buy_time,
-                        "sell_time": latest.sell_time,
-                        "snapshots": snaps,
-                        "flip_history": flips,
-                        "risk_profile": profile,
-                        "item_limit": getattr(item, "buy_limit", None) if item else None,
-                        "user_capital": user_capital,
-                    })
-                    confidence = metrics.get("confidence", 0.0) or 0.0
-                    conf_pct = confidence * 100.0 if confidence <= 1.0 else confidence
-                    if (
-                        not metrics["vetoed"]
-                        and metrics["total_score"] >= min_score
-                        and conf_pct >= min_confidence_pct
-                    ):
-                        results.append(metrics)
-                except Exception:
-                    continue
-        finally:
-            db.close()
+            return datetime.fromtimestamp(float(ts_value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(ts_value, str):
+        try:
+            normalized = ts_value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
 
-        results.sort(key=lambda m: m.get("total_score", 0), reverse=True)
-        return results[:limit]
 
-    return await asyncio.to_thread(_sync)
+def _cache_age_seconds(cache_ts: Optional[datetime]) -> Optional[int]:
+    if cache_ts is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - cache_ts).total_seconds()))
+
+
+def _load_cached_flip_payload(key: str) -> Tuple[Optional[datetime], Optional[List[dict]]]:
+    cache = get_cache_backend()
+    payload = cache.get_json(key)
+    if not isinstance(payload, dict):
+        return None, None
+    ts = _parse_cache_ts(payload.get("ts"))
+    flips = payload.get("flips")
+    if not isinstance(flips, list):
+        return ts, None
+    return ts, flips
+
+
+def _fresh_rate_limit_key(request: Request, profile: str) -> Tuple[str, str]:
+    client_host = request.client.host if request.client else "unknown"
+    return client_host, profile
+
+
+def _enforce_fresh_rate_limit(request: Request, profile: str) -> None:
+    max_per_minute = max(1, int(config.FLIPS_FRESH_MAX_PER_MINUTE))
+    now_bucket = int(time.time() // 60)
+    key = _fresh_rate_limit_key(request, profile)
+    with _FRESH_RATE_LOCK:
+        bucket, count = _FRESH_RATE_STATE.get(key, (now_bucket, 0))
+        if bucket != now_bucket:
+            bucket, count = now_bucket, 0
+        if count >= max_per_minute:
+            raise HTTPException(status_code=429, detail="fresh=1 rate limit exceeded; retry in under a minute")
+        _FRESH_RATE_STATE[key] = (bucket, count + 1)
+
+
+def _reset_fresh_rate_limit_for_tests() -> None:
+    with _FRESH_RATE_LOCK:
+        _FRESH_RATE_STATE.clear()
 
 
 @flip_router.get(
@@ -213,6 +199,7 @@ async def get_top_flips(
     request: Request,
     limit: int = Query(20, ge=1, le=100),
     profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
+    fresh: int = Query(0, ge=0, le=1),
     min_score: float = Query(45.0, ge=0, le=100),
     min_roi: float = Query(0.0, ge=0),
     min_confidence: float = Query(0.0, ge=0, le=100),
@@ -227,12 +214,30 @@ async def get_top_flips(
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
 
-    all_scored = await _fetch_scored_opportunities(
-        limit=limit * 3,
-        min_score=min_score,
-        profile=active_profile,
-        min_confidence_pct=min_confidence,
-    )
+    cache = get_cache_backend()
+    cache_ts: Optional[datetime] = None
+
+    if fresh == 1:
+        _enforce_fresh_rate_limit(request, active_profile)
+        all_scored = await compute_scored_opportunities(
+            limit=100,
+            min_score=min_score,
+            profile=active_profile,
+            min_confidence_pct=min_confidence,
+        )
+        cache_ts = datetime.now(timezone.utc)
+        ts_iso = cache_ts.isoformat()
+        ttl = max(30, int(config.FLIPS_CACHE_TTL_SECONDS))
+        cache.set_json(f"flips:top100:{active_profile}", {"ts": ts_iso, "flips": all_scored}, ttl_seconds=ttl)
+        cache.set_json(f"flips:top5:{active_profile}", {"ts": ts_iso, "flips": all_scored[:5]}, ttl_seconds=ttl)
+        cache.set("flips:last_updated_ts", ts_iso, ttl_seconds=ttl)
+    else:
+        cache_ts, all_scored = _load_cached_flip_payload(f"flips:top100:{active_profile}")
+        if all_scored is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Top list cache is not ready yet. Retry shortly or use fresh=1.",
+            )
 
     filtered = [
         m for m in all_scored
@@ -243,7 +248,14 @@ async def get_top_flips(
     filtered.sort(key=lambda m: m.get(_sort_key, 0), reverse=True)
 
     flips = [_to_summary(m) for m in filtered[:limit]]
-    return FlipsTopResponse(count=len(flips), generated_at=datetime.utcnow(), flips=flips)
+    return FlipsTopResponse(
+        count=len(flips),
+        generated_at=datetime.now(timezone.utc),
+        flips=flips,
+        cache_ts=cache_ts,
+        cache_age_seconds=_cache_age_seconds(cache_ts),
+        profile_used=active_profile,
+    )
 
 
 @flip_router.get(
@@ -266,17 +278,10 @@ async def get_top5_runelite(
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
 
-    cached = _cache_get(active_profile, 5, int(min_score), int(min_confidence))
-    if cached is not None:
-        scored = cached
-    else:
-        scored = await _fetch_scored_opportunities(
-            limit=5,
-            min_score=min_score,
-            profile=active_profile,
-            min_confidence_pct=min_confidence,
-        )
-        _cache_set(active_profile, 5, int(min_score), int(min_confidence), scored)
+    cache_ts, scored = _load_cached_flip_payload(f"flips:top5:{active_profile}")
+    if scored is None:
+        raise HTTPException(status_code=503, detail="Top-5 cache not warmed yet")
+
     flips = [
         RuneLiteFlip(
             item_id=m["item_id"],
@@ -291,7 +296,13 @@ async def get_top5_runelite(
         )
         for m in scored[:5]
     ]
-    return RuneLiteTop5Response(ts=int(time.time()), flips=flips)
+    return RuneLiteTop5Response(
+        ts=int(time.time()),
+        flips=flips,
+        cache_ts=cache_ts,
+        cache_age_seconds=_cache_age_seconds(cache_ts),
+        profile_used=active_profile,
+    )
 
 
 @flip_router.get(

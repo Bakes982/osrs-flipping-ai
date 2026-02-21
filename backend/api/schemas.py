@@ -146,6 +146,9 @@ class FlipsTopResponse(BaseModel):
     count: int
     generated_at: datetime
     flips: List[FlipSummary]
+    cache_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    profile_used: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +234,9 @@ class RuneLiteTop5Response(BaseModel):
     """Response for GET /flips/top5 — optimised for plugin latency."""
     ts: int             # Unix timestamp
     flips: List[RuneLiteFlip]
+    cache_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    profile_used: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

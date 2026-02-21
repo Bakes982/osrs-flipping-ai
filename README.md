@@ -24,6 +24,9 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 - `GET /api/user/alerts/test`
 - `GET /health`
 
+`/flips/top5` is cache-only and served from precomputed worker results.  
+`/flips/top` is cache-first; use `?fresh=1` for live recompute (rate-limited).
+
 ## Load test
 
 Run:
@@ -45,4 +48,12 @@ Deploy two Railway services from the same repo:
    - Env: `RUN_MODE=worker`
 
 Both services should share the same `MONGODB_URL` and `DATABASE_NAME`.
+If `REDIS_URL` is set, cache is shared across instances/restarts; otherwise an in-memory fallback is used.
+
+## Cache keys
+
+- `flips:top5:{profile}`
+- `flips:top100:{profile}`
+- `flips:stats:{profile}`
+- `flips:last_updated_ts`
 

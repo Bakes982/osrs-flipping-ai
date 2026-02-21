@@ -19,6 +19,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 MONGODB_URL = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
 DATABASE_NAME = os.environ.get("DATABASE_NAME", "osrs_flipping_ai")
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
 # ---------------------------------------------------------------------------
 # URLs
@@ -54,6 +55,9 @@ WORKER_RETRY_INITIAL_SECONDS = float(os.environ.get("WORKER_RETRY_INITIAL_SECOND
 WORKER_RETRY_MAX_SECONDS = float(os.environ.get("WORKER_RETRY_MAX_SECONDS", "60"))
 WORKER_RUN_ONCE = _env_bool("WORKER_RUN_ONCE", False)
 WORKER_RUN_ONCE_SECONDS = float(os.environ.get("WORKER_RUN_ONCE_SECONDS", "0.05"))
+FLIPS_CACHE_TTL_SECONDS = int(os.environ.get("FLIPS_CACHE_TTL_SECONDS", "180"))
+FLIPS_CACHE_WARM_INTERVAL_SECONDS = int(os.environ.get("FLIPS_CACHE_WARM_INTERVAL_SECONDS", "30"))
+FLIPS_FRESH_MAX_PER_MINUTE = int(os.environ.get("FLIPS_FRESH_MAX_PER_MINUTE", "6"))
 
 # ---------------------------------------------------------------------------
 # CORS — Starlette mirrors the request Origin when credentials=True + "*",
