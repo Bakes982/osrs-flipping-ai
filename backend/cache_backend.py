@@ -26,6 +26,9 @@ class CacheBackend:
     def set(self, key: str, value: str, ttl_seconds: Optional[int] = None) -> None:
         raise NotImplementedError
 
+    def incr(self, key: str, ttl_seconds: int = 60) -> int:
+        raise NotImplementedError
+
     def get_json(self, key: str) -> Optional[Any]:
         raw = self.get(key)
         if raw is None:
@@ -65,6 +68,28 @@ class MemoryCacheBackend(CacheBackend):
         with self._lock:
             self._store[key] = (value, expires_at)
 
+    def incr(self, key: str, ttl_seconds: int = 60) -> int:
+        now = time.time()
+        with self._lock:
+            hit = self._store.get(key)
+            expires_at: Optional[float] = None
+            current = 0
+            if hit:
+                value, expires_at = hit
+                if expires_at is not None and now > expires_at:
+                    current = 0
+                    expires_at = None
+                else:
+                    try:
+                        current = int(value)
+                    except Exception:
+                        current = 0
+            current += 1
+            if expires_at is None:
+                expires_at = now + max(1, ttl_seconds)
+            self._store[key] = (str(current), expires_at)
+            return current
+
 
 class RedisCacheBackend(CacheBackend):
     backend = "redis"
@@ -82,6 +107,12 @@ class RedisCacheBackend(CacheBackend):
             self._client.setex(key, max(1, int(ttl_seconds)), value)
         else:
             self._client.set(key, value)
+
+    def incr(self, key: str, ttl_seconds: int = 60) -> int:
+        value = int(self._client.incr(key))
+        if value == 1:
+            self._client.expire(key, max(1, int(ttl_seconds)))
+        return value
 
 
 _backend_singleton: Optional[CacheBackend] = None
@@ -115,4 +146,3 @@ def reset_cache_backend_for_tests() -> None:
     global _backend_singleton
     with _backend_lock:
         _backend_singleton = None
-

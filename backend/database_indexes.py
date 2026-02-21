@@ -74,7 +74,18 @@ INDEXES: dict[str, list[IndexModel]] = {
         # _id IS the Discord user ID string — no additional unique index needed.
         IndexModel([("risk_profile", ASCENDING)], name="risk_profile"),
         IndexModel([("subscription_tier", ASCENDING)], name="subscription_tier"),
+        IndexModel([("api_key_hash", ASCENDING)], name="api_key_hash", sparse=True),
         IndexModel([("updated_at", DESCENDING)], name="updated_at_desc"),
+    ],
+
+    # ------------------------------------------------------------------
+    # api_keys — explicit API keys for plugin auth
+    # ------------------------------------------------------------------
+    "api_keys": [
+        IndexModel([("key_hash", ASCENDING)], unique=True, name="key_hash_unique"),
+        IndexModel([("user_id", ASCENDING)], name="user_id"),
+        IndexModel([("enabled", ASCENDING)], name="enabled"),
+        IndexModel([("created_at", DESCENDING)], name="created_at_desc"),
     ],
 
     # ------------------------------------------------------------------

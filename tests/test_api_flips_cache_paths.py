@@ -67,6 +67,8 @@ async def test_top5_cache_only_does_not_trigger_live_compute(monkeypatch):
         ttl_seconds=60,
     )
     monkeypatch.setattr(routes, "get_cache_backend", lambda: memory)
+    monkeypatch.setattr(routes, "_authenticate_plugin_access", lambda *_args, **_kwargs: "anon:test")
+    monkeypatch.setattr(routes, "_enforce_plugin_rate_limit", lambda *_args, **_kwargs: None)
 
     async def _should_not_run(*_args, **_kwargs):
         raise AssertionError("live compute should not run for /flips/top5")
@@ -93,6 +95,8 @@ async def test_top_uses_cache_when_not_fresh(monkeypatch):
         ttl_seconds=60,
     )
     monkeypatch.setattr(routes, "get_cache_backend", lambda: memory)
+    monkeypatch.setattr(routes, "_authenticate_plugin_access", lambda *_args, **_kwargs: "anon:test")
+    monkeypatch.setattr(routes, "_enforce_plugin_rate_limit", lambda *_args, **_kwargs: None)
 
     async def _should_not_run(*_args, **_kwargs):
         raise AssertionError("live compute should not run when fresh=0")
@@ -124,6 +128,8 @@ async def test_top_fresh_rate_limit(monkeypatch):
     monkeypatch.setattr(routes.config, "FLIPS_FRESH_MAX_PER_MINUTE", 1)
     memory = MemoryCacheBackend()
     monkeypatch.setattr(routes, "get_cache_backend", lambda: memory)
+    monkeypatch.setattr(routes, "_authenticate_plugin_access", lambda *_args, **_kwargs: "anon:test")
+    monkeypatch.setattr(routes, "_enforce_plugin_rate_limit", lambda *_args, **_kwargs: None)
 
     async def _live_compute(*_args, **_kwargs):
         return [_metric()]

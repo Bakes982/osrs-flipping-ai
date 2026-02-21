@@ -32,6 +32,14 @@ Python + MongoDB backend for OSRS Grand Exchange flip scoring, personalization, 
 - `/health` includes DB connectivity, cache backend, last poll timestamp, scored item count, cache hit rate, alert sent count, and errors in the last hour.
 - API logs include structured request data: `request_id`, `method`, `path`, `status_code`, `latency_ms`, `cache_hit`, `profile`.
 
+## Plugin auth and limits
+
+- `/flips/top5` requires `X-API-Key` by default (unless `ALLOW_ANON=true`).
+- API keys are validated against `api_keys.key_hash` (or `users.api_key_hash` fallback).
+- Rate limits:
+  - `/flips/top5`: `TOP5_RATE_LIMIT_PER_MINUTE` (default `60`)
+  - `/flips/top`: `TOP_RATE_LIMIT_PER_MINUTE` (default `20`)
+
 ## Load test
 
 Run:

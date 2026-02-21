@@ -36,9 +36,11 @@ from backend.api.schemas import (
     OptimizePortfolioRequest,
     HealthResponse,
 )
+from backend.api_key_auth import resolve_api_key_owner
 from backend.cache_backend import get_cache_backend
 from backend.flips_cache import compute_scored_opportunities
 from backend.metrics import metrics_snapshot, record_cache_access
+from backend.rate_limiter import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +189,37 @@ def _reset_fresh_rate_limit_for_tests() -> None:
         _FRESH_RATE_STATE.clear()
 
 
+def _request_client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _authenticate_plugin_access(request: Request, require_key: bool) -> str:
+    raw_api_key = request.headers.get("X-API-Key", "").strip()
+    client_host = _request_client_host(request)
+    if not raw_api_key:
+        if require_key and not config.ALLOW_ANON:
+            raise HTTPException(status_code=401, detail="Missing X-API-Key")
+        return f"anon:{client_host}"
+
+    owner = resolve_api_key_owner(raw_api_key)
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    key_hash, user_id = owner
+    request.state.api_key_hash = key_hash
+    request.state.api_user_id = user_id
+    return f"key:{key_hash}"
+
+
+def _enforce_plugin_rate_limit(bucket: str, identity: str, limit_per_minute: int) -> None:
+    allowed, count = check_rate_limit(bucket=bucket, identity=identity, limit_per_minute=limit_per_minute)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for {bucket} ({count}/{limit_per_minute} in current minute)",
+        )
+
+
 @flip_router.get(
     "/top",
     response_model=FlipsTopResponse,
@@ -215,6 +248,8 @@ async def get_top_flips(
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
     request.state.profile_used = active_profile
+    identity = _authenticate_plugin_access(request, require_key=bool(config.TOP_REQUIRE_API_KEY))
+    _enforce_plugin_rate_limit("flips_top", identity, int(config.TOP_RATE_LIMIT_PER_MINUTE))
 
     cache = get_cache_backend()
     cache_ts: Optional[datetime] = None
@@ -286,6 +321,8 @@ async def get_top5_runelite(
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
     request.state.profile_used = active_profile
+    identity = _authenticate_plugin_access(request, require_key=True)
+    _enforce_plugin_rate_limit("flips_top5", identity, int(config.TOP5_RATE_LIMIT_PER_MINUTE))
 
     cache_ts, scored = _load_cached_flip_payload(f"flips:top5:{active_profile}")
     if scored is None:

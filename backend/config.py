@@ -58,6 +58,10 @@ WORKER_RUN_ONCE_SECONDS = float(os.environ.get("WORKER_RUN_ONCE_SECONDS", "0.05"
 FLIPS_CACHE_TTL_SECONDS = int(os.environ.get("FLIPS_CACHE_TTL_SECONDS", "180"))
 FLIPS_CACHE_WARM_INTERVAL_SECONDS = int(os.environ.get("FLIPS_CACHE_WARM_INTERVAL_SECONDS", "30"))
 FLIPS_FRESH_MAX_PER_MINUTE = int(os.environ.get("FLIPS_FRESH_MAX_PER_MINUTE", "6"))
+ALLOW_ANON = _env_bool("ALLOW_ANON", False)
+TOP5_RATE_LIMIT_PER_MINUTE = int(os.environ.get("TOP5_RATE_LIMIT_PER_MINUTE", "60"))
+TOP_RATE_LIMIT_PER_MINUTE = int(os.environ.get("TOP_RATE_LIMIT_PER_MINUTE", "20"))
+TOP_REQUIRE_API_KEY = _env_bool("TOP_REQUIRE_API_KEY", False)
 
 # ---------------------------------------------------------------------------
 # CORS — Starlette mirrors the request Origin when credentials=True + "*",
