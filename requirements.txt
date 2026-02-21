@@ -18,3 +18,8 @@ matplotlib>=3.7.0
 
 # Auth (python-multipart needed for form parsing)
 python-multipart>=0.0.6
+
+# Testing (Phase 9)
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0

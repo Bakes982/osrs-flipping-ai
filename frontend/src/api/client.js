@@ -77,7 +77,20 @@ async function fetchJSON(path, options = {}, retries = 3) {
       if (isHTML) {
         throw new Error('Backend returned unexpected HTML. It may be restarting.');
       }
-      if (!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
+      if (!res.ok) {
+        // Try to extract a useful message from the JSON error body
+        let detail = res.statusText || `HTTP ${res.status}`;
+        try {
+          const body = await res.clone().json();
+          const msg = body.detail || body.error || body.message;
+          if (msg) detail = typeof msg === 'string' ? msg : JSON.stringify(msg);
+        } catch { /* body wasn't JSON */ }
+        const err = new Error(`${res.status}: ${detail}`);
+        err.status = res.status;
+        err.detail = detail;
+        err.url = url;
+        throw err;
+      }
       if (res.status === 204) return null;
       const text = await res.text();
       return text ? JSON.parse(text) : null;

@@ -18,11 +18,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-asyncio
+        run: pip install -r requirements.txt
 
-      - name: Run tests (excluding MongoDB-dependent ones)
+      - name: Run unit tests (no external dependencies required)
         run: |
-          pytest tests/test_websocket.py tests/test_smart_pricer.py tests/test_position_sizer.py tests/test_flip_scorer.py -v
+          pytest tests/test_core_utils.py tests/test_scoring.py tests/test_risk.py tests/test_portfolio.py tests/test_alerts.py -v --no-cov
+
+      - name: Lint (ruff, if available)
+        run: pip install ruff --quiet && ruff check backend/ --select=E,F --ignore=E501 || true
 
   lint-frontend:
     runs-on: ubuntu-latest
