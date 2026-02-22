@@ -1179,21 +1179,7 @@ class PositionMonitor:
     async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
         """Send a Discord embed for a large price move on an active position."""
         try:
-            def _sync():
-                db = get_db()
-                try:
-                    wh = get_setting(db, "discord_webhook")
-                    if isinstance(wh, dict):
-                        if not wh.get("enabled", False):
-                            return None
-                        return wh.get("url")
-                    url = get_setting(db, "discord_webhook_url")
-                    enabled = get_setting(db, "discord_alerts_enabled", False)
-                    return url if url and enabled else None
-                finally:
-                    db.close()
-
-            webhook_url = await asyncio.to_thread(_sync)
+            webhook_url = await self._get_sell_alert_webhook()
             if not webhook_url:
                 return
 
