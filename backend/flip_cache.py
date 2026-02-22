@@ -359,30 +359,62 @@ def _update_dump_persistence(all_metrics: Dict[int, dict]) -> None:
             state["alerted"]    = False
 
 
+def _format_dump_message(metrics: dict) -> str:
+    """Return a clean, human-readable dump alert string.
+
+    Format: DUMP {SIGNAL} {name} — Buy {buy} | Sell {sell} | Qty {qty} | +{ppi} ea | +{total} total
+
+    item_id is intentionally omitted from the user-facing message and is only
+    emitted via structured logging.
+    """
+    from backend.analytics.trade_plan import build_trade_plan
+    from backend.core.constants import GE_TAX_RATE, GE_TAX_CAP, GE_TAX_FREE_BELOW
+    from backend import config as _cfg
+
+    name   = metrics.get("item_name", "Unknown")
+    signal = (metrics.get("dump_signal") or "HIGH").upper()
+
+    tp = build_trade_plan(
+        buy_price=int(metrics.get("recommended_buy") or 0),
+        sell_price=int(metrics.get("recommended_sell") or 0),
+        item_limit=None,
+        liquidity_score=None,   # use 50 % default — conservative for alerts
+        risk_profile_position_cap_pct=0.15,
+        capital_gp=_cfg.DEFAULT_CAPITAL_GP,
+        ge_tax_rate=GE_TAX_RATE,
+        ge_tax_cap=GE_TAX_CAP,
+        ge_tax_free_below=GE_TAX_FREE_BELOW,
+    )
+    return (
+        f"DUMP {signal} {name} — "
+        f"Buy {tp['buy_price']:,} | Sell {tp['sell_price']:,} | "
+        f"Qty {tp['qty_to_buy']:,} | "
+        f"+{tp['profit_per_item']:,} ea | "
+        f"+{tp['total_profit']:,} total"
+    )
+
+
 def _emit_dump_alert(metrics: dict) -> None:
     """Fire a dump alert via Discord webhook (if configured)."""
     import os
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+    # Always log structured data (item_id for debugging, not in user message)
+    logger.warning(
+        "DUMP_HIGH alert: item_id=%s name=%s dump_risk=%.1f",
+        metrics.get("item_id"), metrics.get("item_name"),
+        metrics.get("dump_risk_score", 0),
+    )
+
     if not webhook_url:
-        logger.warning(
-            "DUMP_HIGH alert for item %s (%s) — dump_risk=%.1f "
-            "(set DISCORD_WEBHOOK_URL to receive notifications)",
-            metrics.get("item_id"), metrics.get("item_name"),
-            metrics.get("dump_risk_score", 0),
-        )
+        logger.warning("Set DISCORD_WEBHOOK_URL to receive dump alert notifications")
         return
 
     try:
         import json
         import urllib.request
-        payload = json.dumps({
-            "content": (
-                f":warning: **DUMP ALERT** — {metrics.get('item_name', 'Unknown')} "
-                f"(ID {metrics.get('item_id')}) "
-                f"dump_risk={metrics.get('dump_risk_score', 0):.1f} "
-                f"| signal=HIGH"
-            ),
-        }).encode()
+        content = f":warning: **{_format_dump_message(metrics)}**"
+        payload = json.dumps({"content": content}).encode()
         req = urllib.request.Request(
             webhook_url,
             data=payload,

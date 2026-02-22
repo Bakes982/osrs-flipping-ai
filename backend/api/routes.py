@@ -31,6 +31,7 @@ from backend.api.schemas import (
     FlipsTopResponse,
     RuneLiteFlip,
     RuneLiteTop5Response,
+    TradePlan,
     PortfolioAllocationResponse,
     OptimizePortfolioRequest,
     HealthResponse,
@@ -86,9 +87,42 @@ def _meets_filter(
     return True
 
 
-def _to_summary(m: dict) -> FlipSummary:
+def _build_trade_plan_for(m: dict, capital_gp: int, position_cap_pct: float) -> TradePlan:
+    """Build a TradePlan from a scored metrics dict."""
+    from backend.analytics.trade_plan import build_trade_plan
+    from backend.core.constants import GE_TAX_RATE, GE_TAX_CAP, GE_TAX_FREE_BELOW
+
+    liq = m.get("liquidity_score", 0.0) or 0.0
+    liq_100 = liq * 100.0 if liq <= 1.0 else liq   # normalise to 0..100
+
+    raw = build_trade_plan(
+        buy_price=int(m.get("recommended_buy", 0) or 0),
+        sell_price=int(m.get("recommended_sell", 0) or 0),
+        item_limit=m.get("item_limit") or m.get("buy_limit") or None,
+        liquidity_score=liq_100 if liq_100 > 0 else None,
+        risk_profile_position_cap_pct=position_cap_pct,
+        capital_gp=capital_gp,
+        ge_tax_rate=GE_TAX_RATE,
+        ge_tax_cap=GE_TAX_CAP,
+        ge_tax_free_below=GE_TAX_FREE_BELOW,
+    )
+    return TradePlan(**raw)
+
+
+# Position cap per risk profile (mirrors portfolio optimizer thresholds)
+_PROFILE_POSITION_CAP = {
+    "conservative": 0.08,
+    "balanced":     0.15,
+    "aggressive":   0.20,
+}
+
+
+def _to_summary(m: dict, capital_gp: int = 0, position_cap_pct: float = 0.15) -> FlipSummary:
     conf = m.get("confidence", 0.0) or 0.0
     conf_pct = conf * 100.0 if conf <= 1.0 else conf
+    import backend.config as _cfg
+    effective_capital = capital_gp if capital_gp > 0 else _cfg.DEFAULT_CAPITAL_GP
+    trade_plan = _build_trade_plan_for(m, effective_capital, position_cap_pct)
     return FlipSummary(
         item_id=m["item_id"],
         item_name=m.get("item_name", ""),
@@ -125,6 +159,7 @@ def _to_summary(m: dict) -> FlipSummary:
         stable_for_minutes=m.get("stable_for_minutes", 0.0),
         dump_risk_score=m.get("dump_risk_score", 0.0),
         dump_signal=m.get("dump_signal", "none"),
+        trade_plan=trade_plan,
     )
 
 
@@ -247,7 +282,11 @@ async def get_top_flips(
     _sort_key = {"score": "total_score", "roi": "roi_pct", "gp_per_hour": "gp_per_hour"}.get(sort_by, "total_score")
     filtered.sort(key=lambda m: m.get(_sort_key, 0), reverse=True)
 
-    flips = [_to_summary(m) for m in filtered[:limit]]
+    import backend.config as _cfg
+    capital_gp = getattr(ctx, "capital_gp", None) or _cfg.DEFAULT_CAPITAL_GP
+    profile_key = getattr(active_profile, "value", active_profile)
+    pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
+    flips = [_to_summary(m, capital_gp=capital_gp, position_cap_pct=pos_cap) for m in filtered[:limit]]
     return FlipsTopResponse(count=len(flips), generated_at=datetime.utcnow(), flips=flips)
 
 
@@ -274,11 +313,16 @@ async def get_top5_runelite(
         active_profile = ctx.risk_profile.value
 
     import backend.flip_cache as _flip_cache
+    import backend.config as _cfg
     cached_items = _flip_cache.get_top5(active_profile)
 
     def _conf_pct(m: dict) -> float:
         v = m.get("confidence", 0.0) or 0.0
         return v * 100.0 if v <= 1.0 else v
+
+    capital_gp = getattr(ctx, "capital_gp", None) or _cfg.DEFAULT_CAPITAL_GP
+    profile_key = getattr(active_profile, "value", active_profile)
+    pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
 
     flips = [
         RuneLiteFlip(
@@ -295,6 +339,7 @@ async def get_top5_runelite(
             stable_for_minutes=m.get("stable_for_minutes", 0.0),
             dump_risk_score=m.get("dump_risk_score", 0.0),
             dump_signal=m.get("dump_signal", "none"),
+            trade_plan=_build_trade_plan_for(m, capital_gp, pos_cap),
         )
         for m in cached_items
     ]

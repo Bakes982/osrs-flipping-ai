@@ -19,6 +19,20 @@ from pydantic import BaseModel, Field, RootModel
 
 
 # ---------------------------------------------------------------------------
+# Trade plan (build_trade_plan output — additive to any flip payload)
+# ---------------------------------------------------------------------------
+
+class TradePlan(BaseModel):
+    """Deterministic trade sizing plan for one flip opportunity."""
+    buy_price: int
+    sell_price: int
+    qty_to_buy: int
+    profit_per_item: int
+    total_profit: int
+    max_invest_gp: int
+
+
+# ---------------------------------------------------------------------------
 # Shared primitives
 # ---------------------------------------------------------------------------
 
@@ -145,6 +159,8 @@ class FlipSummary(BaseModel):
     # PR11 dump detection
     dump_risk_score: float   = 0.0
     dump_signal:     str     = "none"
+    # Trade plan
+    trade_plan: Optional[TradePlan] = None
 
 
 class FlipsTopResponse(BaseModel):
@@ -234,6 +250,8 @@ class RuneLiteFlip(BaseModel):
     # PR11 dump fields
     dump_risk:  float   = Field(0.0, alias="dump_risk_score")
     dump_sig:   str     = Field("none", alias="dump_signal")
+    # Trade plan
+    trade_plan: Optional[TradePlan] = None
 
     class Config:
         populate_by_name = True

@@ -86,3 +86,9 @@ DUMP_SPICE_VETO_THRESHOLD = float(os.environ.get("DUMP_SPICE_VETO_THRESHOLD", "5
 BACKTEST_ADMIN_KEY = os.environ.get("BACKTEST_ADMIN_KEY", "")
 # Maximum days of history a single backtest request may span.
 BACKTEST_MAX_DAYS = int(os.environ.get("BACKTEST_MAX_DAYS", "30"))
+
+# ---------------------------------------------------------------------------
+# Trade plan — capital and position sizing defaults
+# ---------------------------------------------------------------------------
+# Default capital used by build_trade_plan() when no user-level capital is set.
+DEFAULT_CAPITAL_GP = int(os.environ.get("DEFAULT_CAPITAL_GP", "50000000"))
