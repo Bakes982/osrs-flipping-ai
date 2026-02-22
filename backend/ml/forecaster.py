@@ -72,6 +72,10 @@ class MultiHorizonForecaster:
       - confidence_model: LGBMRegressor -> prediction error magnitude
     """
 
+    # Track dirs we already warned about to avoid repeating the same warning
+    # across many short-lived predictor instances.
+    _missing_manifest_warned_dirs: set[str] = set()
+
     def __init__(self, model_dir: str = "models"):
         self.model_dir = model_dir
         self.models: Dict[str, Any] = {}  # key: "{horizon}_{target}" -> model
@@ -394,7 +398,11 @@ class MultiHorizonForecaster:
         """
         manifest_path = os.path.join(self.model_dir, "manifest.json")
         if not os.path.exists(manifest_path):
-            logger.warning(f"No model manifest found at {manifest_path}")
+            if self.model_dir not in MultiHorizonForecaster._missing_manifest_warned_dirs:
+                logger.warning(f"No model manifest found at {manifest_path}")
+                MultiHorizonForecaster._missing_manifest_warned_dirs.add(self.model_dir)
+            else:
+                logger.debug(f"No model manifest found at {manifest_path}")
             return 0
 
         with open(manifest_path, "r") as f:
