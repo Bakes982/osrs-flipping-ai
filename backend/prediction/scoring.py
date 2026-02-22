@@ -369,7 +369,7 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         "spread_compression": decay_penalty,
         "fill_probability": fill_probability,
     }
-    dump_score, dump_signal = _compute_dump_risk(_dump_input, snapshots)
+    dump_score, dump_signal = _compute_dump_risk(_dump_input, points)
     dump_risk_score = round(dump_score, 2)
     if dump_signal == "high":
         final_score = max(0.0, final_score - 30.0)
@@ -542,8 +542,15 @@ def _compute_dump_risk(result: dict, snapshots: list) -> tuple[float, str]:
     # Each snapshot is spaced ~1 min apart in the data model
     n_snaps = max(1, window)
     if len(snapshots) >= n_snaps + 1:
-        def _mid(s) -> float:
-            return ((s.instant_buy or 0) + (s.instant_sell or 0)) / 2.0 or _TINY
+        def _mid(p) -> float:
+            # p is either a normalized points dict (has "mid") or a snapshot object/dict
+            if isinstance(p, dict):
+                return p.get("mid") or (
+                    ((p.get("instant_buy") or p.get("high") or 0)
+                     + (p.get("instant_sell") or p.get("low") or 0)) / 2.0
+                ) or _TINY
+            return ((getattr(p, "instant_buy", 0) or 0)
+                    + (getattr(p, "instant_sell", 0) or 0)) / 2.0 or _TINY
 
         old_mid = _mid(snapshots[-(n_snaps + 1)])
         new_mid = _mid(snapshots[-1])
