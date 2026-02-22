@@ -31,12 +31,20 @@ class Predictor:
     - Falls back to statistical methods if no trained models exist
     """
 
+    # Process-wide model discovery cache to avoid repeated manifest checks
+    # when multiple Predictor instances are created.
+    _GLOBAL_MODELS_CHECKED = False
+    _GLOBAL_MODELS_AVAILABLE = False
+
     def __init__(self, model_dir: str = "models"):
         self.feature_engine = FeatureEngine()
         self.forecaster = MultiHorizonForecaster(model_dir=model_dir)
         self._models_loaded = False
         # Avoid retrying model discovery on every prediction when no manifest/models exist.
         self._models_checked = False
+        if Predictor._GLOBAL_MODELS_CHECKED and not Predictor._GLOBAL_MODELS_AVAILABLE:
+            # If process-wide discovery already proved no models, skip local checks.
+            self._models_checked = True
         self._feature_cache: Dict[int, Dict[str, Any]] = {}  # item_id -> {features, ts}
         self._cache_ttl = 60  # seconds
 
@@ -56,6 +64,8 @@ class Predictor:
         count = self.forecaster.load_models()
         self._models_checked = True
         self._models_loaded = count > 0
+        Predictor._GLOBAL_MODELS_CHECKED = True
+        Predictor._GLOBAL_MODELS_AVAILABLE = self._models_loaded
         logger.info(
             f"Predictor initialized: {count} models loaded, "
             f"ML {'enabled' if self._models_loaded else 'disabled (using statistical fallback)'}"
