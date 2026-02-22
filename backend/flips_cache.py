@@ -109,25 +109,32 @@ def warm_flip_caches_sync(
 
     now = datetime.now(timezone.utc)
     cache_ts = now.isoformat()
-    for profile in profiles:
-        top100 = compute_scored_opportunities_sync(
-            limit=100,
-            min_score=min_score,
-            profile=profile,
-            min_confidence_pct=min_confidence_pct,
-        )
-        top5 = top100[:5]
-
-        cache.set_json(f"flips:top5:{profile}", {"ts": cache_ts, "flips": top5}, ttl_seconds=ttl)
-        cache.set_json(f"flips:top100:{profile}", {"ts": cache_ts, "flips": top100}, ttl_seconds=ttl)
-        cache.set_json(
-            f"flips:stats:{profile}",
-            {"ts": cache_ts, "count": len(top100), "top_score": (top100[0]["total_score"] if top100 else 0)},
-            ttl_seconds=ttl,
-        )
-        warmed_counts[profile] = len(top100)
-
+    # Mark cache activity early so status endpoints can detect an active worker
+    # even while warming profiles in sequence.
     cache.set("flips:last_updated_ts", cache_ts, ttl_seconds=ttl)
+    for profile in profiles:
+        try:
+            top100 = compute_scored_opportunities_sync(
+                limit=100,
+                min_score=min_score,
+                profile=profile,
+                min_confidence_pct=min_confidence_pct,
+            )
+            top5 = top100[:5]
+
+            cache.set_json(f"flips:top5:{profile}", {"ts": cache_ts, "flips": top5}, ttl_seconds=ttl)
+            cache.set_json(f"flips:top100:{profile}", {"ts": cache_ts, "flips": top100}, ttl_seconds=ttl)
+            cache.set_json(
+                f"flips:stats:{profile}",
+                {"ts": cache_ts, "count": len(top100), "top_score": (top100[0]["total_score"] if top100 else 0)},
+                ttl_seconds=ttl,
+            )
+            warmed_counts[profile] = len(top100)
+            cache.set("flips:last_updated_ts", cache_ts, ttl_seconds=ttl)
+        except Exception:
+            warmed_counts[profile] = 0
+            continue
+
     return warmed_counts
 
 

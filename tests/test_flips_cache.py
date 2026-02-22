@@ -33,6 +33,26 @@ def test_warm_flip_caches_writes_expected_keys(monkeypatch):
     assert len(top100["flips"]) == 2
 
 
+def test_warm_flip_caches_sets_last_updated_even_if_profile_fails(monkeypatch):
+    reset_cache_backend_for_tests()
+    calls = {"count": 0}
+
+    def _fake_compute(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("boom")
+        return [{"item_id": 2, "item_name": "Item 2", "total_score": 55.0}]
+
+    monkeypatch.setattr(flips_cache, "compute_scored_opportunities_sync", _fake_compute)
+
+    warmed = flips_cache.warm_flip_caches_sync(profiles=("conservative", "balanced"))
+    assert warmed["conservative"] == 0
+    assert warmed["balanced"] == 1
+
+    cache = get_cache_backend()
+    assert isinstance(cache.get("flips:last_updated_ts"), str)
+
+
 def test_compute_scored_opportunities_skips_stale_snapshots(monkeypatch):
     class FakeDB:
         def close(self):
