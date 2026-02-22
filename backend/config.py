@@ -121,6 +121,15 @@ BACKTEST_MAX_DAYS = int(os.environ.get("BACKTEST_MAX_DAYS", "30"))
 DEFAULT_CAPITAL_GP = int(os.environ.get("DEFAULT_CAPITAL_GP", "50000000"))
 
 # ---------------------------------------------------------------------------
+# Dump alert v2 — improved filtering and cooldown
+# ---------------------------------------------------------------------------
+# Minimum buy price (GP) for an item to produce a dump alert.
+DUMP_ALERT_MIN_PRICE_GP = int(os.environ.get("DUMP_ALERT_MIN_PRICE_GP", "100000"))
+# Minimum net profit (GP) for an item to produce a dump alert.
+DUMP_ALERT_MIN_PROFIT_GP = int(os.environ.get("DUMP_ALERT_MIN_PROFIT_GP", "10000"))
+# Minutes of silence per item after a dump alert fires.
+DUMP_ALERT_COOLDOWN_MINUTES = int(os.environ.get("DUMP_ALERT_COOLDOWN_MINUTES", "60"))
+# ---------------------------------------------------------------------------
 # Dump Detector v2 — quality filters for actionable alerts
 # ---------------------------------------------------------------------------
 # Minimum insta-sell price to consider (skip cheap junk).

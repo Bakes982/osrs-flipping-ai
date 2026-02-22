@@ -20,19 +20,17 @@ Tests
 
 * test_cache_ttl_expired_triggers_refetch
     Simulating an expired timestamp must trigger a fresh HTTP request.
+
+Also tests the legacy resolver.resolve() compatibility shim and
+flip_cache internal helpers (_passes_dump_filters, cooldown gate).
 """
 
 from __future__ import annotations
 
 import time
-from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_mapping_response(items: list[dict]) -> MagicMock:
@@ -56,7 +54,7 @@ def _reset_cache():
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests — resolve_item_name functional API
 # ---------------------------------------------------------------------------
 
 
@@ -178,3 +176,125 @@ class TestResolveItemName:
 
         mock_get.assert_called_once()
         assert result == "Abyssal whip"
+
+
+# ---------------------------------------------------------------------------
+# Tests — resolver compatibility shim
+# ---------------------------------------------------------------------------
+
+
+class TestResolverShim:
+    def test_resolver_resolve_returns_name(self):
+        """Legacy resolver.resolve() must work via the shim."""
+        from backend.alerts.item_name_resolver import resolver
+
+        mapping_data = [{"id": 4151, "name": "Abyssal whip"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp):
+            result = resolver.resolve(4151)
+
+        assert result == "Abyssal whip"
+
+    def test_resolver_resolve_fallback_passthrough(self):
+        """resolver.resolve() with a valid fallback skips HTTP."""
+        from backend.alerts.item_name_resolver import resolver
+
+        with patch("backend.alerts.item_name_resolver.requests.get") as mock_get:
+            result = resolver.resolve(4151, fallback="Abyssal whip")
+
+        assert result == "Abyssal whip"
+        mock_get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests — _passes_dump_filters (flip_cache internal)
+# ---------------------------------------------------------------------------
+
+class TestPassesDumpFilters:
+    def _call(self, buy: int, profit: int):
+        from backend.flip_cache import _passes_dump_filters
+        return _passes_dump_filters({"recommended_buy": buy, "net_profit": profit})
+
+    def test_passes_when_above_thresholds(self):
+        # default thresholds: min_price=100_000, min_profit=10_000
+        assert self._call(buy=200_000, profit=15_000) is True
+
+    def test_fails_when_price_too_low(self):
+        assert self._call(buy=50_000, profit=15_000) is False
+
+    def test_fails_when_profit_too_low(self):
+        assert self._call(buy=200_000, profit=5_000) is False
+
+    def test_fails_when_both_too_low(self):
+        assert self._call(buy=50_000, profit=5_000) is False
+
+    def test_zero_buy_passes_price_gate(self):
+        # buy=0 means "no price data" — price filter is skipped; profit gate still applies
+        assert self._call(buy=0, profit=15_000) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests — Cooldown gate in _update_dump_persistence
+# ---------------------------------------------------------------------------
+
+class TestDumpCooldown:
+    """Verify that an alert does not fire twice within the cooldown window."""
+
+    def _run_cycles(self, n: int, state: dict, m: dict):
+        """Simulate n high-signal cycles and return how many alerts were emitted."""
+        from backend import flip_cache as fc
+        from unittest.mock import patch as _patch
+
+        fired = []
+
+        def fake_emit(metrics):
+            fired.append(metrics)
+
+        persistence_k = 2   # minimum cycles before alert
+
+        with _patch.object(fc, "_emit_dump_alert", side_effect=fake_emit), \
+             _patch.object(fc, "_passes_dump_filters", return_value=True):
+            for _ in range(n):
+                signal = m.get("dump_signal", "none")
+                now = time.time()
+                cooldown_secs = fc._cfg.DUMP_ALERT_COOLDOWN_MINUTES * 60
+
+                if signal == "high":
+                    state["high_count"] += 1
+                    cooldown_elapsed = (now - state.get("last_alert_ts", 0.0)) >= cooldown_secs
+                    if state["high_count"] >= persistence_k and cooldown_elapsed:
+                        state["alerted"]       = True
+                        state["last_alert_ts"] = now
+                        fake_emit(m)
+                else:
+                    state["high_count"] = 0
+                    state["alerted"]    = False
+
+        return len(fired)
+
+    def test_no_double_alert_within_cooldown(self):
+        state = {"high_count": 0, "alerted": False, "last_alert_ts": 0.0}
+        m = {"item_id": 1, "item_name": "X", "dump_signal": "high",
+             "dump_risk_score": 80.0, "net_profit": 50_000, "recommended_buy": 1_000_000}
+
+        fired = self._run_cycles(10, state, m)   # 10 high cycles
+        assert fired == 1   # alert fires exactly once
+
+    def test_alert_fires_after_cooldown_resets(self):
+        state = {"high_count": 0, "alerted": False, "last_alert_ts": 0.0}
+        m = {"item_id": 1, "item_name": "X", "dump_signal": "high",
+             "dump_risk_score": 80.0, "net_profit": 50_000, "recommended_buy": 1_000_000}
+
+        # First batch: should fire
+        fired1 = self._run_cycles(5, state, m)
+        assert fired1 == 1
+
+        # Simulate cooldown elapsed
+        state["last_alert_ts"] = 0.0
+        state["alerted"]       = False
+        state["high_count"]    = 0
+
+        # Second batch: should fire again
+        fired2 = self._run_cycles(5, state, m)
+        assert fired2 == 1

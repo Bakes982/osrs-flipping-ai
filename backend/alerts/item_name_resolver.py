@@ -8,11 +8,17 @@ alerts by ensuring the mapping is always fresh and correctly indexed.
 Public API
 ----------
     resolve_item_name(item_id, fallback=None) -> str
+    invalidate_cache() -> None
 
 Resolution order:
     1. If ``fallback`` is non-empty and does NOT start with "Item " → return it.
     2. Look up the OSRS Wiki mapping (6-hour TTL cache) → return name.
     3. Return f"Item {item_id}" as a last resort.
+
+Compatibility
+-------------
+A ``resolver`` singleton is also provided for legacy callers that use
+``resolver.resolve(item_id, fallback="")``.
 """
 
 from __future__ import annotations
@@ -132,3 +138,18 @@ def invalidate_cache() -> None:
     global _mapping_cache, _mapping_cache_ts
     _mapping_cache = None
     _mapping_cache_ts = None
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim for legacy callers using resolver.resolve(item_id)
+# ---------------------------------------------------------------------------
+
+class _ResolverCompat:
+    """Thin wrapper around resolve_item_name() for legacy callers."""
+
+    def resolve(self, item_id: int, fallback: str = "") -> str:
+        return resolve_item_name(item_id, fallback if fallback else None)
+
+
+# Module-level singleton shared across the process
+resolver = _ResolverCompat()
