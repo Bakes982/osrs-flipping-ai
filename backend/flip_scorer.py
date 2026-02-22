@@ -1,9 +1,13 @@
 """
 Flip Scorer – composite 0-100 scoring system for flip quality.
 
-Designed to achieve 80%+ win rate by aggressively filtering out
-bad flips using multiple independent signals. Each signal has a
-veto threshold that can reject an item entirely.
+NOTE: As of the Phase 1 architecture refactor, all scoring, ROI, volatility,
+and risk calculations are delegated to the canonical
+``backend.prediction.scoring.calculate_flip_metrics`` function.
+
+This module now acts as a typed adapter: it calls ``calculate_flip_metrics``
+and maps the result back into the ``FlipScore`` dataclass that the rest of
+the system already expects, so no callers need to be updated.
 
 Score breakdown (100 points max):
   - Spread quality    (25 pts)  – is the margin in the 0.5-2% sweet spot?
@@ -127,10 +131,16 @@ class FlipScorer:
         snapshots: Optional[List[PriceSnapshot]] = None,
         flips: Optional[List[FlipHistory]] = None,
     ) -> FlipScore:
-        """Score a single item. Returns FlipScore with vetoes and component scores."""
+        """Score a single item via the canonical ``calculate_flip_metrics`` engine.
+
+        All calculation logic lives in ``backend.prediction.scoring``.  This
+        method loads any missing data from the DB, delegates to the canonical
+        function, and maps the result back into a ``FlipScore`` dataclass.
+        """
+        from backend.prediction.scoring import calculate_flip_metrics
+
         fs = FlipScore(item_id=item_id, item_name=item_name)
 
-        # Only open a DB connection when we actually need data
         need_db = snapshots is None or flips is None
         db = get_db() if need_db else None
         try:
@@ -138,109 +148,71 @@ class FlipScorer:
                 snapshots = get_price_history(db, item_id, hours=4)
             if flips is None:
                 flips = get_item_flips(db, item_id, days=30)
-
-            if not snapshots:
-                fs.vetoed = True
-                fs.veto_reasons.append("No price data")
-                return fs
-
-            # Run SmartPricer
-            rec = self.pricer.price_item(item_id, snapshots=snapshots)
-            fs.recommended_buy = rec.recommended_buy
-            fs.recommended_sell = rec.recommended_sell
-            fs.expected_profit = rec.expected_profit
-            fs.expected_profit_pct = rec.expected_profit_pct
-            fs.tax = rec.tax
-            fs.trend = rec.trend.value
-            fs.confidence = rec.confidence
-            fs.volume_5m = rec.volume_5m
-            fs.instant_buy = rec.instant_buy
-            fs.instant_sell = rec.instant_sell
-
-            if not rec.instant_buy or not rec.instant_sell:
-                fs.vetoed = True
-                fs.veto_reasons.append("Missing buy or sell price")
-                return fs
-
-            fs.spread = rec.instant_buy - rec.instant_sell
-            fs.spread_pct = (fs.spread / rec.instant_sell * 100) if rec.instant_sell > 0 else 0
-
-            # ---- HARD VETOES ----
-            self._check_vetoes(fs, rec, snapshots)
-            if fs.vetoed:
-                return fs
-
-            # ---- COMPONENT SCORING ----
-            fs.spread_score = self._score_spread(fs, rec)
-            fs.volume_score = self._score_volume(fs, rec, snapshots)
-            fs.freshness_score = self._score_freshness(rec, snapshots)
-            fs.trend_score = self._score_trend(rec)
-            fs.history_score = self._score_history(fs, flips)
-            fs.stability_score = self._score_stability(snapshots)
-            fs.ml_score = self._score_ml(fs, item_id, snapshots, flips)
-
-            # Composite weighted score
-            # If ML models aren't trained, redistribute ML weight to others
-            if fs.ml_score < 0:
-                # ML unavailable — use original weights without ML
-                fs.ml_score = 0
-                ml_weight = 0
-                non_ml_total = sum(
-                    v for k, v in self.WEIGHTS.items() if k != "ml"
-                )
-                fs.total_score = (
-                    fs.spread_score * (self.WEIGHTS["spread"] / non_ml_total)
-                    + fs.volume_score * (self.WEIGHTS["volume"] / non_ml_total)
-                    + fs.freshness_score * (self.WEIGHTS["freshness"] / non_ml_total)
-                    + fs.trend_score * (self.WEIGHTS["trend"] / non_ml_total)
-                    + fs.history_score * (self.WEIGHTS["history"] / non_ml_total)
-                    + fs.stability_score * (self.WEIGHTS["stability"] / non_ml_total)
-                )
-            else:
-                fs.total_score = (
-                    fs.spread_score * self.WEIGHTS["spread"]
-                    + fs.volume_score * self.WEIGHTS["volume"]
-                    + fs.freshness_score * self.WEIGHTS["freshness"]
-                    + fs.trend_score * self.WEIGHTS["trend"]
-                    + fs.history_score * self.WEIGHTS["history"]
-                    + fs.stability_score * self.WEIGHTS["stability"]
-                    + fs.ml_score * self.WEIGHTS["ml"]
-                )
-
-            # Apply SmartPricer confidence as a multiplier
-            fs.total_score *= max(0.3, rec.confidence)
-
-            # Price-range multiplier — data from 1,522 Copilot trades:
-            #   10M-50M:  sweet spot (93% WR, 144K avg/flip, 150K GP/hr)
-            #   50M+:     strong (83% WR, 322K avg/flip)
-            #   1M-10M:   solid
-            #   <10K:     good for bulk (46K avg/flip via volume)
-            #   10K-100K: neutral
-            #   100K-1M:  WORST bracket (-7.9M net loss!) — overcompeted
-            mid_price = (rec.instant_buy + rec.instant_sell) // 2 if rec.instant_buy and rec.instant_sell else 0
-            if mid_price > 0:
-                if 10_000_000 <= mid_price <= 50_000_000:
-                    fs.total_score *= 1.15   # best bracket
-                elif mid_price > 50_000_000:
-                    fs.total_score *= 1.10   # strong
-                elif 1_000_000 <= mid_price < 10_000_000:
-                    fs.total_score *= 1.05   # solid
-                elif mid_price < 10_000:
-                    fs.total_score *= 1.05   # bulk flipping works
-                elif 100_000 <= mid_price < 1_000_000:
-                    fs.total_score *= 0.90   # historically weaker bracket
-                # 10K-100K stays at 1.0 (neutral)
-
-            # Cap at 100
-            fs.total_score = min(100, fs.total_score)
-
-            # Generate human-readable reason
-            fs.reason = self._build_reason(fs, rec)
-
         finally:
             if db is not None:
                 db.close()
 
+        if not snapshots:
+            fs.vetoed = True
+            fs.veto_reasons.append("No price data")
+            return fs
+
+        latest = snapshots[-1]
+        item_data = {
+            "item_id": item_id,
+            "item_name": item_name,
+            "instant_buy": latest.instant_buy,
+            "instant_sell": latest.instant_sell,
+            "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
+            "buy_time": latest.buy_time,
+            "sell_time": latest.sell_time,
+            "snapshots": snapshots,
+            "flip_history": flips,
+        }
+
+        m = calculate_flip_metrics(item_data)
+
+        # Try to inject ML score
+        ml_raw = self._score_ml(fs, item_id, snapshots, flips)
+        if ml_raw >= 0:
+            from backend.prediction.scoring import apply_ml_score
+            apply_ml_score(m, ml_raw)
+
+        # Map canonical dict → FlipScore dataclass
+        fs.recommended_buy = m.get("recommended_buy")
+        fs.recommended_sell = m.get("recommended_sell")
+        fs.expected_profit = m.get("net_profit")
+        fs.expected_profit_pct = m.get("roi_pct")
+        fs.tax = m.get("tax")
+        fs.trend = m.get("trend", "NEUTRAL")
+        fs.confidence = m.get("confidence", 1.0)
+        fs.volume_5m = item_data["volume_5m"]
+        fs.instant_buy = latest.instant_buy
+        fs.instant_sell = latest.instant_sell
+        fs.spread = m.get("spread")
+        fs.spread_pct = m.get("spread_pct")
+
+        fs.vetoed = m.get("vetoed", False)
+        fs.veto_reasons = m.get("veto_reasons", [])
+
+        fs.spread_score = m.get("score_spread", 0)
+        fs.volume_score = m.get("score_volume", 0)
+        fs.freshness_score = m.get("score_freshness", 0)
+        fs.trend_score = m.get("score_trend", 0)
+        fs.history_score = m.get("score_history", 0)
+        fs.stability_score = m.get("score_stability", 0)
+        fs.ml_score = ml_raw
+
+        fs.total_score = m.get("total_score", 0)
+        fs.win_rate = m.get("win_rate")
+        fs.total_flips = m.get("total_flips", 0)
+        fs.avg_profit = m.get("avg_profit")
+
+        fs.ml_direction = m.get("trend")     # best proxy when full ML unavailable
+        fs.ml_confidence = m.get("confidence")
+        fs.ml_method = "canonical"
+
+        fs.reason = m.get("reason", "")
         return fs
 
     # ------------------------------------------------------------------

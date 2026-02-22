@@ -72,7 +72,7 @@ def _direction(current: Optional[int], predicted: Optional[int]) -> str:
 def _fetch_wiki_snapshot(item_id: int):
     """Fetch current prices from the OSRS Wiki API and return a synthetic PriceSnapshot."""
     import requests
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     try:
         url = "https://prices.runescape.wiki/api/v1/osrs/latest"
@@ -92,7 +92,7 @@ def _fetch_wiki_snapshot(item_id: int):
             item_id=item_id,
             instant_buy=high,
             instant_sell=low,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.utcnow(),
             buy_volume=data.get("highPriceVolume", 0),
             sell_volume=data.get("lowPriceVolume", 0),
         )

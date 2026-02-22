@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Bell, Check, Trash2, Plus, AlertTriangle, TrendingUp, TrendingDown, Target, Eye } from 'lucide-react';
+import { Bell, Check, Trash2, Plus, AlertTriangle, TrendingUp, TrendingDown, Target, Eye, Zap } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
@@ -36,6 +36,105 @@ const ALERT_COLORS = {
   ml_signal: 'badge-yellow',
   position_change: 'badge-cyan',
 };
+
+// ---------------------------------------------------------------------------
+// Dump event card — shows bot-dump details with recovery metrics
+// ---------------------------------------------------------------------------
+
+function DumpCard({ alert, onAck, onClick }) {
+  const d = alert.data || {};
+  const priceDrop = d.price_drop_pct;
+  const sellVol   = d.sell_volume;
+  const buyVol    = d.buy_volume;
+  const sellRatio = d.sell_ratio ? Math.round(d.sell_ratio * 100) : null;
+  const profitPer = d.profit_per_item;
+  const curPrice  = d.instant_sell;
+  const avgPrice  = d.avg_sell;
+  const dumpGp    = d.dump_gp_total;
+  const severity  = d.severity ?? 0;
+
+  // Severity colour: 1-3 yellow, 4-6 orange, 7+ red
+  const sevColor = severity >= 7 ? '#ef4444' : severity >= 4 ? '#f97316' : '#eab308';
+
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        padding: '14px 16px',
+        borderBottom: '1px solid var(--border)',
+        cursor: 'pointer',
+        opacity: alert.acknowledged ? 0.45 : 1,
+        borderLeft: `3px solid ${sevColor}`,
+        display: 'grid',
+        gridTemplateColumns: '1fr auto',
+        gap: 8,
+      }}
+    >
+      <div>
+        {/* Header row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+          <Zap size={15} style={{ color: sevColor, flexShrink: 0 }} />
+          <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text-primary)' }}>
+            {alert.item_name}
+          </span>
+          <span style={{
+            fontSize: 11, fontWeight: 700, padding: '1px 7px',
+            borderRadius: 4, background: sevColor + '22', color: sevColor,
+            border: `1px solid ${sevColor}55`,
+          }}>
+            SEV {severity}/10
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{timeAgo(alert.timestamp)}</span>
+        </div>
+
+        {/* Key metrics row */}
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12 }}>
+          <div>
+            <span style={{ color: 'var(--text-muted)' }}>Price </span>
+            <span style={{ color: '#ef4444', fontWeight: 600 }}>▼{priceDrop?.toFixed(1)}%</span>
+            {curPrice && avgPrice && (
+              <span style={{ color: 'var(--text-muted)' }}> ({formatGP(curPrice)} vs avg {formatGP(avgPrice)})</span>
+            )}
+          </div>
+
+          <div>
+            <span style={{ color: 'var(--text-muted)' }}>Volume </span>
+            <span style={{ color: '#f97316', fontWeight: 600 }}>{formatGP(sellVol)} sold</span>
+            <span style={{ color: 'var(--text-muted)' }}> vs {formatGP(buyVol)} bought</span>
+            {sellRatio && (
+              <span style={{ color: '#f97316', fontWeight: 600 }}> ({sellRatio}% sell)</span>
+            )}
+          </div>
+
+          {dumpGp > 0 && (
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>Dump size </span>
+              <span style={{ color: 'var(--text-primary)' }}>{formatGP(dumpGp)} GP</span>
+            </div>
+          )}
+
+          {profitPer > 0 && (
+            <div>
+              <span style={{ color: 'var(--text-muted)' }}>Recovery est. </span>
+              <span style={{ color: '#22c55e', fontWeight: 700 }}>+{formatGP(profitPer)} GP/item</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Ack button */}
+      {!alert.acknowledged && (
+        <button
+          onClick={e => { e.stopPropagation(); onAck(alert.id); }}
+          style={{ background: 'none', border: 'none', color: 'var(--cyan)', cursor: 'pointer', padding: 4, alignSelf: 'center' }}
+          title="Acknowledge"
+        >
+          <Check size={16} />
+        </button>
+      )}
+    </div>
+  );
+}
 
 export default function Alerts() {
   const nav = useNavigate();
@@ -221,6 +320,19 @@ export default function Alerts() {
         ) : (
           <div>
             {filtered.map(a => {
+              // Dump alerts get a specialised card with volume + recovery metrics
+              if (a.alert_type === 'dump') {
+                return (
+                  <DumpCard
+                    key={a.id}
+                    alert={a}
+                    onAck={handleAck}
+                    onClick={() => a.item_id && nav(`/item/${a.item_id}`)}
+                  />
+                );
+              }
+
+              // Generic alert row for all other types
               const Icon = ALERT_ICONS[a.alert_type] || Bell;
               const color = ALERT_COLORS[a.alert_type] || 'badge-cyan';
               return (
@@ -230,7 +342,7 @@ export default function Alerts() {
                   opacity: a.acknowledged ? 0.5 : 1,
                   cursor: 'pointer',
                 }} onClick={() => a.item_id && nav(`/item/${a.item_id}`)}>
-                  <Icon size={18} style={{ color: `var(--${a.alert_type === 'dump' ? 'red' : a.alert_type === 'opportunity' ? 'green' : 'cyan'})`, flexShrink: 0 }} />
+                  <Icon size={18} style={{ color: `var(--${a.alert_type === 'opportunity' ? 'green' : 'cyan'})`, flexShrink: 0 }} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: a.acknowledged ? 400 : 600, marginBottom: 2 }}>
                       {a.message}

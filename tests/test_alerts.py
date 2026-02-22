@@ -1,145 +1,198 @@
-"""Tests for the Alerts API endpoints."""
+"""
+Unit tests for backend.alerts.monitor — Phase 9.
+
+Tests cover:
+  • Margin alert trigger conditions
+  • Volume spike detection
+  • Trend reversal detection
+  • Alert severity
+  • Discord notifier (mocked)
+  • CompositeNotifier fan-out
+  • AlertMonitor state management
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Skip all tests in this file - they require rewriting for MongoDB backend
-# The skip must happen before imports because the imports will fail (SQLAlchemy objects no longer exist)
-pytest.skip("Tests require rewrite for MongoDB backend", allow_module_level=True)
+from backend.alerts.monitor import (
+    Alert,
+    AlertKind,
+    AlertMonitor,
+    CompositeNotifier,
+    DiscordNotifier,
+    _check_margin,
+    _check_trend_reversal,
+    _check_volume_spike,
+)
 
-# These imports are intentionally unreachable - they would fail if executed
-from unittest.mock import patch, MagicMock
-from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# _check_margin
+# ---------------------------------------------------------------------------
+
+class TestCheckMargin:
+    def test_fires_at_threshold(self):
+        a = _check_margin(4151, "Abyssal whip", 100_000, threshold=100_000)
+        assert a is not None
+        assert a.kind == AlertKind.MARGIN
+
+    def test_fires_above_threshold(self):
+        a = _check_margin(4151, "Abyssal whip", 200_000, threshold=100_000)
+        assert a is not None
+
+    def test_no_fire_below_threshold(self):
+        assert _check_margin(4151, "Abyssal whip", 50_000, threshold=100_000) is None
+
+    def test_zero_profit(self):
+        assert _check_margin(4151, "Abyssal whip", 0, threshold=1) is None
+
+    def test_negative_profit(self):
+        assert _check_margin(4151, "Abyssal whip", -1_000, threshold=1) is None
 
 
-@pytest.fixture(autouse=True)
-def setup_db():
-    """Create tables and clean up for each test."""
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    try:
-        # Clean alerts and settings
-        db.query(Alert).delete()
-        db.query(Setting).filter(Setting.key == "price_alerts").delete()
-        db.commit()
-    finally:
-        db.close()
-    yield
-    db = SessionLocal()
-    try:
-        db.query(Alert).delete()
-        db.query(Setting).filter(Setting.key == "price_alerts").delete()
-        db.commit()
-    finally:
-        db.close()
+# ---------------------------------------------------------------------------
+# _check_volume_spike
+# ---------------------------------------------------------------------------
 
+class TestCheckVolumeSpike:
+    def test_fires_at_3x(self):
+        a = _check_volume_spike(1, "Item", current_vol=300, avg_vol=100.0, spike_multiplier=3.0)
+        assert a is not None
+        assert a.kind == AlertKind.VOLUME_SPIKE
+
+    def test_no_fire_below_3x(self):
+        assert _check_volume_spike(1, "Item", current_vol=299, avg_vol=100.0, spike_multiplier=3.0) is None
+
+    def test_zero_avg_no_fire(self):
+        assert _check_volume_spike(1, "Item", current_vol=9999, avg_vol=0.0) is None
+
+    def test_data_contains_ratio(self):
+        a = _check_volume_spike(1, "Item", current_vol=600, avg_vol=100.0, spike_multiplier=3.0)
+        assert "ratio" in a.data
+
+
+# ---------------------------------------------------------------------------
+# _check_trend_reversal
+# ---------------------------------------------------------------------------
+
+class TestCheckTrendReversal:
+    @pytest.mark.parametrize("prev,new", [
+        ("UP", "DOWN"),
+        ("UP", "STRONG_DOWN"),
+        ("STRONG_UP", "DOWN"),
+        ("DOWN", "UP"),
+        ("STRONG_DOWN", "STRONG_UP"),
+    ])
+    def test_fires_on_reversal(self, prev, new):
+        a = _check_trend_reversal(1, "Item", prev, new, price=1_000_000)
+        assert a is not None
+        assert a.kind == AlertKind.TREND_REVERSAL
+
+    @pytest.mark.parametrize("prev,new", [
+        ("UP", "UP"),
+        ("NEUTRAL", "NEUTRAL"),
+        ("UP", "STRONG_UP"),
+        ("DOWN", "STRONG_DOWN"),
+    ])
+    def test_no_fire_same_direction(self, prev, new):
+        assert _check_trend_reversal(1, "Item", prev, new, price=1_000_000) is None
+
+    def test_strong_reversal_is_warning(self):
+        a = _check_trend_reversal(1, "Item", "STRONG_UP", "STRONG_DOWN", price=1_000_000)
+        assert a is not None
+        assert a.severity == "WARNING"
+
+
+# ---------------------------------------------------------------------------
+# Alert dataclass
+# ---------------------------------------------------------------------------
 
 class TestAlertModel:
-    """Test Alert DB operations."""
+    def test_default_timestamp(self):
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        assert isinstance(a.timestamp, datetime)
 
-    def test_create_alert(self):
-        db = SessionLocal()
-        try:
-            alert = Alert(
-                item_id=13652,
-                item_name="Dragon claws",
-                alert_type="opportunity",
-                message="High-score opportunity: Dragon claws (score 82)",
-                data={"score": 82.0, "profit": 500000},
-            )
-            db.add(alert)
-            db.commit()
-
-            result = db.query(Alert).filter(Alert.item_id == 13652).first()
-            assert result is not None
-            assert result.alert_type == "opportunity"
-            assert result.acknowledged is False
-            assert result.data["score"] == 82.0
-        finally:
-            db.close()
-
-    def test_acknowledge_alert(self):
-        db = SessionLocal()
-        try:
-            alert = Alert(
-                item_id=1, item_name="Test", alert_type="dump",
-                message="Test dump alert",
-            )
-            db.add(alert)
-            db.commit()
-            alert_id = alert.id
-
-            # Acknowledge
-            db.query(Alert).filter(Alert.id == alert_id).update({"acknowledged": True})
-            db.commit()
-
-            result = db.query(Alert).filter(Alert.id == alert_id).first()
-            assert result.acknowledged is True
-        finally:
-            db.close()
-
-    def test_multiple_alert_types(self):
-        db = SessionLocal()
-        try:
-            for atype in ["price_target", "dump", "opportunity", "ml_signal"]:
-                db.add(Alert(
-                    item_id=1, item_name="Test", alert_type=atype,
-                    message=f"Test {atype}",
-                ))
-            db.commit()
-
-            all_alerts = db.query(Alert).all()
-            assert len(all_alerts) == 4
-            types = {a.alert_type for a in all_alerts}
-            assert types == {"price_target", "dump", "opportunity", "ml_signal"}
-        finally:
-            db.close()
+    def test_default_severity(self):
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        assert a.severity == "INFO"
 
 
-class TestPriceTargets:
-    """Test price target storage in settings."""
+# ---------------------------------------------------------------------------
+# DiscordNotifier
+# ---------------------------------------------------------------------------
 
-    def test_store_price_targets(self):
-        from backend.database import get_setting, set_setting
-        db = SessionLocal()
-        try:
-            targets = [
-                {"item_id": 13652, "item_name": "Dragon claws", "target_price": 50_000_000, "direction": "below"},
-                {"item_id": 11802, "item_name": "Armadyl godsword", "target_price": 20_000_000, "direction": "above"},
-            ]
-            set_setting(db, "price_alerts", targets)
+class TestDiscordNotifier:
+    @pytest.mark.asyncio
+    async def test_empty_url_returns_false(self):
+        n = DiscordNotifier("")
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        assert await n.send(a) is False
 
-            loaded = get_setting(db, "price_alerts", default=[])
-            assert len(loaded) == 2
-            assert loaded[0]["item_id"] == 13652
-            assert loaded[1]["direction"] == "above"
-        finally:
-            db.close()
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not __import__("importlib").util.find_spec("httpx"), reason="httpx not installed")
+    async def test_successful_send(self):
+        n = DiscordNotifier("https://example.com/hook")
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=ctx)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        ctx.post = AsyncMock(return_value=mock_resp)
+        with patch("backend.alerts.monitor.httpx.AsyncClient", return_value=ctx):
+            result = await n.send(a)
+        assert result is True
 
-    def test_remove_triggered_target(self):
-        from backend.database import get_setting, set_setting
-        db = SessionLocal()
-        try:
-            targets = [
-                {"item_id": 1, "target_price": 100, "direction": "below"},
-                {"item_id": 2, "target_price": 200, "direction": "above"},
-            ]
-            set_setting(db, "price_alerts", targets)
 
-            # Simulate removing triggered target
-            remaining = [t for t in targets if t["item_id"] != 1]
-            set_setting(db, "price_alerts", remaining)
+# ---------------------------------------------------------------------------
+# CompositeNotifier
+# ---------------------------------------------------------------------------
 
-            loaded = get_setting(db, "price_alerts", default=[])
-            assert len(loaded) == 1
-            assert loaded[0]["item_id"] == 2
-        finally:
-            db.close()
+class TestCompositeNotifier:
+    @pytest.mark.asyncio
+    async def test_fans_out_to_all(self):
+        n1 = MagicMock(spec=DiscordNotifier)
+        n1.send = AsyncMock(return_value=True)
+        n2 = MagicMock(spec=DiscordNotifier)
+        n2.send = AsyncMock(return_value=False)
+        composite = CompositeNotifier([n1, n2])
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        result = await composite.send(a)
+        assert result is True
+        n1.send.assert_awaited_once()
+        n2.send.assert_awaited_once()
 
-    def test_empty_targets_default(self):
-        from backend.database import get_setting
-        db = SessionLocal()
-        try:
-            loaded = get_setting(db, "price_alerts", default=[])
-            assert loaded == []
-        finally:
-            db.close()
+    @pytest.mark.asyncio
+    async def test_returns_false_if_all_fail(self):
+        n1 = MagicMock(spec=DiscordNotifier)
+        n1.send = AsyncMock(return_value=False)
+        composite = CompositeNotifier([n1])
+        a = Alert(kind=AlertKind.MARGIN, item_id=1, item_name="x", message="y")
+        result = await composite.send(a)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# AlertMonitor state
+# ---------------------------------------------------------------------------
+
+class TestAlertMonitorState:
+    def test_empty_state_on_init(self):
+        monitor = AlertMonitor()
+        assert monitor._state == {}
+
+    def test_state_set_manually(self):
+        monitor = AlertMonitor()
+        monitor._state[1] = {"trend": "UP", "last_alerted": 0.0, "avg_vol": 10.0}
+        assert 1 in monitor._state
+
+    def test_set_notifier(self):
+        monitor = AlertMonitor()
+        n = MagicMock(spec=DiscordNotifier)
+        monitor.set_notifier(n)
+        assert monitor._notifier is n

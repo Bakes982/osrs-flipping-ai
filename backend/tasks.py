@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from backend import config
 from backend.database import (
     get_db,
     PriceSnapshot,
@@ -31,6 +32,7 @@ from backend.database import (
     upsert_item_feature,
     get_item,
     find_active_positions,
+    dismiss_position,
     find_pending_sells,
     get_price_history,
 )
@@ -45,6 +47,10 @@ HEADERS = {"User-Agent": USER_AGENT}
 # In-memory price cache: item_id_str → {high, low, highTime, lowTime}
 # Populated by PriceCollector every 10s; used as fallback when DB has no snapshots.
 _price_cache: Dict = {}
+
+# In-memory 5-minute cache: item_id_str → {avgHighPrice, avgLowPrice, highPriceVolume, lowPriceVolume}
+# Populated by PriceCollector every 60s alongside the /5m fetch.
+_5m_cache: Dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +73,28 @@ class PriceCollector:
         self._last_5m_fetch: float = 0.0
         self._last_store: float = 0.0
         self._client: Optional[httpx.AsyncClient] = None
+        self._consecutive_upstream_failures: int = 0
+        self._circuit_open_until_ts: float = 0.0
+        self._failure_threshold = max(1, int(config.WORKER_CIRCUIT_FAILURE_THRESHOLD))
+        self._circuit_open_seconds = max(10, int(config.WORKER_CIRCUIT_OPEN_SECONDS))
+        self._last_circuit_log_ts: float = 0.0
+
+    def _is_circuit_open(self) -> bool:
+        return time.time() < self._circuit_open_until_ts
+
+    def _record_upstream_success(self) -> None:
+        self._consecutive_upstream_failures = 0
+
+    def _record_upstream_failure(self, endpoint: str, exc: Exception) -> None:
+        self._consecutive_upstream_failures += 1
+        logger.error("Failed to fetch %s: %s", endpoint, exc)
+        if self._consecutive_upstream_failures >= self._failure_threshold:
+            self._circuit_open_until_ts = time.time() + self._circuit_open_seconds
+            self._consecutive_upstream_failures = 0
+            logger.error(
+                "PriceCollector circuit opened for %ss after repeated upstream failures",
+                self._circuit_open_seconds,
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -75,6 +103,8 @@ class PriceCollector:
 
     async def fetch_latest(self) -> Dict:
         """Fetch instant prices from /latest."""
+        if self._is_circuit_open():
+            return self._latest_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/latest")
@@ -82,22 +112,28 @@ class PriceCollector:
             self._latest_data = resp.json().get("data", {})
             # Update global in-memory cache for all items (used by PositionMonitor)
             _price_cache.update(self._latest_data)
+            self._record_upstream_success()
             return self._latest_data
         except Exception as e:
-            logger.error("Failed to fetch /latest: %s", e)
+            self._record_upstream_failure("/latest", e)
             return self._latest_data
 
     async def fetch_5m(self) -> Dict:
         """Fetch 5-minute averaged prices from /5m."""
+        if self._is_circuit_open():
+            return self._5m_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/5m")
             resp.raise_for_status()
             self._5m_data = resp.json().get("data", {})
             self._last_5m_fetch = time.time()
+            # Expose globally so AlertMonitor can access volume data for dump detection
+            _5m_cache.update(self._5m_data)
+            self._record_upstream_success()
             return self._5m_data
         except Exception as e:
-            logger.error("Failed to fetch /5m: %s", e)
+            self._record_upstream_failure("/5m", e)
             return self._5m_data
 
     async def store_snapshots(self) -> int:
@@ -190,6 +226,16 @@ class PriceCollector:
         logger.info("PriceCollector started")
         while True:
             try:
+                if self._is_circuit_open():
+                    now = time.time()
+                    # Log at most once every 15s while open.
+                    if now - self._last_circuit_log_ts > 15:
+                        remaining = int(max(0, self._circuit_open_until_ts - now))
+                        logger.warning("PriceCollector circuit open; retry in %ss", remaining)
+                        self._last_circuit_log_ts = now
+                    await asyncio.sleep(2)
+                    continue
+
                 await self.fetch_latest()
 
                 # Fetch 5m data every 60 seconds
@@ -677,54 +723,180 @@ class AlertMonitor:
             set_setting(db, "price_alerts", new_targets)
 
     def _check_dump_alerts_sync(self, db):
-        """Detect items experiencing rapid price drops (>5% in 15 min). Sync version."""
-        item_ids = get_tracked_item_ids(db)
+        """Detect bot dump events across all ~6000 tradeable items.
+
+        A dump is identified by two simultaneous signals in the /5m data:
+          1. Sell volume >> buy volume  — someone is mass-selling (bots dumping)
+          2. Current price < 5m average — the selling has already pushed the price down
+
+        Both signals together give high confidence that the drop is temporary and
+        will recover once the dump is absorbed, creating a buy opportunity.
+
+        Does NOT rely on MongoDB snapshots — uses the in-memory _price_cache (latest,
+        updated every 10s) and _5m_cache (5m averages + volumes, updated every 60s).
+        This means we can check every item on the GE, not just tracked ones.
+        """
+        if not _price_cache or not _5m_cache:
+            return  # Caches not populated yet
+
         now = datetime.utcnow()
-        cutoff_15m = now - timedelta(minutes=15)
 
-        # Only check top 50 items to limit DB load
-        for item_id in item_ids[:50]:
+        # Thresholds (tuned for OSRS GE dump catching)
+        MIN_ITEM_VALUE       = 50_000    # GP — ignore cheap junk (too noisy)
+        MIN_SELL_VOLUME      = 50        # items — minimum meaningful dump size
+        SELL_RATIO_THRESHOLD = 0.65      # 65%+ of 5m volume must be selling
+        PRICE_DROP_THRESHOLD = 3.0       # % below 5m average to qualify
+        COOLDOWN_MINUTES     = 30        # suppress repeat alerts for same item
+
+        dump_webhook_url = self._get_dump_alert_webhook_sync(db)
+
+        for item_id_str, instant in _price_cache.items():
             try:
-                docs = db.price_snapshots.find(
-                    {"item_id": item_id, "timestamp": {"$gte": cutoff_15m}}
-                ).sort("timestamp", 1)
-                snaps = [PriceSnapshot.from_doc(d) for d in docs]
+                five_m = _5m_cache.get(item_id_str, {})
 
-                if len(snaps) < 5:
+                # Current instant prices
+                instant_sell = instant.get("low")   # what you get selling right now
+                instant_buy  = instant.get("high")  # what you pay buying right now
+
+                # 5-minute averaged prices and volumes
+                avg_sell  = five_m.get("avgLowPrice")
+                avg_buy   = five_m.get("avgHighPrice")
+                sell_vol  = five_m.get("lowPriceVolume", 0) or 0   # items sold last 5m
+                buy_vol   = five_m.get("highPriceVolume", 0) or 0  # items bought last 5m
+
+                # Must have valid data
+                if not instant_sell or not avg_sell or avg_sell <= 0:
                     continue
 
-                prices = [s.instant_buy for s in snaps if s.instant_buy and s.instant_buy > 0]
-                if len(prices) < 5:
+                # Skip cheap items (junk / noise)
+                if avg_sell < MIN_ITEM_VALUE:
                     continue
 
-                first_price = prices[0]
-                last_price = prices[-1]
-                change_pct = (last_price - first_price) / first_price * 100
+                # Must have enough volume to be meaningful
+                total_vol = sell_vol + buy_vol
+                if total_vol < MIN_SELL_VOLUME or sell_vol < MIN_SELL_VOLUME:
+                    continue
 
-                if change_pct < -5:
-                    # Check we haven't alerted for this item in last 30 min
-                    recent_alert = db.alerts.find_one({
-                        "item_id": item_id,
-                        "alert_type": "dump",
-                        "timestamp": {"$gte": now - timedelta(minutes=30)},
-                    })
-                    if recent_alert:
-                        continue
+                # === DUMP SIGNAL 1: volume imbalance ===
+                # Most of the 5m volume is sell-side (bots dumping)
+                sell_ratio = sell_vol / total_vol
+                if sell_ratio < SELL_RATIO_THRESHOLD:
+                    continue
 
-                    item_row = get_item(db, item_id)
-                    item_name = item_row.name if item_row else f"Item {item_id}"
+                # === DUMP SIGNAL 2: price below 5m average ===
+                # Selling pressure has already pushed price below the recent average
+                price_drop_pct = (avg_sell - instant_sell) / avg_sell * 100
+                if price_drop_pct < PRICE_DROP_THRESHOLD:
+                    continue
 
-                    alert = Alert(
-                        item_id=item_id,
-                        item_name=item_name,
-                        alert_type="dump",
-                        message=f"{item_name} dropping {change_pct:.1f}% in 15min ({first_price:,} -> {last_price:,})",
-                        data={"change_pct": round(change_pct, 1), "from_price": first_price, "to_price": last_price},
-                    )
-                    insert_alert(db, alert)
-                    logger.info("Dump alert: %s", alert.message)
-            except Exception:
-                pass
+                # Both signals confirmed — this looks like a bot dump
+                item_id = int(item_id_str)
+
+                # Cooldown: don't spam alerts for the same item
+                recent_alert = db.alerts.find_one({
+                    "item_id": item_id,
+                    "alert_type": "dump",
+                    "timestamp": {"$gte": now - timedelta(minutes=COOLDOWN_MINUTES)},
+                })
+                if recent_alert:
+                    continue
+
+                # Item name (may not be in DB if it's not a top-100 item)
+                item_row = get_item(db, item_id)
+                item_name = item_row.name if item_row else f"Item {item_id}"
+
+                # Recovery metrics
+                # If price snaps back to 5m average after you buy at instant_sell:
+                #   profit = avg_sell - instant_sell - GE_tax
+                ge_tax = int(min(avg_sell * 0.01, 5_000_000))  # 1% buyer's side
+                profit_per_item = int(avg_sell - instant_sell - ge_tax)
+
+                # Total GP being dumped in this 5m window
+                dump_gp_total = int(sell_vol * instant_sell)
+
+                # Severity score 1-10: combines drop depth and volume imbalance
+                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
+
+                alert = Alert(
+                    item_id=item_id,
+                    item_name=item_name,
+                    alert_type="dump",
+                    message=(
+                        f"{item_name}: {price_drop_pct:.1f}% below 5m avg "
+                        f"({instant_sell:,} vs avg {avg_sell:,} GP) — "
+                        f"{sell_vol:,} sold vs {buy_vol:,} bought ({sell_ratio:.0%} sell ratio) — "
+                        f"~{profit_per_item:+,} GP/item recovery potential"
+                    ),
+                    data={
+                        "dump_type":         "volume_dump",
+                        "instant_sell":      instant_sell,
+                        "instant_buy":       instant_buy,
+                        "avg_sell":          avg_sell,
+                        "avg_buy":           avg_buy,
+                        "price_drop_pct":    round(price_drop_pct, 1),
+                        "sell_volume":       sell_vol,
+                        "buy_volume":        buy_vol,
+                        "sell_ratio":        round(sell_ratio, 2),
+                        "recovery_gp":       int(avg_sell - instant_sell),
+                        "profit_per_item":   profit_per_item,
+                        "dump_gp_total":     dump_gp_total,
+                        "severity":          severity,
+                    },
+                )
+                insert_alert(db, alert)
+                logger.info(
+                    "Dump alert [severity %.1f]: %s — %.1f%% drop, %d sold vs %d bought",
+                    severity, item_name, price_drop_pct, sell_vol, buy_vol,
+                )
+                if dump_webhook_url:
+                    self._send_discord_dump_alert_sync(dump_webhook_url, alert)
+            except Exception as e:
+                logger.debug("Dump check error for item %s: %s", item_id_str, e)
+
+    def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
+        """Return dedicated dump-alert webhook URL (fallback to general)."""
+        try:
+            url = get_setting(db, "dump_alert_webhook_url")
+            if url:
+                return str(url).strip()
+
+            wh = get_setting(db, "discord_webhook")
+            if isinstance(wh, dict):
+                if wh.get("enabled", False) and wh.get("url"):
+                    return str(wh.get("url")).strip()
+
+            url = get_setting(db, "discord_webhook_url")
+            enabled = get_setting(db, "discord_alerts_enabled", False)
+            if url and enabled:
+                return str(url).strip()
+        except Exception as e:
+            logger.debug("Dump webhook lookup failed: %s", e)
+        return None
+
+    def _send_discord_dump_alert_sync(self, webhook_url: str, alert: Alert) -> None:
+        """Send dump alert embed to Discord webhook (sync)."""
+        try:
+            import requests as _requests
+
+            d = alert.data or {}
+            embed = {
+                "title": f"📉 DUMP DETECTED: {alert.item_name}",
+                "color": 0xE74C3C,
+                "description": alert.message,
+                "fields": [
+                    {"name": "Sell Ratio", "value": f"{(d.get('sell_ratio', 0.0) * 100):.0f}%", "inline": True},
+                    {"name": "Price Drop", "value": f"{d.get('price_drop_pct', 0)}%", "inline": True},
+                    {"name": "Profit / item", "value": f"{d.get('profit_per_item', 0):,} GP", "inline": True},
+                    {"name": "Sold 5m", "value": f"{d.get('sell_volume', 0):,}", "inline": True},
+                    {"name": "Bought 5m", "value": f"{d.get('buy_volume', 0):,}", "inline": True},
+                    {"name": "Dump GP 5m", "value": f"{d.get('dump_gp_total', 0):,} GP", "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI • Dump Detector"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.debug("Failed to send dump Discord alert: %s", e)
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
@@ -907,8 +1079,15 @@ class PositionMonitor:
                         "last_rec_sell": rec_sell,
                     }
 
-                    # Discord for large moves
-                    if abs(change_from_alert) >= self.LARGE_CHANGE_PCT:
+                    # Discord for large moves:
+                    # - PRICE DROP: always notify (losing more is always actionable)
+                    # - PRICE RISE: only notify if the position has crossed into profit.
+                    #   A bounce from -74% to -73% is noise, not a signal.
+                    is_now_profitable = update.get("pnl_pct", -1) >= 0
+                    should_discord = abs(change_from_alert) >= self.LARGE_CHANGE_PCT and (
+                        change_from_alert < 0 or is_now_profitable
+                    )
+                    if should_discord:
                         asyncio.create_task(
                             self._send_discord_position_alert(pos, update, change_from_alert)
                         )
@@ -1020,8 +1199,14 @@ class PositionMonitor:
 
             import requests as _requests
 
-            direction = "\U0001f4c9 PRICE DROP" if change_pct < 0 else "\U0001f4c8 PRICE RISE"
-            color = 0xFF4444 if change_pct < 0 else 0x44FF44
+            pnl_pct = update.get("pnl_pct", 0)
+            if change_pct < 0:
+                direction = "\U0001f4c9 PRICE DROP"
+                color = 0xFF4444
+            else:
+                # Only reaches here when pnl_pct >= 0 (gated in check_positions)
+                direction = "\U0001f4b0 NOW PROFITABLE \u2014 CONSIDER SELLING"
+                color = 0x00FF88
 
             embed = {
                 "title": f"{direction}: {pos['item_name']}",
@@ -1207,16 +1392,86 @@ class PositionMonitor:
         except Exception as e:
             logger.error("Failed to send Discord sell alert: %s", e)
 
+    def _auto_archive_stale_positions(self):
+        """Auto-dismiss positions that have been open longer than the configured
+        archive threshold.  Runs once on startup and every 6 hours.
+
+        A position is considered stale when:
+          - Its timestamp is older than `position_auto_archive_days` days
+          - It still has no matching sell (i.e. it is still "active")
+
+        This cleans up ghost positions caused by:
+          - Dink missing the SELL webhook while you were offline
+          - CSV imports of old trades that were already completed
+          - Items sold for a loss before the plugin was installed
+
+        The threshold is stored in the ``position_auto_archive_days`` setting.
+        A value of 0 disables auto-archiving.
+        """
+        db = get_db()
+        try:
+            days = get_setting(db, "position_auto_archive_days", default=7)
+            if not days or int(days) <= 0:
+                return
+
+            cutoff = datetime.utcnow() - timedelta(days=int(days))
+            positions = find_active_positions(db)
+            archived = 0
+
+            for pos in positions:
+                bought_at_raw = pos.get("bought_at")
+                if not bought_at_raw:
+                    continue
+                # bought_at is stored as an ISO string by find_active_positions
+                try:
+                    ts = datetime.fromisoformat(bought_at_raw.replace("Z", "+00:00"))
+                    # Normalise to naive UTC for comparison
+                    if ts.tzinfo is not None:
+                        ts = ts.replace(tzinfo=None)
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    dismiss_position(db, pos["trade_id"])
+                    archived += 1
+                    age_days = (datetime.utcnow() - ts).days
+                    logger.info(
+                        "Auto-archived stale position: %s (opened %s, %d days old)",
+                        pos.get("item_name", pos.get("item_id")),
+                        ts.strftime("%Y-%m-%d"),
+                        age_days,
+                    )
+
+            if archived:
+                logger.info("Auto-archive complete: dismissed %d stale position(s)", archived)
+        except Exception as e:
+            logger.error("Auto-archive error: %s", e)
+        finally:
+            db.close()
+
     async def run_forever(self):
         logger.info("PositionMonitor started (checks every %ds)", self.CHECK_INTERVAL)
         # Wait for initial price data
         await asyncio.sleep(45)
+
+        # Run auto-archive on startup, then every 6 hours
+        archive_interval = 6 * 3600
+        last_archive = 0.0
+
         while True:
             try:
                 await self.check_positions()
                 await self.check_selling_offers()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
+
+            # Periodic auto-archive (non-blocking, runs in thread pool)
+            if time.time() - last_archive >= archive_interval:
+                try:
+                    await asyncio.to_thread(self._auto_archive_stale_positions)
+                    last_archive = time.time()
+                except Exception as e:
+                    logger.error("PositionMonitor auto-archive error: %s", e)
+
             await asyncio.sleep(self.CHECK_INTERVAL)
 
 
@@ -1229,6 +1484,79 @@ def get_position_monitor() -> PositionMonitor:
     if _position_monitor is None:
         _position_monitor = PositionMonitor()
     return _position_monitor
+
+
+# ---------------------------------------------------------------------------
+# FlipCacheWorker (PR10) — maintains the stable in-memory top lists
+# ---------------------------------------------------------------------------
+
+class FlipCacheWorker:
+    """Scores all tracked items every ~60 seconds and updates the in-memory
+    flip cache with dampening / hysteresis applied.
+
+    This is the only writer of ``backend.flip_cache``.  The /flips/top5
+    endpoint reads from that cache without touching the database.
+    """
+
+    CYCLE_SECONDS = 60
+
+    async def run_cycle(self) -> None:
+        """Score items and update the flip cache."""
+        from backend.database import (
+            get_db, get_tracked_item_ids, get_price_history,
+            get_item_flips, get_item,
+        )
+        from backend.prediction.scoring import calculate_flip_metrics
+        import backend.flip_cache as _cache
+
+        def _sync() -> List[dict]:
+            db = get_db()
+            results = []
+            try:
+                item_ids = get_tracked_item_ids(db)
+                for item_id in item_ids[:200]:
+                    try:
+                        snaps = get_price_history(db, item_id, hours=4)
+                        if not snaps:
+                            continue
+                        flips = get_item_flips(db, item_id, days=30)
+                        item  = get_item(db, item_id)
+                        latest = snaps[-1]
+                        metrics = calculate_flip_metrics({
+                            "item_id":    item_id,
+                            "item_name":  item.name if item else f"Item {item_id}",
+                            "instant_buy":  latest.instant_buy,
+                            "instant_sell": latest.instant_sell,
+                            "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
+                            "buy_time":  latest.buy_time,
+                            "sell_time": latest.sell_time,
+                            "snapshots": snaps,
+                            "flip_history": flips,
+                        })
+                        results.append(metrics)
+                    except Exception:
+                        continue
+            finally:
+                db.close()
+            return results
+
+        try:
+            scored = await asyncio.to_thread(_sync)
+            _cache.update_cache(scored, cycle_seconds=self.CYCLE_SECONDS)
+            logger.debug("FlipCacheWorker: updated cache with %d scored items", len(scored))
+        except Exception as e:
+            logger.error("FlipCacheWorker cycle error: %s", e)
+
+    async def run_forever(self) -> None:
+        logger.info("FlipCacheWorker started (cycle=%ds)", self.CYCLE_SECONDS)
+        # Initial short delay to let PriceCollector gather some data
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await self.run_cycle()
+            except Exception as e:
+                logger.error("FlipCacheWorker tick error: %s", e)
+            await asyncio.sleep(self.CYCLE_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1842,7 @@ async def start_background_tasks():
     pruner = DataPruner()
     opp_notifier = get_opportunity_notifier()
     pos_monitor = get_position_monitor()
+    flip_cache_worker = FlipCacheWorker()   # PR10
 
     # Start PriceCollector first (it feeds data to everything else)
     _tasks.append(asyncio.create_task(collector.run_forever()))
@@ -1531,6 +1860,10 @@ async def start_background_tasks():
     await asyncio.sleep(10)
     _tasks.append(asyncio.create_task(alert_monitor.run_forever()))
     logger.info("AlertMonitor task created")
+
+    # FlipCacheWorker: maintains stable in-memory top lists (PR10)
+    _tasks.append(asyncio.create_task(flip_cache_worker.run_forever()))
+    logger.info("FlipCacheWorker task created")
 
     # These run infrequently, start them last
     _tasks.append(asyncio.create_task(retrainer.run_forever()))

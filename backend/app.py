@@ -8,12 +8,17 @@ Run with:
 
 import sys
 import os
-import asyncio
 import logging
+import json
+import time
+import uuid
 from contextlib import asynccontextmanager
+
+import traceback
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Ensure the project root is importable so that both ``backend.*`` and
@@ -24,23 +29,21 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from backend import config
+from backend.core.logging import configure_logging
 from backend.database import init_db
-from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
-from backend.routers import opportunities, portfolio, analysis, settings, alerts
-from backend.routers import blocklist as blocklist_router
 from backend.auth import (
     router as auth_router, is_configured as auth_configured,
     requires_auth, get_current_user,
 )
+from backend.domain.models import UserContext
+from backend.domain.enums import RiskProfile
+from backend.metrics import record_error
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — use the centralised configurator (Phase 8)
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -51,23 +54,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once on startup, yields for the lifetime of the app, then cleans up."""
+    if config.RUN_MODE != "api":
+        logger.warning(
+            "backend.app started with RUN_MODE=%s. API mode is expected for this process.",
+            config.RUN_MODE,
+        )
+
     logger.info("Initialising database...")
     init_db()
-
-    # Schedule background tasks to start AFTER uvicorn is fully listening.
-    # Tasks are staggered to avoid all hammering MongoDB simultaneously.
-    async def _delayed_start():
-        await asyncio.sleep(5)
-        logger.info("Starting background tasks (staggered)...")
-        await start_background_tasks()
-
-    asyncio.create_task(_delayed_start())
-    logger.info("Database ready, background tasks scheduled.")
+    logger.info("Database ready.")
 
     yield  # Application is running
-
-    logger.info("Shutting down background tasks...")
-    await stop_background_tasks()
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +91,31 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
+# Global exception handler -- surfaces unhandled errors as structured JSON
+# so the frontend can display useful diagnostic info instead of a generic
+# "something went wrong" message.
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc()
+    logger.error(
+        "Unhandled exception on %s %s: %s\n%s",
+        request.method, request.url.path, exc, tb,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": str(exc),
+            "type": type(exc).__name__,
+            "path": request.url.path,
+            "request_id": getattr(request.state, "request_id", None),
+            "traceback": tb,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Auth middleware -- blocks unauthenticated access to /api/* when configured
 # ---------------------------------------------------------------------------
 
@@ -111,17 +133,93 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def user_context_middleware(request: Request, call_next):
+    """
+    Resolve the authenticated user's risk profile and personalisation data,
+    then attach a ``UserContext`` to ``request.state.user_ctx``.
+
+    Downstream route handlers can access it via::
+
+        ctx: UserContext = request.state.user_ctx
+
+    Falls back to ``UserContext.anonymous()`` (balanced, no personalisation)
+    for unauthenticated requests or when the users collection has no record.
+    """
+    ctx = UserContext.anonymous()
+    try:
+        user = get_current_user(request)
+        if user and user.get("id"):
+            uid = user["id"]
+            ctx.user_id  = uid
+            ctx.username = user.get("username")
+            # Load user document from DB for risk profile + calibration
+            try:
+                from backend.database import get_db
+                db = get_db()
+                doc = db.db["users"].find_one(
+                    {"_id": uid},
+                    {"risk_profile": 1, "profit_multiplier": 1,
+                     "hold_multiplier": 1, "item_affinity": 1,
+                     "category_affinity": 1},
+                )
+                if doc:
+                    try:
+                        ctx.risk_profile = RiskProfile(doc.get("risk_profile", "balanced"))
+                    except ValueError:
+                        ctx.risk_profile = RiskProfile.BALANCED
+                    ctx.profit_multiplier = float(doc.get("profit_multiplier", 1.0) or 1.0)
+                    ctx.hold_multiplier   = float(doc.get("hold_multiplier",   1.0) or 1.0)
+                    raw_aff = doc.get("item_affinity", {}) or {}
+                    ctx.item_affinity = {
+                        int(k): float(v) for k, v in raw_aff.items()
+                        if k.isdigit()
+                    }
+                    raw_cat = doc.get("category_affinity", {}) or {}
+                    ctx.category_affinity = {str(k): float(v) for k, v in raw_cat.items()}
+            except Exception as db_exc:
+                logger.debug("user_context_middleware: DB lookup failed: %s", db_exc)
+    except Exception as exc:
+        logger.debug("user_context_middleware: %s", exc)
+
+    request.state.user_ctx = ctx
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+
+    response = await call_next(request)
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    if response.status_code >= 500:
+        record_error()
+
+    payload = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "cache_hit": getattr(request.state, "cache_hit", None),
+        "profile": getattr(request.state, "profile_used", None),
+    }
+    logger.info("request_log %s", json.dumps(payload, separators=(",", ":")))
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
 
 app.include_router(auth_router)
-app.include_router(opportunities.router)
-app.include_router(portfolio.router)
-app.include_router(analysis.router)
-app.include_router(settings.router)
-app.include_router(alerts.router)
-app.include_router(blocklist_router.router)
+
+# Register all routers (existing + new Phase 4/5/7/8 endpoints)
+from backend.api.routes import register_routes
+register_routes(app)
 
 
 # ---------------------------------------------------------------------------

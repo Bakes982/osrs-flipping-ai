@@ -611,6 +611,13 @@ def init_db():
         else:
             logger.warning("Index creation failed: %s — continuing without indexes", idx_err)
 
+    # Apply extended index schema (new collections: users, flip_outcomes, etc.)
+    try:
+        from backend.database_indexes import ensure_all_indexes
+        ensure_all_indexes(_wrapper)
+    except Exception as ext_idx_err:
+        logger.warning("Extended index creation warning: %s", ext_idx_err)
+
     logger.info("MongoDB initialized: %s / %s", MONGODB_URL.split("@")[-1], DATABASE_NAME)
 
 

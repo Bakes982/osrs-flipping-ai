@@ -80,7 +80,7 @@ export default function ItemDetail() {
   const [geTimestep, setGeTimestep] = useState('1h');
 
   // Fetch item detail, predictions, and GE price history
-  const { data: detail, loading } = useApi(
+  const { data: detail, loading, error } = useApi(
     () => api.getOpportunityDetail(itemId),
     [itemId],
     60000,
@@ -97,6 +97,13 @@ export default function ItemDetail() {
   );
 
   if (loading) return <div className="loading">Loading item analysis...</div>;
+  if (error) return (
+    <div className="empty" style={{ color: '#ef4444' }}>
+      <strong>Failed to load item data</strong><br />
+      <small style={{ color: '#9ca3af' }}>{error}</small><br />
+      <button className="btn" style={{ marginTop: 12 }} onClick={() => nav(-1)}>← Back</button>
+    </div>
+  );
   if (!detail) return <div className="empty">Item not found</div>;
 
   // Map backend fields
