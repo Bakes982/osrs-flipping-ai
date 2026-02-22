@@ -334,27 +334,61 @@ def update_cache(scored_items: List[dict], cycle_seconds: float = 60.0) -> None:
     )
 
 
-def _update_dump_persistence(all_metrics: Dict[int, dict]) -> None:
-    """PR11: Track consecutive high-dump cycles and fire alerts when threshold met.
+def _passes_dump_filters(m: dict) -> bool:
+    """Return True if the item clears the v2 quality filters.
 
-    Only emits an alert once per item (alerted=True) until the signal clears,
-    to avoid spam.
+    Filters (all configurable via env vars):
+      - recommended_buy  >= DUMP_ALERT_MIN_PRICE_GP  (only checked when > 0)
+      - net_profit       >= DUMP_ALERT_MIN_PROFIT_GP
+
+    The price filter is intentionally skipped when ``recommended_buy`` is
+    absent or zero — the field may legitimately be missing in certain
+    scoring contexts (e.g. test fixtures, early pipeline stages).
+    """
+    buy    = m.get("recommended_buy") or m.get("instant_buy") or 0
+    profit = m.get("net_profit", 0)
+    if buy > 0 and buy < _cfg.DUMP_ALERT_MIN_PRICE_GP:
+        return False
+    return profit >= _cfg.DUMP_ALERT_MIN_PROFIT_GP
+
+
+def _update_dump_persistence(all_metrics: Dict[int, dict]) -> None:
+    """PR11 / v2: Track consecutive high-dump cycles and fire alerts when threshold met.
+
+    Improvements over v1:
+      - Quality filters (min price, min profit) gate alert eligibility.
+      - 60-minute time-based cooldown per item prevents re-alert spam even if
+        the signal bounces — only resets after the cooldown window elapses.
     """
     global _dump_persist_state
 
-    persistence_k = _cfg.DUMP_ALERT_PERSISTENCE
+    persistence_k  = _cfg.DUMP_ALERT_PERSISTENCE
+    cooldown_secs  = _cfg.DUMP_ALERT_COOLDOWN_MINUTES * 60
+    now            = time.time()
 
     for iid, m in all_metrics.items():
         signal = m.get("dump_signal", "none")
-        state  = _dump_persist_state.setdefault(iid, {"high_count": 0, "alerted": False})
+        state  = _dump_persist_state.setdefault(
+            iid,
+            {"high_count": 0, "alerted": False, "last_alert_ts": 0.0},
+        )
 
         if signal == "high":
             state["high_count"] += 1
-            if state["high_count"] >= persistence_k and not state["alerted"]:
-                state["alerted"] = True
+
+            cooldown_elapsed = (now - state["last_alert_ts"]) >= cooldown_secs
+            if (
+                state["high_count"] >= persistence_k
+                and cooldown_elapsed
+                and _passes_dump_filters(m)
+            ):
+                state["alerted"]      = True
+                state["last_alert_ts"] = now
                 _emit_dump_alert(m)
         else:
-            # Signal cleared — reset so future high dumps re-alert
+            # Signal cleared — reset count and alerted flag.
+            # last_alert_ts is intentionally kept so the cooldown window still
+            # applies if the signal bounces back within 60 minutes.
             state["high_count"] = 0
             state["alerted"]    = False
 
@@ -395,35 +429,109 @@ def _format_dump_message(metrics: dict) -> str:
 
 
 def _emit_dump_alert(metrics: dict) -> None:
-    """Fire a dump alert via Discord webhook (if configured)."""
+    """Fire a rich dump alert via Discord webhook (v2).
+
+    Improvements over v1:
+      - Resolves item name via ItemNameResolver (6h TTL cache) in case the
+        metrics dict has a missing or stale name.
+      - Sends a Discord embed with colour-coded severity and trade plan fields.
+      - Attaches a 6h price chart image when chart generation succeeds.
+      - Logs item_id in structured logger.warning only (not in user message).
+    """
+    import io
+    import json
     import os
+    from datetime import datetime
+
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-    # Always log structured data (item_id for debugging, not in user message)
+    item_id = metrics.get("item_id")
+
+    # Resolve name: prefer metrics dict, fallback to Wiki mapping cache
+    from backend.alerts.item_name_resolver import resolver as _name_resolver
+    name = metrics.get("item_name") or _name_resolver.resolve(item_id)
+
+    # Structured log for debugging (item_id is safe here)
     logger.warning(
         "DUMP_HIGH alert: item_id=%s name=%s dump_risk=%.1f",
-        metrics.get("item_id"), metrics.get("item_name"),
-        metrics.get("dump_risk_score", 0),
+        item_id, name, metrics.get("dump_risk_score", 0),
     )
 
     if not webhook_url:
         logger.warning("Set DISCORD_WEBHOOK_URL to receive dump alert notifications")
         return
 
+    signal = (metrics.get("dump_signal") or "HIGH").upper()
+    buy    = int(metrics.get("recommended_buy") or 0)
+    sell   = int(metrics.get("recommended_sell") or 0)
+    score  = float(metrics.get("total_score") or 0)
+    trend  = metrics.get("trend", "NEUTRAL")
+
+    # Human-readable trade plan line (from existing formatter)
+    plan_line = _format_dump_message(metrics)
+
+    embed = {
+        "title":       f"\u26a0\ufe0f DUMP {signal} \u2014 {name}",
+        "description": plan_line,
+        "color":       0xEF5350,   # red
+        "timestamp":   datetime.utcnow().isoformat(),
+        "footer":      {"text": "OSRS Flipping AI \u2022 Dump Detection v2"},
+        "fields": [
+            {"name": "Dump Risk",  "value": f"{metrics.get('dump_risk_score', 0):.0f}/100", "inline": True},
+            {"name": "Score",      "value": f"{score:.0f}/100",                              "inline": True},
+            {"name": "Trend",      "value": trend,                                           "inline": True},
+        ],
+    }
+
+    # Try to generate a 6h price chart
+    chart_bytes = None
+    if item_id:
+        try:
+            from backend.discord_notifier import generate_opportunity_chart
+            chart_bytes = generate_opportunity_chart(
+                item_name=name,
+                item_id=item_id,
+                buy_price=buy,
+                sell_price=sell,
+                score=score,
+                trend=trend,
+                hours=6,
+            )
+        except Exception as exc:
+            logger.warning("Dump alert chart generation failed for item %s: %s", item_id, exc)
+
     try:
-        import json
-        import urllib.request
-        content = f":warning: **{_format_dump_message(metrics)}**"
-        payload = json.dumps({"content": content}).encode()
-        req = urllib.request.Request(
-            webhook_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        logger.error("Failed to send dump alert: %s", e)
+        import requests as _requests
+
+        if chart_bytes:
+            filename = f"dump_{item_id}.png"
+            embed["image"] = {"url": f"attachment://{filename}"}
+            payload_json = json.dumps({"embeds": [embed]})
+            resp = _requests.post(
+                webhook_url,
+                data={"payload_json": payload_json},
+                files={"file": (filename, io.BytesIO(chart_bytes), "image/png")},
+                timeout=15,
+            )
+        else:
+            resp = _requests.post(
+                webhook_url,
+                json={"embeds": [embed]},
+                timeout=10,
+            )
+
+        if resp.status_code == 429:
+            import time as _time
+            retry_after = resp.json().get("retry_after", 2)
+            logger.warning("Discord rate-limited, retrying in %.1fs", retry_after)
+            _time.sleep(retry_after)
+            resp = _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+
+        if resp.status_code not in (200, 204):
+            logger.error("Dump alert webhook returned HTTP %s", resp.status_code)
+
+    except Exception as exc:
+        logger.error("Failed to send dump alert: %s", exc)
 
 
 def get_dump_high_count() -> int:
