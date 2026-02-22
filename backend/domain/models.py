@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from backend.domain.enums import (
-    FlipStatus, RiskLevel, RiskProfile, TrendDirection, VolumeRating,
+    FlipStatus, RiskLevel, RiskProfile, StrategyMode, TrendDirection, VolumeRating,
 )
 
 
@@ -181,6 +181,9 @@ class UserRecord(BaseModel):
     # Affinity maps (updated by affinity.py)
     item_affinity:     Dict[str, float] = Field(default_factory=dict)  # str(item_id) → boost
     category_affinity: Dict[str, float] = Field(default_factory=dict)
+
+    # Strategy mode (PR9): how slots are divided between core and spice buckets
+    strategy_mode: StrategyMode = StrategyMode.STEADY
 
     subscription_tier: str = "free"   # "free" | "pro" | "enterprise"
 

@@ -5,6 +5,7 @@ and personalisation data access.
 Routes:
     GET  /api/user/profile          — return current user profile
     POST /api/user/profile          — update risk profile / alert prefs
+    PATCH /api/user/strategy_mode  — update strategy mode (PR9)
     GET  /api/user/calibration      — return calibration multipliers
     GET  /api/user/affinity         — return item affinity boosts
     POST /api/user/flip-outcome     — record a flip outcome for personalisation
@@ -21,8 +22,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from backend.domain.enums import RiskProfile
+from backend.domain.enums import RiskProfile, StrategyMode
 from backend.domain.models import UserContext
+from backend import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class UserProfileResponse(BaseModel):
     user_id:          Optional[str]
     username:         Optional[str]
     risk_profile:     str
+    strategy_mode:    str          # PR9
     profit_multiplier: float
     hold_multiplier:   float
     watchlist:         List[int]
@@ -48,6 +51,11 @@ class UpdateProfileRequest(BaseModel):
     watchlist:    Optional[List[int]] = None
     alert_margin_threshold: Optional[int] = None
     alert_volume_spike_x:   Optional[float] = None
+
+
+class UpdateStrategyModeRequest(BaseModel):
+    """PR9 — update the user's strategy_mode."""
+    strategy_mode: str  # "steady" | "steady_spice" | "spice_only"
 
 
 class RecordFlipOutcomeRequest(BaseModel):
@@ -101,6 +109,19 @@ def _require_auth(ctx: UserContext) -> None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
+def _default_strategy_mode() -> str:
+    """Return the default strategy_mode for new accounts.
+
+    If FORCE_DEFAULT_STRATEGY_MODE env var is set to a valid StrategyMode
+    value, use that; otherwise fall back to "steady".
+    """
+    forced = _cfg.FORCE_DEFAULT_STRATEGY_MODE.strip().lower()
+    valid = {m.value for m in StrategyMode}
+    if forced in valid:
+        return forced
+    return StrategyMode.STEADY.value
+
+
 def _upsert_user(db, ctx: UserContext) -> None:
     """Ensure a user document exists for this Discord user."""
     db.db["users"].update_one(
@@ -109,6 +130,7 @@ def _upsert_user(db, ctx: UserContext) -> None:
             "_id":               ctx.user_id,
             "username":          ctx.username or "",
             "risk_profile":      ctx.risk_profile.value,
+            "strategy_mode":     _default_strategy_mode(),   # PR9
             "profit_multiplier": 1.0,
             "hold_multiplier":   1.0,
             "item_affinity":     {},
@@ -151,6 +173,7 @@ async def get_profile(request: Request):
                 "user_id":          ctx.user_id,
                 "username":         doc.get("username", ctx.username or ""),
                 "risk_profile":     doc.get("risk_profile", "balanced"),
+                "strategy_mode":    doc.get("strategy_mode", _default_strategy_mode()),
                 "profit_multiplier": doc.get("profit_multiplier", 1.0),
                 "hold_multiplier":   doc.get("hold_multiplier", 1.0),
                 "watchlist":         doc.get("watchlist", []),
@@ -436,6 +459,43 @@ async def update_profile(request: Request, body: UpdateProfileRequest):
 
             db.db["users"].update_one({"_id": ctx.user_id}, {"$set": updates})
             return {"ok": True}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
+
+
+@router.patch("/strategy_mode")
+async def update_strategy_mode(request: Request, body: UpdateStrategyModeRequest):
+    """PR9 — Update the authenticated user's strategy_mode.
+
+    body: { "strategy_mode": "steady" | "steady_spice" | "spice_only" }
+    """
+    ctx = _ctx(request)
+    _require_auth(ctx)
+
+    # Validate
+    valid_modes = {m.value for m in StrategyMode}
+    if body.strategy_mode not in valid_modes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid strategy_mode '{body.strategy_mode}'. "
+                   f"Choose: {sorted(valid_modes)}",
+        )
+
+    def _sync():
+        from backend.database import get_db
+        db = get_db()
+        try:
+            _upsert_user(db, ctx)
+            db.db["users"].update_one(
+                {"_id": ctx.user_id},
+                {"$set": {
+                    "strategy_mode": body.strategy_mode,
+                    "updated_at":    datetime.utcnow(),
+                }},
+            )
+            return {"ok": True, "strategy_mode": body.strategy_mode}
         finally:
             db.close()
 
