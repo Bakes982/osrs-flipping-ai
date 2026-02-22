@@ -409,6 +409,7 @@ def register_routes(app: FastAPI) -> None:
     from backend.routers import opportunities, portfolio, analysis, settings, alerts
     from backend.routers import blocklist as blocklist_router
     from backend.routers import user_profile
+    from backend.routers import backtest as backtest_router   # PR12
 
     app.include_router(opportunities.router)
     app.include_router(portfolio.router)
@@ -417,6 +418,7 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(alerts.router)
     app.include_router(blocklist_router.router)
     app.include_router(user_profile.router)
+    app.include_router(backtest_router.router)               # PR12
 
     # New unified endpoints
     app.include_router(flip_router)
