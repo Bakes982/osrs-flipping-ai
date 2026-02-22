@@ -139,6 +139,12 @@ class FlipSummary(BaseModel):
     gp_per_hour: float
     trend: str
     vetoed: bool = False
+    # PR10 stability
+    stable_for_cycles: int   = 0
+    stable_for_minutes: float = 0.0
+    # PR11 dump detection
+    dump_risk_score: float   = 0.0
+    dump_signal:     str     = "none"
 
 
 class FlipsTopResponse(BaseModel):

@@ -120,6 +120,11 @@ def _to_summary(m: dict) -> FlipSummary:
         gp_per_hour=m.get("gp_per_hour", 0),
         trend=m.get("trend", "NEUTRAL"),
         vetoed=m.get("vetoed", False),
+        # PR10 / PR11 fields
+        stable_for_cycles=m.get("stable_for_cycles", 0),
+        stable_for_minutes=m.get("stable_for_minutes", 0.0),
+        dump_risk_score=m.get("dump_risk_score", 0.0),
+        dump_signal=m.get("dump_signal", "none"),
     )
 
 

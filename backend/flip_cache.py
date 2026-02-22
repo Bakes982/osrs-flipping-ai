@@ -95,6 +95,10 @@ _last_update_ts: float = 0.0
 # Cycle duration used to derive stable_for_minutes
 _cycle_seconds: float = 60.0
 
+# PR11 — Dump alert persistence state
+# _dump_persist_state[item_id] = {"high_count": int, "alerted": bool}
+_dump_persist_state: Dict[int, dict] = {}
+
 
 def get_top5(profile: str = "balanced") -> List[dict]:
     """Return the cached top-5 list for a given risk profile.
@@ -320,10 +324,83 @@ def update_cache(scored_items: List[dict], cycle_seconds: float = 60.0) -> None:
         top5 = _build_top5(core_active, spice_active)
         _top5_cache[profile] = top5
 
+    # PR11 — Track dump persistence and emit alerts after N consecutive cycles
+    _update_dump_persistence(all_metrics)
+
     _last_update_ts = time.time()
     logger.debug(
         "flip_cache updated: %d profiles, %d total scored items",
         len(_PROFILES), len(scored_items),
+    )
+
+
+def _update_dump_persistence(all_metrics: Dict[int, dict]) -> None:
+    """PR11: Track consecutive high-dump cycles and fire alerts when threshold met.
+
+    Only emits an alert once per item (alerted=True) until the signal clears,
+    to avoid spam.
+    """
+    global _dump_persist_state
+
+    persistence_k = _cfg.DUMP_ALERT_PERSISTENCE
+
+    for iid, m in all_metrics.items():
+        signal = m.get("dump_signal", "none")
+        state  = _dump_persist_state.setdefault(iid, {"high_count": 0, "alerted": False})
+
+        if signal == "high":
+            state["high_count"] += 1
+            if state["high_count"] >= persistence_k and not state["alerted"]:
+                state["alerted"] = True
+                _emit_dump_alert(m)
+        else:
+            # Signal cleared — reset so future high dumps re-alert
+            state["high_count"] = 0
+            state["alerted"]    = False
+
+
+def _emit_dump_alert(metrics: dict) -> None:
+    """Fire a dump alert via Discord webhook (if configured)."""
+    import os
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not webhook_url:
+        logger.warning(
+            "DUMP_HIGH alert for item %s (%s) — dump_risk=%.1f "
+            "(set DISCORD_WEBHOOK_URL to receive notifications)",
+            metrics.get("item_id"), metrics.get("item_name"),
+            metrics.get("dump_risk_score", 0),
+        )
+        return
+
+    try:
+        import json
+        import urllib.request
+        payload = json.dumps({
+            "content": (
+                f":warning: **DUMP ALERT** — {metrics.get('item_name', 'Unknown')} "
+                f"(ID {metrics.get('item_id')}) "
+                f"dump_risk={metrics.get('dump_risk_score', 0):.1f} "
+                f"| signal=HIGH"
+            ),
+        }).encode()
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        logger.error("Failed to send dump alert: %s", e)
+
+
+def get_dump_high_count() -> int:
+    """Return the number of items currently showing a high dump signal.
+
+    Used by /status endpoint (PR11).
+    """
+    return sum(
+        1 for s in _dump_persist_state.values() if s.get("high_count", 0) >= 1
     )
 
 
@@ -359,4 +436,5 @@ def cache_status() -> dict:
         "top5_sizes": {p: len(v) for p, v in _top5_cache.items()},
         "top_core_sizes": {p: len(v) for p, v in _top_core_cache.items()},
         "top_spice_sizes": {p: len(v) for p, v in _top_spice_cache.items()},
+        "dump_high_count": get_dump_high_count(),   # PR11
     }
