@@ -20,11 +20,12 @@ import asyncio
 import logging
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 
+from backend import config
 from backend.api.schemas import (
     FlipMetricsResponse,
     FlipSummary,
@@ -35,15 +36,20 @@ from backend.api.schemas import (
     PortfolioAllocationResponse,
     OptimizePortfolioRequest,
     HealthResponse,
+    StatusResponse,
 )
+from backend.api_key_auth import resolve_api_key_owner
+from backend.cache_backend import get_cache_backend
+from backend.flips_cache import compute_scored_opportunities
+from backend.metrics import metrics_snapshot, record_cache_access
+from backend.rate_limiter import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
 # Module-level start time for uptime reporting
 _START_TIME: float = time.time()
-_TOP_CACHE_TTL_SECONDS = 45
-_TOP_CACHE: Dict[Tuple[str, int, int, int], Tuple[float, List[dict]]] = {}
-_TOP_CACHE_LOCK = threading.Lock()
+_FRESH_RATE_STATE: Dict[Tuple[str, str], Tuple[int, int]] = {}
+_FRESH_RATE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +124,8 @@ _PROFILE_POSITION_CAP = {
 
 
 def _to_summary(m: dict, capital_gp: int = 0, position_cap_pct: float = 0.15) -> FlipSummary:
-    conf = m.get("confidence", 0.0) or 0.0
-    conf_pct = conf * 100.0 if conf <= 1.0 else conf
+    conf_pct = _confidence_pct(m)
+    reasons, badges = _explain_flip(m)
     import backend.config as _cfg
     effective_capital = capital_gp if capital_gp > 0 else _cfg.DEFAULT_CAPITAL_GP
     trade_plan = _build_trade_plan_for(m, effective_capital, position_cap_pct)
@@ -154,6 +160,8 @@ def _to_summary(m: dict, capital_gp: int = 0, position_cap_pct: float = 0.15) ->
         gp_per_hour=m.get("gp_per_hour", 0),
         trend=m.get("trend", "NEUTRAL"),
         vetoed=m.get("vetoed", False),
+        reasons=reasons,
+        badges=badges,
         # PR10 / PR11 fields
         stable_for_cycles=m.get("stable_for_cycles", 0),
         stable_for_minutes=m.get("stable_for_minutes", 0.0),
@@ -163,81 +171,179 @@ def _to_summary(m: dict, capital_gp: int = 0, position_cap_pct: float = 0.15) ->
     )
 
 
-def _cache_get(profile: str, limit: int, min_score: int, min_confidence_pct: int) -> Optional[List[dict]]:
-    key = (profile, limit, min_score, min_confidence_pct)
-    now = time.time()
-    with _TOP_CACHE_LOCK:
-        hit = _TOP_CACHE.get(key)
-        if not hit:
-            return None
-        ts, payload = hit
-        if now - ts > _TOP_CACHE_TTL_SECONDS:
-            _TOP_CACHE.pop(key, None)
-            return None
-        return payload
-
-
-def _cache_set(profile: str, limit: int, min_score: int, min_confidence_pct: int, payload: List[dict]) -> None:
-    key = (profile, limit, min_score, min_confidence_pct)
-    with _TOP_CACHE_LOCK:
-        _TOP_CACHE[key] = (time.time(), payload)
-
-
-async def _fetch_scored_opportunities(
-    limit: int = 50,
-    min_score: float = 45.0,
-    profile: str = "balanced",
-    min_confidence_pct: float = 0.0,
-    user_capital: int = 10_000_000,
-) -> List[dict]:
-    """Pull currently-scored opportunities from the database."""
-    from backend.database import get_db, get_tracked_item_ids, get_price_history, get_item_flips, get_item
-    from backend.prediction.scoring import calculate_flip_metrics
-
-    def _sync() -> List[dict]:
-        db = get_db()
-        results = []
+def _confidence_pct(metric: dict) -> float:
+    conf_pct = metric.get("confidence_pct")
+    if conf_pct is not None:
         try:
-            item_ids = get_tracked_item_ids(db)
-            for item_id in item_ids[:200]:
-                try:
-                    snaps = get_price_history(db, item_id, hours=4)
-                    if not snaps:
-                        continue
-                    flips = get_item_flips(db, item_id, days=30)
-                    item = get_item(db, item_id)
-                    latest = snaps[-1]
-                    metrics = calculate_flip_metrics({
-                        "item_id": item_id,
-                        "item_name": item.name if item else f"Item {item_id}",
-                        "instant_buy": latest.instant_buy,
-                        "instant_sell": latest.instant_sell,
-                        "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
-                        "buy_time": latest.buy_time,
-                        "sell_time": latest.sell_time,
-                        "snapshots": snaps,
-                        "flip_history": flips,
-                        "risk_profile": profile,
-                        "item_limit": getattr(item, "buy_limit", None) if item else None,
-                        "user_capital": user_capital,
-                    })
-                    confidence = metrics.get("confidence", 0.0) or 0.0
-                    conf_pct = confidence * 100.0 if confidence <= 1.0 else confidence
-                    if (
-                        not metrics["vetoed"]
-                        and metrics["total_score"] >= min_score
-                        and conf_pct >= min_confidence_pct
-                    ):
-                        results.append(metrics)
-                except Exception:
-                    continue
-        finally:
-            db.close()
+            conf = float(conf_pct)
+            if conf <= 1.0:
+                conf *= 100.0
+            return max(0.0, min(100.0, conf))
+        except Exception:
+            pass
+    conf = metric.get("confidence", 0.0) or 0.0
+    conf = float(conf)
+    if conf <= 1.0:
+        conf *= 100.0
+    return max(0.0, min(100.0, conf))
 
-        results.sort(key=lambda m: m.get("total_score", 0), reverse=True)
-        return results[:limit]
 
-    return await asyncio.to_thread(_sync)
+def _explain_flip(metric: dict) -> Tuple[List[str], List[str]]:
+    reasons: List[str] = []
+    badges: List[str] = []
+
+    fill_probability = float(metric.get("fill_probability", 0.0) or 0.0)
+    if fill_probability >= 0.8:
+        reasons.append("High liquidity and fast fills")
+        badges.append("FAST")
+
+    decay_penalty = float(metric.get("decay_penalty", metric.get("spread_compression", 0.0)) or 0.0)
+    if decay_penalty <= 0.2:
+        reasons.append("Stable spread (low compression)")
+        badges.append("SAFE")
+
+    trend_score = float(metric.get("trend_score", 0.0) or 0.0)
+    if trend_score > 1.0:
+        trend_score = trend_score / 100.0
+    if trend_score >= 0.55:
+        reasons.append("Positive trend (EMA crossover)")
+
+    risk_adj_gph = float(metric.get("risk_adjusted_gph_personal", metric.get("risk_adjusted_gp_per_hour", 0.0)) or 0.0)
+    if risk_adj_gph >= 250_000:
+        reasons.append("High risk-adjusted GP/h")
+
+    roi_pct = float(metric.get("roi_pct", 0.0) or 0.0)
+    if roi_pct >= 5.0:
+        badges.append("HIGH_ROI")
+
+    risk_score = float(metric.get("risk_score", 5.0) or 5.0)
+    if risk_score >= 6.5:
+        badges.append("VOLATILE")
+
+    # Avoid empty reasons so UI always has text to show.
+    if not reasons:
+        reasons.append("Balanced margin, confidence, and risk profile")
+    if not badges:
+        badges.append("WATCH")
+
+    return reasons[:4], badges[:4]
+
+
+def _parse_cache_ts(ts_value: object) -> Optional[datetime]:
+    if ts_value is None:
+        return None
+    if isinstance(ts_value, datetime):
+        return ts_value if ts_value.tzinfo else ts_value.replace(tzinfo=timezone.utc)
+    if isinstance(ts_value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(ts_value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(ts_value, str):
+        try:
+            normalized = ts_value.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _cache_age_seconds(cache_ts: Optional[datetime]) -> Optional[int]:
+    if cache_ts is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - cache_ts).total_seconds()))
+
+
+def _load_cached_flip_payload(key: str) -> Tuple[Optional[datetime], Optional[List[dict]]]:
+    cache = get_cache_backend()
+    payload = cache.get_json(key)
+    if not isinstance(payload, dict):
+        return None, None
+    ts = _parse_cache_ts(payload.get("ts"))
+    flips = payload.get("flips")
+    if not isinstance(flips, list):
+        return ts, None
+    return ts, flips
+
+
+def _fresh_rate_limit_key(request: Request, profile: str) -> Tuple[str, str]:
+    client_host = request.client.host if request.client else "unknown"
+    return client_host, profile
+
+
+def _enforce_fresh_rate_limit(request: Request, profile: str) -> None:
+    max_per_minute = max(1, int(config.FLIPS_FRESH_MAX_PER_MINUTE))
+    now_bucket = int(time.time() // 60)
+    key = _fresh_rate_limit_key(request, profile)
+    with _FRESH_RATE_LOCK:
+        bucket, count = _FRESH_RATE_STATE.get(key, (now_bucket, 0))
+        if bucket != now_bucket:
+            bucket, count = now_bucket, 0
+        if count >= max_per_minute:
+            raise HTTPException(status_code=429, detail="fresh=1 rate limit exceeded; retry in under a minute")
+        _FRESH_RATE_STATE[key] = (bucket, count + 1)
+
+
+def _reset_fresh_rate_limit_for_tests() -> None:
+    with _FRESH_RATE_LOCK:
+        _FRESH_RATE_STATE.clear()
+
+
+def _request_client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _authenticate_plugin_access(request: Request, require_key: bool) -> str:
+    raw_api_key = request.headers.get("X-API-Key", "").strip()
+    client_host = _request_client_host(request)
+    if not raw_api_key:
+        if require_key and not config.ALLOW_ANON:
+            raise HTTPException(status_code=401, detail="Missing X-API-Key")
+        return f"anon:{client_host}"
+
+    owner = resolve_api_key_owner(raw_api_key)
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    key_hash, user_id = owner
+    request.state.api_key_hash = key_hash
+    request.state.api_user_id = user_id
+    return f"key:{key_hash}"
+
+
+def _enforce_plugin_rate_limit(bucket: str, identity: str, limit_per_minute: int) -> None:
+    allowed, count = check_rate_limit(bucket=bucket, identity=identity, limit_per_minute=limit_per_minute)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for {bucket} ({count}/{limit_per_minute} in current minute)",
+        )
+
+
+def _cache_runtime_summary() -> Tuple[Optional[datetime], Optional[int], int, Dict[str, int], str]:
+    cache_backend_name = "none"
+    last_poll_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    items_scored_count = 0
+    profile_counts: Dict[str, int] = {}
+    try:
+        cache = get_cache_backend()
+        cache_backend_name = getattr(cache, "backend", "none")
+        raw_last_poll = cache.get("flips:last_updated_ts")
+        last_poll_ts = _parse_cache_ts(raw_last_poll)
+        cache_age_seconds = _cache_age_seconds(last_poll_ts)
+        for profile in ("conservative", "balanced", "aggressive"):
+            stats = cache.get_json(f"flips:stats:{profile}") or {}
+            try:
+                count = int(stats.get("count", 0) or 0)
+            except Exception:
+                count = 0
+            profile_counts[profile] = count
+            items_scored_count += count
+    except Exception:
+        cache_backend_name = "none"
+    return last_poll_ts, cache_age_seconds, items_scored_count, profile_counts, cache_backend_name
 
 
 @flip_router.get(
@@ -253,6 +359,7 @@ async def get_top_flips(
     request: Request,
     limit: int = Query(20, ge=1, le=100),
     profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
+    fresh: int = Query(0, ge=0, le=1),
     min_score: float = Query(45.0, ge=0, le=100),
     min_roi: float = Query(0.0, ge=0),
     min_confidence: float = Query(0.0, ge=0, le=100),
@@ -266,13 +373,40 @@ async def get_top_flips(
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
+    request.state.profile_used = active_profile
+    identity = _authenticate_plugin_access(request, require_key=bool(config.TOP_REQUIRE_API_KEY))
+    _enforce_plugin_rate_limit("flips_top", identity, int(config.TOP_RATE_LIMIT_PER_MINUTE))
 
-    all_scored = await _fetch_scored_opportunities(
-        limit=limit * 3,
-        min_score=min_score,
-        profile=active_profile,
-        min_confidence_pct=min_confidence,
-    )
+    cache = get_cache_backend()
+    cache_ts: Optional[datetime] = None
+
+    if fresh == 1:
+        request.state.cache_hit = False
+        _enforce_fresh_rate_limit(request, active_profile)
+        all_scored = await compute_scored_opportunities(
+            limit=100,
+            min_score=min_score,
+            profile=active_profile,
+            min_confidence_pct=min_confidence,
+        )
+        cache_ts = datetime.now(timezone.utc)
+        ts_iso = cache_ts.isoformat()
+        ttl = max(30, int(config.FLIPS_CACHE_TTL_SECONDS))
+        cache.set_json(f"flips:top100:{active_profile}", {"ts": ts_iso, "flips": all_scored}, ttl_seconds=ttl)
+        cache.set_json(f"flips:top5:{active_profile}", {"ts": ts_iso, "flips": all_scored[:5]}, ttl_seconds=ttl)
+        cache.set("flips:last_updated_ts", ts_iso, ttl_seconds=ttl)
+        record_cache_access(False)
+    else:
+        cache_ts, all_scored = _load_cached_flip_payload(f"flips:top100:{active_profile}")
+        if all_scored is None:
+            request.state.cache_hit = False
+            record_cache_access(False)
+            raise HTTPException(
+                status_code=503,
+                detail="Top list cache is not ready yet. Retry shortly or use fresh=1.",
+            )
+        request.state.cache_hit = True
+        record_cache_access(True)
 
     filtered = [
         m for m in all_scored
@@ -287,7 +421,14 @@ async def get_top_flips(
     profile_key = getattr(active_profile, "value", active_profile)
     pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
     flips = [_to_summary(m, capital_gp=capital_gp, position_cap_pct=pos_cap) for m in filtered[:limit]]
-    return FlipsTopResponse(count=len(flips), generated_at=datetime.utcnow(), flips=flips)
+    return FlipsTopResponse(
+        count=len(flips),
+        generated_at=datetime.now(timezone.utc),
+        flips=flips,
+        cache_ts=cache_ts,
+        cache_age_seconds=_cache_age_seconds(cache_ts),
+        profile_used=active_profile,
+    )
 
 
 @flip_router.get(
@@ -311,39 +452,54 @@ async def get_top5_runelite(
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
+    request.state.profile_used = active_profile
+    identity = _authenticate_plugin_access(request, require_key=True)
+    _enforce_plugin_rate_limit("flips_top5", identity, int(config.TOP5_RATE_LIMIT_PER_MINUTE))
 
-    import backend.flip_cache as _flip_cache
+    cache_ts, scored = _load_cached_flip_payload(f"flips:top5:{active_profile}")
+    if scored is None:
+        request.state.cache_hit = False
+        record_cache_access(False)
+        raise HTTPException(status_code=503, detail="Top-5 cache not warmed yet")
+    request.state.cache_hit = True
+    record_cache_access(True)
+
     import backend.config as _cfg
-    cached_items = _flip_cache.get_top5(active_profile)
-
-    def _conf_pct(m: dict) -> float:
-        v = m.get("confidence", 0.0) or 0.0
-        return v * 100.0 if v <= 1.0 else v
-
     capital_gp = getattr(ctx, "capital_gp", None) or _cfg.DEFAULT_CAPITAL_GP
     profile_key = getattr(active_profile, "value", active_profile)
     pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
 
-    flips = [
-        RuneLiteFlip(
-            item_id=m["item_id"],
-            item_name=m.get("item_name", ""),
-            recommended_buy=m.get("recommended_buy", 0),
-            recommended_sell=m.get("recommended_sell", 0),
-            net_profit=m.get("net_profit", 0),
-            roi_pct=m.get("roi_pct", 0),
-            total_score=m.get("total_score", 0),
-            confidence_pct=_conf_pct(m),
-            risk_level=m.get("risk_level", "MEDIUM"),
-            stable_for_cycles=m.get("stable_for_cycles", 0),
-            stable_for_minutes=m.get("stable_for_minutes", 0.0),
-            dump_risk_score=m.get("dump_risk_score", 0.0),
-            dump_signal=m.get("dump_signal", "none"),
-            trade_plan=_build_trade_plan_for(m, capital_gp, pos_cap),
+    flips = []
+    for m in scored[:5]:
+        reasons, badges = _explain_flip(m)
+        flips.append(
+            RuneLiteFlip(
+                item_id=m["item_id"],
+                item_name=m.get("item_name", ""),
+                recommended_buy=m.get("recommended_buy", 0),
+                recommended_sell=m.get("recommended_sell", 0),
+                net_profit=m.get("net_profit", 0),
+                roi_pct=m.get("roi_pct", 0),
+                total_score=m.get("total_score", 0),
+                confidence_pct=_confidence_pct(m),
+                risk_level=m.get("risk_level", "MEDIUM"),
+                reasons=reasons,
+                badges=badges,
+                stable_for_cycles=m.get("stable_for_cycles", 0),
+                stable_for_minutes=m.get("stable_for_minutes", 0.0),
+                dump_risk_score=m.get("dump_risk_score", 0.0),
+                dump_signal=m.get("dump_signal", "none"),
+                trade_plan=_build_trade_plan_for(m, capital_gp, pos_cap),
+            )
         )
-        for m in cached_items
-    ]
-    return RuneLiteTop5Response(ts=int(time.time()), cached=True, flips=flips)
+    return RuneLiteTop5Response(
+        ts=int(time.time()),
+        cached=True,
+        flips=flips,
+        cache_ts=cache_ts,
+        cache_age_seconds=_cache_age_seconds(cache_ts),
+        profile_used=active_profile,
+    )
 
 
 @flip_router.get(
@@ -424,20 +580,61 @@ system_router = APIRouter(tags=["system"])
 )
 async def health_check():
     db_status = "ok"
+    db_connected = True
     try:
         from backend.database import get_db
         db = get_db()
-        db.db.command("ping")
+        # Database wrapper stores pymongo database on `_db`.
+        if hasattr(db, "_db"):
+            db._db.command("ping")
+        elif hasattr(db, "db"):
+            db.db.command("ping")
+        else:
+            raise RuntimeError("Unsupported database wrapper (missing _db/db)")
         db.close()
     except Exception as exc:
         db_status = f"error: {exc}"
+        db_connected = False
 
     from backend.tasks import _tasks  # noqa: PLC0415
+    last_poll_ts, _cache_age, items_scored_count_last_run, _profile_counts, cache_backend_name = _cache_runtime_summary()
+
+    metrics = metrics_snapshot()
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
+        db_connected=db_connected,
         background_tasks=len(_tasks),
         uptime_seconds=round(time.time() - _START_TIME, 1),
+        last_poll_ts=last_poll_ts,
+        items_scored_count_last_run=items_scored_count_last_run,
+        cache_backend=cache_backend_name,
+        cache_hit_rate=float(metrics["cache_hit_rate"]),
+        alert_sent_count=int(metrics["alert_sent_count"]),
+        errors_last_hour=int(metrics["errors_last_hour"]),
+    )
+
+
+@system_router.get(
+    "/status",
+    response_model=StatusResponse,
+    summary="Worker/cache runtime status",
+)
+async def runtime_status():
+    last_poll_ts, cache_age_seconds, items_scored_count, profile_counts, cache_backend_name = _cache_runtime_summary()
+    worker_ok = (
+        cache_age_seconds is not None
+        and cache_age_seconds <= max(10, int(config.WORKER_OK_MAX_AGE_SECONDS))
+    )
+    status = "live" if worker_ok else "stale"
+    return StatusResponse(
+        status=status,
+        worker_ok=worker_ok,
+        last_poll_ts=last_poll_ts,
+        cache_age_seconds=cache_age_seconds,
+        items_scored_count=items_scored_count,
+        cache_backend=cache_backend_name,
+        profile_counts=profile_counts,
     )
 
 

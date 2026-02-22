@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from backend.prediction.scoring import calculate_flip_metrics, apply_ml_score
+import backend.prediction.scoring as scoring_module
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +232,35 @@ class TestVetoes:
         ))
         # May or may not be vetoed depending on spread positioning; just check it runs
         assert isinstance(m["vetoed"], bool)
+
+    def test_low_fill_probability_penalized_for_conservative(self, monkeypatch):
+        monkeypatch.setattr(scoring_module, "_sigmoid", lambda _x: 0.05)
+        data = _base_item_data(volume_5m=100)
+        data["risk_profile"] = "conservative"
+        m = calculate_flip_metrics(data)
+        assert m["total_score"] <= 30
+        assert any("fill probability" in r.lower() for r in m["veto_reasons"])
+
+    def test_spread_compression_spike_penalized(self):
+        now = int(time.time())
+        snaps = [
+            _make_snapshot(instant_buy=1_120_000, instant_sell=1_000_000, age_seconds=1200),
+            _make_snapshot(instant_buy=1_015_000, instant_sell=1_000_000, age_seconds=60),
+        ]
+        data = {
+            "item_id": 4151,
+            "item_name": "Abyssal whip",
+            "instant_buy": 1_015_000,
+            "instant_sell": 1_000_000,
+            "volume_5m": 100,
+            "buy_time": now,
+            "sell_time": now,
+            "snapshots": snaps,
+            "flip_history": [],
+        }
+        m = calculate_flip_metrics(data)
+        assert m["total_score"] <= 20
+        assert any("compression spike" in r.lower() for r in m["veto_reasons"])
 
 
 # ---------------------------------------------------------------------------

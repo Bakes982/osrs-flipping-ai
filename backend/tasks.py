@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from backend import config
 from backend.database import (
     get_db,
     PriceSnapshot,
@@ -72,6 +73,28 @@ class PriceCollector:
         self._last_5m_fetch: float = 0.0
         self._last_store: float = 0.0
         self._client: Optional[httpx.AsyncClient] = None
+        self._consecutive_upstream_failures: int = 0
+        self._circuit_open_until_ts: float = 0.0
+        self._failure_threshold = max(1, int(config.WORKER_CIRCUIT_FAILURE_THRESHOLD))
+        self._circuit_open_seconds = max(10, int(config.WORKER_CIRCUIT_OPEN_SECONDS))
+        self._last_circuit_log_ts: float = 0.0
+
+    def _is_circuit_open(self) -> bool:
+        return time.time() < self._circuit_open_until_ts
+
+    def _record_upstream_success(self) -> None:
+        self._consecutive_upstream_failures = 0
+
+    def _record_upstream_failure(self, endpoint: str, exc: Exception) -> None:
+        self._consecutive_upstream_failures += 1
+        logger.error("Failed to fetch %s: %s", endpoint, exc)
+        if self._consecutive_upstream_failures >= self._failure_threshold:
+            self._circuit_open_until_ts = time.time() + self._circuit_open_seconds
+            self._consecutive_upstream_failures = 0
+            logger.error(
+                "PriceCollector circuit opened for %ss after repeated upstream failures",
+                self._circuit_open_seconds,
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -80,6 +103,8 @@ class PriceCollector:
 
     async def fetch_latest(self) -> Dict:
         """Fetch instant prices from /latest."""
+        if self._is_circuit_open():
+            return self._latest_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/latest")
@@ -87,13 +112,16 @@ class PriceCollector:
             self._latest_data = resp.json().get("data", {})
             # Update global in-memory cache for all items (used by PositionMonitor)
             _price_cache.update(self._latest_data)
+            self._record_upstream_success()
             return self._latest_data
         except Exception as e:
-            logger.error("Failed to fetch /latest: %s", e)
+            self._record_upstream_failure("/latest", e)
             return self._latest_data
 
     async def fetch_5m(self) -> Dict:
         """Fetch 5-minute averaged prices from /5m."""
+        if self._is_circuit_open():
+            return self._5m_data
         client = await self._get_client()
         try:
             resp = await client.get(f"{WIKI_BASE}/5m")
@@ -102,9 +130,10 @@ class PriceCollector:
             self._last_5m_fetch = time.time()
             # Expose globally so AlertMonitor can access volume data for dump detection
             _5m_cache.update(self._5m_data)
+            self._record_upstream_success()
             return self._5m_data
         except Exception as e:
-            logger.error("Failed to fetch /5m: %s", e)
+            self._record_upstream_failure("/5m", e)
             return self._5m_data
 
     async def store_snapshots(self) -> int:
@@ -197,6 +226,16 @@ class PriceCollector:
         logger.info("PriceCollector started")
         while True:
             try:
+                if self._is_circuit_open():
+                    now = time.time()
+                    # Log at most once every 15s while open.
+                    if now - self._last_circuit_log_ts > 15:
+                        remaining = int(max(0, self._circuit_open_until_ts - now))
+                        logger.warning("PriceCollector circuit open; retry in %ss", remaining)
+                        self._last_circuit_log_ts = now
+                    await asyncio.sleep(2)
+                    continue
+
                 await self.fetch_latest()
 
                 # Fetch 5m data every 60 seconds
@@ -709,6 +748,8 @@ class AlertMonitor:
         PRICE_DROP_THRESHOLD = 3.0       # % below 5m average to qualify
         COOLDOWN_MINUTES     = 30        # suppress repeat alerts for same item
 
+        dump_webhook_url = self._get_dump_alert_webhook_sync(db)
+
         for item_id_str, instant in _price_cache.items():
             try:
                 five_m = _5m_cache.get(item_id_str, {})
@@ -807,8 +848,55 @@ class AlertMonitor:
                     "Dump alert [severity %.1f]: %s — %.1f%% drop, %d sold vs %d bought",
                     severity, item_name, price_drop_pct, sell_vol, buy_vol,
                 )
+                if dump_webhook_url:
+                    self._send_discord_dump_alert_sync(dump_webhook_url, alert)
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
+
+    def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
+        """Return dedicated dump-alert webhook URL (fallback to general)."""
+        try:
+            url = get_setting(db, "dump_alert_webhook_url")
+            if url:
+                return str(url).strip()
+
+            wh = get_setting(db, "discord_webhook")
+            if isinstance(wh, dict):
+                if wh.get("enabled", False) and wh.get("url"):
+                    return str(wh.get("url")).strip()
+
+            url = get_setting(db, "discord_webhook_url")
+            enabled = get_setting(db, "discord_alerts_enabled", False)
+            if url and enabled:
+                return str(url).strip()
+        except Exception as e:
+            logger.debug("Dump webhook lookup failed: %s", e)
+        return None
+
+    def _send_discord_dump_alert_sync(self, webhook_url: str, alert: Alert) -> None:
+        """Send dump alert embed to Discord webhook (sync)."""
+        try:
+            import requests as _requests
+
+            d = alert.data or {}
+            embed = {
+                "title": f"📉 DUMP DETECTED: {alert.item_name}",
+                "color": 0xE74C3C,
+                "description": alert.message,
+                "fields": [
+                    {"name": "Sell Ratio", "value": f"{(d.get('sell_ratio', 0.0) * 100):.0f}%", "inline": True},
+                    {"name": "Price Drop", "value": f"{d.get('price_drop_pct', 0)}%", "inline": True},
+                    {"name": "Profit / item", "value": f"{d.get('profit_per_item', 0):,} GP", "inline": True},
+                    {"name": "Sold 5m", "value": f"{d.get('sell_volume', 0):,}", "inline": True},
+                    {"name": "Bought 5m", "value": f"{d.get('buy_volume', 0):,}", "inline": True},
+                    {"name": "Dump GP 5m", "value": f"{d.get('dump_gp_total', 0):,} GP", "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI • Dump Detector"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.debug("Failed to send dump Discord alert: %s", e)
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""

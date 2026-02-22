@@ -8,8 +8,10 @@ Run with:
 
 import sys
 import os
-import asyncio
 import logging
+import json
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 import traceback
@@ -29,7 +31,6 @@ if _PROJECT_ROOT not in sys.path:
 from backend import config
 from backend.core.logging import configure_logging
 from backend.database import init_db
-from backend.tasks import start_background_tasks, stop_background_tasks
 from backend.websocket import manager
 from backend.auth import (
     router as auth_router, is_configured as auth_configured,
@@ -37,6 +38,7 @@ from backend.auth import (
 )
 from backend.domain.models import UserContext
 from backend.domain.enums import RiskProfile
+from backend.metrics import record_error
 
 # ---------------------------------------------------------------------------
 # Logging — use the centralised configurator (Phase 8)
@@ -52,23 +54,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once on startup, yields for the lifetime of the app, then cleans up."""
+    if config.RUN_MODE != "api":
+        logger.warning(
+            "backend.app started with RUN_MODE=%s. API mode is expected for this process.",
+            config.RUN_MODE,
+        )
+
     logger.info("Initialising database...")
     init_db()
-
-    # Schedule background tasks to start AFTER uvicorn is fully listening.
-    # Tasks are staggered to avoid all hammering MongoDB simultaneously.
-    async def _delayed_start():
-        await asyncio.sleep(5)
-        logger.info("Starting background tasks (staggered)...")
-        await start_background_tasks()
-
-    asyncio.create_task(_delayed_start())
-    logger.info("Database ready, background tasks scheduled.")
+    logger.info("Database ready.")
 
     yield  # Application is running
-
-    logger.info("Shutting down background tasks...")
-    await stop_background_tasks()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +109,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "detail": str(exc),
             "type": type(exc).__name__,
             "path": request.url.path,
+            "request_id": getattr(request.state, "request_id", None),
             "traceback": tb,
         },
     )
@@ -187,6 +184,31 @@ async def user_context_middleware(request: Request, call_next):
 
     request.state.user_ctx = ctx
     return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+
+    response = await call_next(request)
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    if response.status_code >= 500:
+        record_error()
+
+    payload = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "cache_hit": getattr(request.state, "cache_hit", None),
+        "profile": getattr(request.state, "profile_used", None),
+    }
+    logger.info("request_log %s", json.dumps(payload, separators=(",", ":")))
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # ---------------------------------------------------------------------------

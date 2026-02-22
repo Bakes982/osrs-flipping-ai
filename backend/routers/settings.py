@@ -30,6 +30,7 @@ DEFAULTS: Dict[str, Any] = {
     "discord_webhook_url": "",
     "discord_alerts_enabled": False,
     "sell_alert_webhook_url": "",   # separate webhook for sell-price-drop alerts
+    "dump_alert_webhook_url": "",   # separate webhook for dump-detection alerts
     "tracked_item_ids": [],
     "blacklisted_item_ids": [],
     "allowed_discord_ids": [],      # list of Discord user ID strings allowed to log in

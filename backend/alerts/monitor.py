@@ -27,6 +27,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,7 +83,6 @@ class DiscordNotifier(Notifier):
         if not self._url:
             return False
         try:
-            import httpx
             colour = self._COLOUR.get(alert.severity, 0x4FC3F7)
             embed = {
                 "title": f"[{alert.kind.value}] {alert.item_name}",

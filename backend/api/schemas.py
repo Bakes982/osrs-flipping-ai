@@ -152,6 +152,8 @@ class FlipSummary(BaseModel):
     estimated_hold_time: int    # minutes
     gp_per_hour: float
     trend: str
+    reasons: List[str] = Field(default_factory=list)
+    badges: List[str] = Field(default_factory=list)
     vetoed: bool = False
     # PR10 stability
     stable_for_cycles: int   = 0
@@ -168,6 +170,9 @@ class FlipsTopResponse(BaseModel):
     count: int
     generated_at: datetime
     flips: List[FlipSummary]
+    cache_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    profile_used: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +249,8 @@ class RuneLiteFlip(BaseModel):
     sc: float           = Field(alias="total_score")
     c: float            = Field(0.0, alias="confidence_pct")
     rl: str             = Field("MEDIUM", alias="risk_level")
+    reasons: List[str] = Field(default_factory=list)
+    badges: List[str] = Field(default_factory=list)
     # PR10 stability fields
     stable_cycles: int  = Field(0, alias="stable_for_cycles")
     stable_min: float   = Field(0.0, alias="stable_for_minutes")
@@ -265,6 +272,9 @@ class RuneLiteTop5Response(BaseModel):
     ts: int             # Unix timestamp
     cached: bool = True # PR10: always True — this is cache-served
     flips: List[RuneLiteFlip]
+    cache_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    profile_used: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +285,26 @@ class HealthResponse(BaseModel):
     status: str
     version: str = "2.0.0"
     db: str = "ok"
+    db_connected: bool = True
     background_tasks: int = 0
     uptime_seconds: float = 0.0
+    last_poll_ts: Optional[datetime] = None
+    items_scored_count_last_run: int = 0
+    cache_backend: str = "none"
+    cache_hit_rate: float = 0.0
+    alert_sent_count: int = 0
+    errors_last_hour: int = 0
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class StatusResponse(BaseModel):
+    status: str
+    worker_ok: bool = False
+    last_poll_ts: Optional[datetime] = None
+    cache_age_seconds: Optional[int] = None
+    items_scored_count: int = 0
+    cache_backend: str = "none"
+    profile_counts: Dict[str, int] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
