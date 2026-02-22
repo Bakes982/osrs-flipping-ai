@@ -432,34 +432,48 @@ def _emit_dump_alert(metrics: dict) -> None:
     """Fire a rich dump alert via Discord webhook (v2).
 
     Improvements over v1:
-      - Resolves item name via ItemNameResolver (6h TTL cache) in case the
-        metrics dict has a missing or stale name.
+      - Resolves item name via resolve_item_name() — always calls the Wiki
+        mapping so "Item XXXXX" placeholders in metrics are replaced.
+      - Webhook routing: DISCORD_WEBHOOK_DUMPS first, DISCORD_WEBHOOK_URL fallback.
       - Sends a Discord embed with colour-coded severity and trade plan fields.
       - Attaches a 6h price chart image when chart generation succeeds.
-      - Logs item_id in structured logger.warning only (not in user message).
     """
     import io
     import json
     import os
     from datetime import datetime
 
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    # Webhook priority: DISCORD_WEBHOOK_DUMPS (dump-only channel) first
+    webhook_url = (
+        os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
+        or os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    )
 
     item_id = metrics.get("item_id")
 
-    # Resolve name: prefer metrics dict, fallback to Wiki mapping cache
-    from backend.alerts.item_name_resolver import resolver as _name_resolver
-    name = metrics.get("item_name") or _name_resolver.resolve(item_id)
+    # Resolve name — ALWAYS call resolver so "Item XXXX" is replaced.
+    # The `or` short-circuit bug is intentionally avoided here: pass the
+    # current item_name as fallback so the resolver fast-paths real names.
+    from backend.alerts.item_name_resolver import resolve_item_name
+    resolved_name = resolve_item_name(item_id, fallback=metrics.get("item_name", ""))
+    logger.info(
+        "DUMP_NAME_DEBUG id=%s fallback=%r resolved=%r",
+        item_id, metrics.get("item_name"), resolved_name,
+    )
 
-    # Structured log for debugging (item_id is safe here)
+    # Structured log for debugging
     logger.warning(
         "DUMP_HIGH alert: item_id=%s name=%s dump_risk=%.1f",
-        item_id, name, metrics.get("dump_risk_score", 0),
+        item_id, resolved_name, metrics.get("dump_risk_score", 0),
     )
 
     if not webhook_url:
-        logger.warning("Set DISCORD_WEBHOOK_URL to receive dump alert notifications")
+        logger.warning(
+            "Set DISCORD_WEBHOOK_DUMPS (or DISCORD_WEBHOOK_URL) to receive dump alerts"
+        )
         return
+
+    logger.info("DUMP_WEBHOOK target=%s", webhook_url[:35])
 
     signal = (metrics.get("dump_signal") or "HIGH").upper()
     buy    = int(metrics.get("recommended_buy") or 0)
@@ -471,7 +485,7 @@ def _emit_dump_alert(metrics: dict) -> None:
     plan_line = _format_dump_message(metrics)
 
     embed = {
-        "title":       f"\u26a0\ufe0f DUMP {signal} \u2014 {name}",
+        "title":       f"\u26a0\ufe0f DUMP {signal} \u2014 {resolved_name}",
         "description": plan_line,
         "color":       0xEF5350,   # red
         "timestamp":   datetime.utcnow().isoformat(),
@@ -489,7 +503,7 @@ def _emit_dump_alert(metrics: dict) -> None:
         try:
             from backend.discord_notifier import generate_opportunity_chart
             chart_bytes = generate_opportunity_chart(
-                item_name=name,
+                item_name=resolved_name,
                 item_id=item_id,
                 buy_price=buy,
                 sell_price=sell,

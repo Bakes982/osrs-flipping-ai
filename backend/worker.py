@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from typing import Awaitable, Callable
 
@@ -127,6 +128,90 @@ async def run_worker_forever(
             backoff = min(max_backoff, backoff * 2.0)
 
 
+async def _run_dump_smoke_test() -> None:
+    """Resolve item 4151 and post a smoke-test message to the DUMPS webhook.
+
+    Activated by setting DUMP_SMOKE_TEST=1 on the worker.  Used to verify
+    that dump-v2 name resolution and the Discord webhook are wired correctly.
+    """
+    import requests as _requests
+
+    from backend.alerts.item_name_resolver import resolve_item_name
+    from backend.database import get_db, get_setting
+
+    SMOKE_ITEM_ID = 4151  # Abyssal whip — well-known, always in the mapping
+
+    # --- 1. Resolve the item name (same resolver used in real dump alerts) ---
+    try:
+        name = resolve_item_name(SMOKE_ITEM_ID)
+    except Exception as exc:
+        logger.warning("DUMP_SMOKE_TEST: resolver raised %s — using fallback", exc)
+        name = f"Item {SMOKE_ITEM_ID}"
+
+    logger.info("DUMP_SMOKE_TEST resolved %d -> %s", SMOKE_ITEM_ID, name)
+
+    # --- 2. Fetch the dump webhook URL (same priority as AlertMonitor) ---
+    def _get_dump_webhook() -> str | None:
+        # env override is highest priority — same as _get_dump_alert_webhook_sync
+        env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
+        if env_url:
+            return env_url
+        init_db()
+        db = get_db()
+        try:
+            url = get_setting(db, "dump_alert_webhook_url")
+            if url:
+                return str(url).strip()
+            wh = get_setting(db, "discord_webhook")
+            if isinstance(wh, dict):
+                if wh.get("enabled", False) and wh.get("url"):
+                    return str(wh["url"]).strip()
+            url = get_setting(db, "discord_webhook_url")
+            enabled = get_setting(db, "discord_alerts_enabled", False)
+            if url and enabled:
+                return str(url).strip()
+        except Exception as exc:
+            logger.warning("DUMP_SMOKE_TEST: webhook lookup failed: %s", exc)
+        finally:
+            db.close()
+        return None
+
+    webhook_url = await asyncio.to_thread(_get_dump_webhook)
+
+    if not webhook_url:
+        logger.warning("DUMP_SMOKE_TEST: no dump webhook URL found — skipping Discord send")
+        return
+
+    # --- 3. Send the smoke-test Discord message ---
+    body = f"Resolved {SMOKE_ITEM_ID} -> {name}"
+    embed = {
+        "title": "DUMP SMOKE TEST",
+        "description": body,
+        "color": 0x00BFFF,
+        "fields": [
+            {"name": "Item ID", "value": str(SMOKE_ITEM_ID), "inline": True},
+            {"name": "Resolved Name", "value": name, "inline": True},
+        ],
+        "footer": {"text": "OSRS Flipping AI • Smoke Test"},
+    }
+
+    def _send() -> None:
+        try:
+            resp = _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+            if resp.status_code in (200, 204):
+                logger.info("DUMP_SMOKE_TEST: Discord message sent OK (HTTP %d)", resp.status_code)
+            else:
+                logger.error(
+                    "DUMP_SMOKE_TEST: Discord returned HTTP %d: %s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
+        except Exception as exc:
+            logger.error("DUMP_SMOKE_TEST: Discord send failed: %s", exc)
+
+    await asyncio.to_thread(_send)
+
+
 async def main_async() -> None:
     if config.RUN_MODE != "worker":
         logger.warning(
@@ -134,6 +219,21 @@ async def main_async() -> None:
             config.RUN_MODE,
         )
         return
+
+    # Version stamp — visible in Railway logs on every deploy
+    try:
+        import subprocess as _sp
+        _git_hash = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=_sp.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        _git_hash = "unknown"
+    logger.info("APP_VERSION dump-v2 commit=%s", _git_hash)
+
+    if os.environ.get("DUMP_SMOKE_TEST"):
+        await _run_dump_smoke_test()
 
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)

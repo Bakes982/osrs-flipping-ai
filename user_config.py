@@ -240,6 +240,20 @@ class UserConfig:
         self.save_config()
         print("Discord notifications enabled")
 
+    def set_price_alerts_webhook(self, webhook_url: str):
+        """Set a dedicated webhook for sell price-change / price-spike alerts."""
+        if 'discord_webhook' not in self.config:
+            self.config['discord_webhook'] = {
+                'enabled': False,
+                'url': '',
+                'notify_opportunities': True,
+                'notify_price_spikes': True,
+                'min_score_to_notify': 50
+            }
+        self.config['discord_webhook']['price_alerts_webhook'] = webhook_url
+        self.save_config()
+        print(f"Price-change alerts webhook configured!")
+
     def set_discord_min_score(self, min_score: int):
         """Set minimum opportunity score to trigger Discord notification"""
         if 'discord_webhook' not in self.config:
@@ -255,7 +269,8 @@ class UserConfig:
             'url': '',
             'notify_opportunities': True,
             'notify_price_spikes': True,
-            'min_score_to_notify': 50
+            'min_score_to_notify': 50,
+            'price_alerts_webhook': 'https://discord.com/api/webhooks/1474337747446796351/EjVW1qDmMl3th8gAQ-ra8idgw3qHVSlQbpt_GqPeZ3bG3-teskzT2NKICLJGdEKsgirJ'
         })
 
     # PRESET CONFIGURATIONS

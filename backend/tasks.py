@@ -10,6 +10,8 @@ Background Tasks for OSRS Flipping AI
 
 import asyncio
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -723,30 +725,42 @@ class AlertMonitor:
             set_setting(db, "price_alerts", new_targets)
 
     def _check_dump_alerts_sync(self, db):
-        """Detect bot dump events across all ~6000 tradeable items.
+        """Detect bot dump events across all ~6000 tradeable items — v2.
 
         A dump is identified by two simultaneous signals in the /5m data:
-          1. Sell volume >> buy volume  — someone is mass-selling (bots dumping)
-          2. Current price < 5m average — the selling has already pushed the price down
+          1. Sell volume >> buy volume  (bots mass-selling)
+          2. Current instant-sell price < 5m average (selling pushed price down)
 
-        Both signals together give high confidence that the drop is temporary and
-        will recover once the dump is absorbed, creating a buy opportunity.
+        v2 improvements over the original:
+          - All thresholds are env-configurable (DUMP_V2_* vars)
+          - Item names resolved via Wiki mapping (never shows "Item XXXXX")
+          - Rich Discord embed with price chart, trade sizing, confidence tier
+          - Webhook routed via DISCORD_WEBHOOK_DUMPS env var
+          - Per-item cooldown via DUMP_V2_COOLDOWN_MINUTES
 
         Does NOT rely on MongoDB snapshots — uses the in-memory _price_cache (latest,
         updated every 10s) and _5m_cache (5m averages + volumes, updated every 60s).
-        This means we can check every item on the GE, not just tracked ones.
         """
+        from backend.alerts.item_name_resolver import resolve_item_name
+        from backend.alerts.dump_notifier import DumpAlertV2, DumpAlertNotifierV2
+        # generate_opportunity_chart is imported lazily inside the chart try/except
+        # so that a missing matplotlib install never prevents alerts from firing.
+
         if not _price_cache or not _5m_cache:
             return  # Caches not populated yet
 
         now = datetime.utcnow()
 
-        # Thresholds (tuned for OSRS GE dump catching)
-        MIN_ITEM_VALUE       = 50_000    # GP — ignore cheap junk (too noisy)
-        MIN_SELL_VOLUME      = 50        # items — minimum meaningful dump size
-        SELL_RATIO_THRESHOLD = 0.65      # 65%+ of 5m volume must be selling
-        PRICE_DROP_THRESHOLD = 3.0       # % below 5m average to qualify
-        COOLDOWN_MINUTES     = 30        # suppress repeat alerts for same item
+        # v2 quality gates — all env-configurable (see config.py)
+        MIN_PRICE        = config.DUMP_V2_MIN_PRICE_GP        # 500_000 GP default
+        MIN_DROP_PCT     = config.DUMP_V2_MIN_DROP_PCT        # 4.0 % default
+        MIN_VOL          = config.DUMP_V2_MIN_VOLUME_TRADES   # 25 trades default
+        MIN_SELL_RATIO   = config.DUMP_V2_MIN_SELL_RATIO      # 0.80 default
+        MIN_PROFIT       = config.DUMP_V2_MIN_PROFIT_PER_ITEM # 2_000 GP default
+        MIN_TOTAL_PROFIT = config.DUMP_V2_MIN_TOTAL_PROFIT    # 150_000 GP default
+        COOLDOWN_MIN     = config.DUMP_V2_COOLDOWN_MINUTES    # 60 min default
+        POSITION_CAP     = config.DUMP_V2_POSITION_CAP_PCT    # 0.10 default
+        CAPITAL          = config.DEFAULT_CAPITAL_GP           # 50_000_000 default
 
         dump_webhook_url = self._get_dump_alert_webhook_sync(db)
 
@@ -755,106 +769,192 @@ class AlertMonitor:
                 five_m = _5m_cache.get(item_id_str, {})
 
                 # Current instant prices
-                instant_sell = instant.get("low")   # what you get selling right now
-                instant_buy  = instant.get("high")  # what you pay buying right now
+                instant_sell = instant.get("low")   # price you receive selling now
+                instant_buy  = instant.get("high")  # price you pay buying now
 
                 # 5-minute averaged prices and volumes
-                avg_sell  = five_m.get("avgLowPrice")
-                avg_buy   = five_m.get("avgHighPrice")
-                sell_vol  = five_m.get("lowPriceVolume", 0) or 0   # items sold last 5m
-                buy_vol   = five_m.get("highPriceVolume", 0) or 0  # items bought last 5m
+                avg_sell = five_m.get("avgLowPrice")
+                avg_buy  = five_m.get("avgHighPrice")
+                sell_vol = five_m.get("lowPriceVolume",  0) or 0
+                buy_vol  = five_m.get("highPriceVolume", 0) or 0
 
-                # Must have valid data
+                # Gate 0: need valid price data
                 if not instant_sell or not avg_sell or avg_sell <= 0:
                     continue
 
-                # Skip cheap items (junk / noise)
-                if avg_sell < MIN_ITEM_VALUE:
+                # Gate 1: minimum item value — skip cheap junk / noise
+                if avg_sell < MIN_PRICE:
                     continue
 
-                # Must have enough volume to be meaningful
+                # Gate 2: minimum 5m trading activity
                 total_vol = sell_vol + buy_vol
-                if total_vol < MIN_SELL_VOLUME or sell_vol < MIN_SELL_VOLUME:
+                if total_vol < MIN_VOL:
                     continue
 
-                # === DUMP SIGNAL 1: volume imbalance ===
-                # Most of the 5m volume is sell-side (bots dumping)
-                sell_ratio = sell_vol / total_vol
-                if sell_ratio < SELL_RATIO_THRESHOLD:
+                # Gate 3: sell-side dominance — DUMP SIGNAL 1
+                sell_ratio = sell_vol / total_vol if total_vol > 0 else 0.0
+                if sell_ratio < MIN_SELL_RATIO:
                     continue
 
-                # === DUMP SIGNAL 2: price below 5m average ===
-                # Selling pressure has already pushed price below the recent average
+                # Gate 4: price below 5m average — DUMP SIGNAL 2
                 price_drop_pct = (avg_sell - instant_sell) / avg_sell * 100
-                if price_drop_pct < PRICE_DROP_THRESHOLD:
+                if price_drop_pct < MIN_DROP_PCT:
                     continue
 
-                # Both signals confirmed — this looks like a bot dump
+                # Both dump signals confirmed — check cooldown before heavier work
                 item_id = int(item_id_str)
-
-                # Cooldown: don't spam alerts for the same item
                 recent_alert = db.alerts.find_one({
-                    "item_id": item_id,
+                    "item_id":    item_id,
                     "alert_type": "dump",
-                    "timestamp": {"$gte": now - timedelta(minutes=COOLDOWN_MINUTES)},
+                    "timestamp":  {"$gte": now - timedelta(minutes=COOLDOWN_MIN)},
                 })
                 if recent_alert:
+                    logger.info("DUMP_SUPPRESSED cooldown id=%s", item_id)
                     continue
 
-                # Item name (may not be in DB if it's not a top-100 item)
-                item_row = get_item(db, item_id)
-                item_name = item_row.name if item_row else f"Item {item_id}"
+                # Resolve item name — NEVER show "Item XXXXX" if mapping has a real name
+                item_row  = get_item(db, item_id)
+                db_name   = item_row.name if item_row else None
+                resolved_name = resolve_item_name(item_id, fallback=db_name)
+                logger.info(
+                    "DUMP_NAME_DEBUG id=%s fallback=%r resolved=%r",
+                    item_id, db_name, resolved_name,
+                )
 
-                # Recovery metrics
-                # If price snaps back to 5m average after you buy at instant_sell:
-                #   profit = avg_sell - instant_sell - GE_tax
-                ge_tax = int(min(avg_sell * 0.01, 5_000_000))  # 1% buyer's side
+                # Gate 5: minimum net profit per item (after 1% GE buyer tax)
+                ge_tax = int(min(avg_sell * 0.01, 5_000_000))
                 profit_per_item = int(avg_sell - instant_sell - ge_tax)
+                if profit_per_item < MIN_PROFIT:
+                    continue
 
-                # Total GP being dumped in this 5m window
-                dump_gp_total = int(sell_vol * instant_sell)
+                # Trade sizing
+                max_invest_gp          = int(CAPITAL * POSITION_CAP)
+                qty                    = max(1, max_invest_gp // int(instant_sell))
+                estimated_total_profit = qty * profit_per_item
 
-                # Severity score 1-10: combines drop depth and volume imbalance
-                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
+                # Gate 6: minimum estimated total profit
+                if estimated_total_profit < MIN_TOTAL_PROFIT:
+                    continue
 
-                alert = Alert(
+                # Confidence tier based on signal strength
+                if sell_ratio >= 0.90 and price_drop_pct >= 7.0:
+                    confidence = "HIGH"
+                elif sell_ratio >= 0.85 and price_drop_pct >= 4.0:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+
+                # Build DumpAlertV2 (name is already resolved)
+                alert_v2 = DumpAlertV2(
                     item_id=item_id,
-                    item_name=item_name,
+                    item_name=resolved_name,
+                    current_price=int(instant_sell),
+                    reference_price=int(avg_sell),
+                    drop_pct=round(price_drop_pct, 1),
+                    drop_amount=int(avg_sell - instant_sell),
+                    sold_5m=sell_vol,
+                    bought_5m=buy_vol,
+                    sell_ratio=round(sell_ratio, 3),
+                    profit_per_item_net=profit_per_item,
+                    predicted_recovery=int(avg_sell),
+                    confidence=confidence,
+                    qty_to_buy=qty,
+                    max_invest_gp=max_invest_gp,
+                    estimated_total_profit=estimated_total_profit,
+                    chart_path=None,
+                    timestamp=now,
+                )
+
+                # Chart generation — best-effort; never crashes the alert.
+                # Imported lazily so that a missing matplotlib install never
+                # prevents alerts from firing (chart just won't be attached).
+                chart_tmp_path = None
+                try:
+                    from backend.discord_notifier import generate_opportunity_chart
+                    chart_bytes = generate_opportunity_chart(
+                        item_name=resolved_name,
+                        item_id=item_id,
+                        buy_price=int(instant_sell),
+                        sell_price=int(avg_sell),
+                        score=min(100.0, price_drop_pct * sell_ratio * 10),
+                        trend="FALLING",
+                        hours=6,
+                    )
+                    if chart_bytes:
+                        tf = tempfile.NamedTemporaryFile(
+                            suffix=f"_dump_{item_id}.png", delete=False
+                        )
+                        tf.write(chart_bytes)
+                        tf.close()
+                        chart_tmp_path = tf.name
+                        alert_v2.chart_path = chart_tmp_path
+                        logger.info("DUMP_CHART_OK path=%s", chart_tmp_path)
+                except Exception as chart_exc:
+                    logger.warning("DUMP_CHART_FAIL %s", chart_exc)
+
+                # Send to Discord via DumpAlertNotifierV2
+                if dump_webhook_url:
+                    logger.info("DUMP_WEBHOOK target=%s", dump_webhook_url[:35])
+                    DumpAlertNotifierV2(dump_webhook_url).send(alert_v2)
+
+                # Persist to DB (drives cooldown checks for future cycles)
+                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
+                db_alert = Alert(
+                    item_id=item_id,
+                    item_name=resolved_name,
                     alert_type="dump",
                     message=(
-                        f"{item_name}: {price_drop_pct:.1f}% below 5m avg "
-                        f"({instant_sell:,} vs avg {avg_sell:,} GP) — "
-                        f"{sell_vol:,} sold vs {buy_vol:,} bought ({sell_ratio:.0%} sell ratio) — "
+                        f"{resolved_name}: {price_drop_pct:.1f}% below 5m avg "
+                        f"({int(instant_sell):,} vs avg {int(avg_sell):,} GP) — "
+                        f"{sell_vol:,} sold vs {buy_vol:,} bought "
+                        f"({sell_ratio:.0%} sell ratio) — "
                         f"~{profit_per_item:+,} GP/item recovery potential"
                     ),
                     data={
-                        "dump_type":         "volume_dump",
-                        "instant_sell":      instant_sell,
-                        "instant_buy":       instant_buy,
-                        "avg_sell":          avg_sell,
-                        "avg_buy":           avg_buy,
-                        "price_drop_pct":    round(price_drop_pct, 1),
-                        "sell_volume":       sell_vol,
-                        "buy_volume":        buy_vol,
-                        "sell_ratio":        round(sell_ratio, 2),
-                        "recovery_gp":       int(avg_sell - instant_sell),
-                        "profit_per_item":   profit_per_item,
-                        "dump_gp_total":     dump_gp_total,
-                        "severity":          severity,
+                        "dump_type":       "volume_dump",
+                        "instant_sell":    int(instant_sell),
+                        "instant_buy":     int(instant_buy) if instant_buy else None,
+                        "avg_sell":        int(avg_sell),
+                        "avg_buy":         int(avg_buy) if avg_buy else None,
+                        "price_drop_pct":  round(price_drop_pct, 1),
+                        "sell_volume":     sell_vol,
+                        "buy_volume":      buy_vol,
+                        "sell_ratio":      round(sell_ratio, 2),
+                        "profit_per_item": profit_per_item,
+                        "severity":        severity,
+                        "confidence":      confidence,
                     },
                 )
-                insert_alert(db, alert)
+                insert_alert(db, db_alert)
                 logger.info(
-                    "Dump alert [severity %.1f]: %s — %.1f%% drop, %d sold vs %d bought",
-                    severity, item_name, price_drop_pct, sell_vol, buy_vol,
+                    "Dump alert [%s]: %s — %.1f%% drop, %d sold vs %d bought",
+                    confidence, resolved_name, price_drop_pct, sell_vol, buy_vol,
                 )
-                if dump_webhook_url:
-                    self._send_discord_dump_alert_sync(dump_webhook_url, alert)
+
+                # Clean up temp chart file
+                if chart_tmp_path:
+                    try:
+                        os.unlink(chart_tmp_path)
+                    except Exception:
+                        pass
+
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
 
     def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
-        """Return dedicated dump-alert webhook URL (fallback to general)."""
+        """Return dedicated dump-alert webhook URL.
+
+        Priority order:
+          1. DISCORD_WEBHOOK_DUMPS env var  (explicit dump channel)
+          2. dump_alert_webhook_url DB setting
+          3. General discord_webhook DB setting (fallback only)
+        """
+        # 1. Env var — highest priority, set this in Railway for the dump channel
+        env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
+        if env_url:
+            return env_url
+
+        # 2. DB settings
         try:
             url = get_setting(db, "dump_alert_webhook_url")
             if url:
@@ -872,31 +972,6 @@ class AlertMonitor:
         except Exception as e:
             logger.debug("Dump webhook lookup failed: %s", e)
         return None
-
-    def _send_discord_dump_alert_sync(self, webhook_url: str, alert: Alert) -> None:
-        """Send dump alert embed to Discord webhook (sync)."""
-        try:
-            import requests as _requests
-
-            d = alert.data or {}
-            embed = {
-                "title": f"📉 DUMP DETECTED: {alert.item_name}",
-                "color": 0xE74C3C,
-                "description": alert.message,
-                "fields": [
-                    {"name": "Sell Ratio", "value": f"{(d.get('sell_ratio', 0.0) * 100):.0f}%", "inline": True},
-                    {"name": "Price Drop", "value": f"{d.get('price_drop_pct', 0)}%", "inline": True},
-                    {"name": "Profit / item", "value": f"{d.get('profit_per_item', 0):,} GP", "inline": True},
-                    {"name": "Sold 5m", "value": f"{d.get('sell_volume', 0):,}", "inline": True},
-                    {"name": "Bought 5m", "value": f"{d.get('buy_volume', 0):,}", "inline": True},
-                    {"name": "Dump GP 5m", "value": f"{d.get('dump_gp_total', 0):,} GP", "inline": True},
-                ],
-                "footer": {"text": "OSRS Flipping AI • Dump Detector"},
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-        except Exception as e:
-            logger.debug("Failed to send dump Discord alert: %s", e)
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
@@ -1179,21 +1254,7 @@ class PositionMonitor:
     async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
         """Send a Discord embed for a large price move on an active position."""
         try:
-            def _sync():
-                db = get_db()
-                try:
-                    wh = get_setting(db, "discord_webhook")
-                    if isinstance(wh, dict):
-                        if not wh.get("enabled", False):
-                            return None
-                        return wh.get("url")
-                    url = get_setting(db, "discord_webhook_url")
-                    enabled = get_setting(db, "discord_alerts_enabled", False)
-                    return url if url and enabled else None
-                finally:
-                    db.close()
-
-            webhook_url = await asyncio.to_thread(_sync)
+            webhook_url = await self._get_sell_alert_webhook()
             if not webhook_url:
                 return
 
