@@ -1399,6 +1399,79 @@ def get_position_monitor() -> PositionMonitor:
 
 
 # ---------------------------------------------------------------------------
+# FlipCacheWorker (PR10) — maintains the stable in-memory top lists
+# ---------------------------------------------------------------------------
+
+class FlipCacheWorker:
+    """Scores all tracked items every ~60 seconds and updates the in-memory
+    flip cache with dampening / hysteresis applied.
+
+    This is the only writer of ``backend.flip_cache``.  The /flips/top5
+    endpoint reads from that cache without touching the database.
+    """
+
+    CYCLE_SECONDS = 60
+
+    async def run_cycle(self) -> None:
+        """Score items and update the flip cache."""
+        from backend.database import (
+            get_db, get_tracked_item_ids, get_price_history,
+            get_item_flips, get_item,
+        )
+        from backend.prediction.scoring import calculate_flip_metrics
+        import backend.flip_cache as _cache
+
+        def _sync() -> List[dict]:
+            db = get_db()
+            results = []
+            try:
+                item_ids = get_tracked_item_ids(db)
+                for item_id in item_ids[:200]:
+                    try:
+                        snaps = get_price_history(db, item_id, hours=4)
+                        if not snaps:
+                            continue
+                        flips = get_item_flips(db, item_id, days=30)
+                        item  = get_item(db, item_id)
+                        latest = snaps[-1]
+                        metrics = calculate_flip_metrics({
+                            "item_id":    item_id,
+                            "item_name":  item.name if item else f"Item {item_id}",
+                            "instant_buy":  latest.instant_buy,
+                            "instant_sell": latest.instant_sell,
+                            "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
+                            "buy_time":  latest.buy_time,
+                            "sell_time": latest.sell_time,
+                            "snapshots": snaps,
+                            "flip_history": flips,
+                        })
+                        results.append(metrics)
+                    except Exception:
+                        continue
+            finally:
+                db.close()
+            return results
+
+        try:
+            scored = await asyncio.to_thread(_sync)
+            _cache.update_cache(scored, cycle_seconds=self.CYCLE_SECONDS)
+            logger.debug("FlipCacheWorker: updated cache with %d scored items", len(scored))
+        except Exception as e:
+            logger.error("FlipCacheWorker cycle error: %s", e)
+
+    async def run_forever(self) -> None:
+        logger.info("FlipCacheWorker started (cycle=%ds)", self.CYCLE_SECONDS)
+        # Initial short delay to let PriceCollector gather some data
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await self.run_cycle()
+            except Exception as e:
+                logger.error("FlipCacheWorker tick error: %s", e)
+            await asyncio.sleep(self.CYCLE_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # OpportunityNotifier
 # ---------------------------------------------------------------------------
 
@@ -1681,6 +1754,7 @@ async def start_background_tasks():
     pruner = DataPruner()
     opp_notifier = get_opportunity_notifier()
     pos_monitor = get_position_monitor()
+    flip_cache_worker = FlipCacheWorker()   # PR10
 
     # Start PriceCollector first (it feeds data to everything else)
     _tasks.append(asyncio.create_task(collector.run_forever()))
@@ -1698,6 +1772,10 @@ async def start_background_tasks():
     await asyncio.sleep(10)
     _tasks.append(asyncio.create_task(alert_monitor.run_forever()))
     logger.info("AlertMonitor task created")
+
+    # FlipCacheWorker: maintains stable in-memory top lists (PR10)
+    _tasks.append(asyncio.create_task(flip_cache_worker.run_forever()))
+    logger.info("FlipCacheWorker task created")
 
     # These run infrequently, start them last
     _tasks.append(asyncio.create_task(retrainer.run_forever()))

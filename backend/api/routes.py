@@ -249,34 +249,32 @@ async def get_top_flips(
 @flip_router.get(
     "/top5",
     response_model=RuneLiteTop5Response,
-    summary="Top-5 for RuneLite plugin (Phase 7)",
+    summary="Top-5 for RuneLite plugin (PR10: cache-only)",
     description=(
         "Minimal-payload endpoint optimised for RuneLite plugin polling. "
-        "Target response time < 200 ms.  Returns compact field names."
+        "Served entirely from the in-memory flip cache — no DB I/O. "
+        "Target response time < 200 ms. "
+        "profile: balanced | conservative | aggressive."
     ),
 )
 async def get_top5_runelite(
     request: Request,
     profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
-    min_score: float = Query(45.0, ge=0, le=100),
-    min_confidence: float = Query(0.0, ge=0, le=100),
 ):
+    """Cache-only top-5: reads from backend.flip_cache (no DB)."""
+    # Honour request.state.user_ctx if the caller doesn't specify a profile
     ctx = getattr(request.state, "user_ctx", None)
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
         active_profile = ctx.risk_profile.value
 
-    cached = _cache_get(active_profile, 5, int(min_score), int(min_confidence))
-    if cached is not None:
-        scored = cached
-    else:
-        scored = await _fetch_scored_opportunities(
-            limit=5,
-            min_score=min_score,
-            profile=active_profile,
-            min_confidence_pct=min_confidence,
-        )
-        _cache_set(active_profile, 5, int(min_score), int(min_confidence), scored)
+    import backend.flip_cache as _flip_cache
+    cached_items = _flip_cache.get_top5(active_profile)
+
+    def _conf_pct(m: dict) -> float:
+        v = m.get("confidence", 0.0) or 0.0
+        return v * 100.0 if v <= 1.0 else v
+
     flips = [
         RuneLiteFlip(
             item_id=m["item_id"],
@@ -286,12 +284,16 @@ async def get_top5_runelite(
             net_profit=m.get("net_profit", 0),
             roi_pct=m.get("roi_pct", 0),
             total_score=m.get("total_score", 0),
-            confidence_pct=((m.get("confidence", 0.0) or 0.0) * 100.0) if (m.get("confidence", 0.0) or 0.0) <= 1.0 else (m.get("confidence", 0.0) or 0.0),
+            confidence_pct=_conf_pct(m),
             risk_level=m.get("risk_level", "MEDIUM"),
+            stable_for_cycles=m.get("stable_for_cycles", 0),
+            stable_for_minutes=m.get("stable_for_minutes", 0.0),
+            dump_risk_score=m.get("dump_risk_score", 0.0),
+            dump_signal=m.get("dump_signal", "none"),
         )
-        for m in scored[:5]
+        for m in cached_items
     ]
-    return RuneLiteTop5Response(ts=int(time.time()), flips=flips)
+    return RuneLiteTop5Response(ts=int(time.time()), cached=True, flips=flips)
 
 
 @flip_router.get(

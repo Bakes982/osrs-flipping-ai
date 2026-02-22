@@ -220,16 +220,26 @@ class RuneLiteFlip(BaseModel):
     p: int              = Field(alias="net_profit")
     r: float            = Field(alias="roi_pct")
     sc: float           = Field(alias="total_score")
-    c: float            = Field(alias="confidence_pct")
-    rl: str             = Field(alias="risk_level")
+    c: float            = Field(0.0, alias="confidence_pct")
+    rl: str             = Field("MEDIUM", alias="risk_level")
+    # PR10 stability fields
+    stable_cycles: int  = Field(0, alias="stable_for_cycles")
+    stable_min: float   = Field(0.0, alias="stable_for_minutes")
+    # PR11 dump fields
+    dump_risk:  float   = Field(0.0, alias="dump_risk_score")
+    dump_sig:   str     = Field("none", alias="dump_signal")
 
     class Config:
         populate_by_name = True
 
 
 class RuneLiteTop5Response(BaseModel):
-    """Response for GET /flips/top5 — optimised for plugin latency."""
+    """Response for GET /flips/top5 — optimised for plugin latency.
+
+    Always served from the in-memory cache (no DB I/O) for <200 ms latency.
+    """
     ts: int             # Unix timestamp
+    cached: bool = True # PR10: always True — this is cache-served
     flips: List[RuneLiteFlip]
 
 
