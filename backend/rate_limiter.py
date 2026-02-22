@@ -20,6 +20,9 @@ def check_rate_limit(
     minute_bucket = int(time.time() // 60)
     key = f"rl:{bucket}:{identity}:{minute_bucket}"
     cache = get_cache_backend()
-    count = cache.incr(key, ttl_seconds=70)
-    return count <= int(limit_per_minute), count
-
+    try:
+        count = cache.incr(key, ttl_seconds=70)
+        return count <= int(limit_per_minute), count
+    except Exception:
+        # Fail-open if cache backend is unavailable.
+        return True, 0

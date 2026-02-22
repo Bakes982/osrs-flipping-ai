@@ -30,7 +30,10 @@ class CacheBackend:
         raise NotImplementedError
 
     def get_json(self, key: str) -> Optional[Any]:
-        raw = self.get(key)
+        try:
+            raw = self.get(key)
+        except Exception:
+            return None
         if raw is None:
             return None
         try:
@@ -39,7 +42,10 @@ class CacheBackend:
             return None
 
     def set_json(self, key: str, value: Any, ttl_seconds: Optional[int] = None) -> None:
-        self.set(key, json.dumps(value), ttl_seconds=ttl_seconds)
+        try:
+            self.set(key, json.dumps(value), ttl_seconds=ttl_seconds)
+        except Exception:
+            return None
 
 
 class MemoryCacheBackend(CacheBackend):
@@ -97,7 +103,15 @@ class RedisCacheBackend(CacheBackend):
     def __init__(self, url: str) -> None:
         if redis is None:
             raise RuntimeError("redis package not installed")
-        self._client = redis.from_url(url, decode_responses=True)
+        self._client = redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            retry_on_timeout=False,
+        )
+        # Fail fast at startup so we can fallback to memory cache immediately.
+        self._client.ping()
 
     def get(self, key: str) -> Optional[str]:
         return self._client.get(key)

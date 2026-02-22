@@ -25,6 +25,9 @@ def test_get_cache_backend_uses_redis_when_available(monkeypatch):
         def __init__(self):
             self.store = {}
 
+        def ping(self):
+            return True
+
         def get(self, key):
             return self.store.get(key)
 
@@ -55,3 +58,17 @@ def test_get_cache_backend_uses_redis_when_available(monkeypatch):
     backend.set_json("sample", {"ok": True}, ttl_seconds=30)
     assert backend.get_json("sample") == {"ok": True}
     assert backend.incr("counter", ttl_seconds=30) == 1
+
+
+def test_get_cache_backend_falls_back_when_redis_ping_fails(monkeypatch):
+    class BadRedisClient:
+        def ping(self):
+            raise RuntimeError("cannot connect")
+
+    fake_redis_module = SimpleNamespace(from_url=lambda *_args, **_kwargs: BadRedisClient())
+    monkeypatch.setattr(cache_backend.config, "REDIS_URL", "redis://broken")
+    monkeypatch.setattr(cache_backend, "redis", fake_redis_module)
+    cache_backend.reset_cache_backend_for_tests()
+
+    backend = cache_backend.get_cache_backend()
+    assert backend.backend == "memory"
