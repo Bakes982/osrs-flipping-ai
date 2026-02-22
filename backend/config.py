@@ -119,3 +119,23 @@ BACKTEST_MAX_DAYS = int(os.environ.get("BACKTEST_MAX_DAYS", "30"))
 # ---------------------------------------------------------------------------
 # Default capital used by build_trade_plan() when no user-level capital is set.
 DEFAULT_CAPITAL_GP = int(os.environ.get("DEFAULT_CAPITAL_GP", "50000000"))
+
+# ---------------------------------------------------------------------------
+# Dump Detector v2 — quality filters for actionable alerts
+# ---------------------------------------------------------------------------
+# Minimum insta-sell price to consider (skip cheap junk).
+DUMP_V2_MIN_PRICE_GP = int(os.environ.get("DUMP_V2_MIN_PRICE_GP", "500000"))
+# Minimum % drop from 4h reference average before flagging as a dump.
+DUMP_V2_MIN_DROP_PCT = float(os.environ.get("DUMP_V2_MIN_DROP_PCT", "4.0"))
+# Minimum combined 5m volume (sold_5m + bought_5m) to confirm trading activity.
+DUMP_V2_MIN_VOLUME_TRADES = int(os.environ.get("DUMP_V2_MIN_VOLUME_TRADES", "25"))
+# Minimum sell-side dominance — sold_5m / total_5m must meet this threshold.
+DUMP_V2_MIN_SELL_RATIO = float(os.environ.get("DUMP_V2_MIN_SELL_RATIO", "0.80"))
+# Minimum net profit per item (after GE tax) required to alert.
+DUMP_V2_MIN_PROFIT_PER_ITEM = int(os.environ.get("DUMP_V2_MIN_PROFIT_PER_ITEM", "2000"))
+# Minimum estimated total profit (profit_per_item × qty) required to alert.
+DUMP_V2_MIN_TOTAL_PROFIT = int(os.environ.get("DUMP_V2_MIN_TOTAL_PROFIT", "150000"))
+# Per-item alert cooldown in minutes — prevents spam for the same item.
+DUMP_V2_COOLDOWN_MINUTES = int(os.environ.get("DUMP_V2_COOLDOWN_MINUTES", "60"))
+# Position cap used when computing trade plan quantity (fraction of capital).
+DUMP_V2_POSITION_CAP_PCT = float(os.environ.get("DUMP_V2_POSITION_CAP_PCT", "0.10"))

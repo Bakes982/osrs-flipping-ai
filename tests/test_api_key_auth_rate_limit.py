@@ -56,7 +56,7 @@ async def test_top5_invalid_key_returns_401(monkeypatch):
     monkeypatch.setattr(routes, "check_rate_limit", lambda **_kwargs: (True, 1))
 
     with pytest.raises(HTTPException) as exc:
-        await routes.get_top5_runelite(_request("/flips/top5", api_key="bad"), profile="balanced", min_score=45.0, min_confidence=0.0)
+        await routes.get_top5_runelite(_request("/flips/top5", api_key="bad"), profile="balanced")
     assert exc.value.status_code == 401
 
 
@@ -73,7 +73,7 @@ async def test_top5_valid_key_returns_200(monkeypatch):
     monkeypatch.setattr(routes, "resolve_api_key_owner", lambda _k: ("hash123", "user1"))
     monkeypatch.setattr(routes, "check_rate_limit", lambda **_kwargs: (True, 1))
 
-    response = await routes.get_top5_runelite(_request("/flips/top5", api_key="valid"), profile="balanced", min_score=45.0, min_confidence=0.0)
+    response = await routes.get_top5_runelite(_request("/flips/top5", api_key="valid"), profile="balanced")
     assert len(response.flips) == 1
 
 
@@ -91,6 +91,6 @@ async def test_top5_rate_limit_exceeded_returns_429(monkeypatch):
     monkeypatch.setattr(routes, "check_rate_limit", lambda **_kwargs: (False, 61))
 
     with pytest.raises(HTTPException) as exc:
-        await routes.get_top5_runelite(_request("/flips/top5", api_key="valid"), profile="balanced", min_score=45.0, min_confidence=0.0)
+        await routes.get_top5_runelite(_request("/flips/top5", api_key="valid"), profile="balanced")
     assert exc.value.status_code == 429
 
