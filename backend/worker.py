@@ -150,8 +150,12 @@ async def _run_dump_smoke_test() -> None:
 
     logger.info("DUMP_SMOKE_TEST resolved %d -> %s", SMOKE_ITEM_ID, name)
 
-    # --- 2. Fetch the dump webhook URL (same lookup as AlertMonitor) ---
+    # --- 2. Fetch the dump webhook URL (same priority as AlertMonitor) ---
     def _get_dump_webhook() -> str | None:
+        # env override is highest priority — same as _get_dump_alert_webhook_sync
+        env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
+        if env_url:
+            return env_url
         init_db()
         db = get_db()
         try:
@@ -215,6 +219,18 @@ async def main_async() -> None:
             config.RUN_MODE,
         )
         return
+
+    # Version stamp — visible in Railway logs on every deploy
+    try:
+        import subprocess as _sp
+        _git_hash = _sp.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=_sp.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        _git_hash = "unknown"
+    logger.info("APP_VERSION dump-v2 commit=%s", _git_hash)
 
     if os.environ.get("DUMP_SMOKE_TEST"):
         await _run_dump_smoke_test()
