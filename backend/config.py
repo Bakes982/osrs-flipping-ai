@@ -73,3 +73,49 @@ WORKER_OK_MAX_AGE_SECONDS = int(os.environ.get("WORKER_OK_MAX_AGE_SECONDS", "180
 # in cross-domain preflight requests.
 # ---------------------------------------------------------------------------
 CORS_ORIGINS = ["*"]
+
+# ---------------------------------------------------------------------------
+# PR9 — Strategy mode default override
+# ---------------------------------------------------------------------------
+# When set to a valid StrategyMode value (e.g. "steady_spice"), new user
+# accounts will default to that strategy instead of "steady".
+FORCE_DEFAULT_STRATEGY_MODE = os.environ.get("FORCE_DEFAULT_STRATEGY_MODE", "")
+
+# ---------------------------------------------------------------------------
+# PR10 — Flip recommendation dampening / hysteresis
+# ---------------------------------------------------------------------------
+# An item must qualify for DAMPENING_K consecutive worker cycles before it
+# enters the eligible (visible) set.
+DAMPENING_K = int(os.environ.get("DAMPENING_K", "3"))
+# Once active, confidence can dip this many points below min before eviction.
+HYSTERESIS_CONF_MARGIN = float(os.environ.get("HYSTERESIS_CONF_MARGIN", "5"))
+# Same margin applied to total_score for score-based hysteresis.
+HYSTERESIS_SCORE_MARGIN = float(os.environ.get("HYSTERESIS_SCORE_MARGIN", "5"))
+
+# ---------------------------------------------------------------------------
+# PR11 — Dump detector knobs
+# ---------------------------------------------------------------------------
+# Window (minutes) for short-return price-drop signal.
+DUMP_SHORT_RETURN_WINDOW_MIN = int(os.environ.get("DUMP_SHORT_RETURN_WINDOW_MIN", "10"))
+# Thresholds for dump_signal classification (score 0-100).
+DUMP_WATCH_THRESHOLD  = float(os.environ.get("DUMP_WATCH_THRESHOLD", "40"))
+DUMP_HIGH_THRESHOLD   = float(os.environ.get("DUMP_HIGH_THRESHOLD", "70"))
+# Consecutive cycles with dump_signal=="high" before alert fires.
+DUMP_ALERT_PERSISTENCE = int(os.environ.get("DUMP_ALERT_PERSISTENCE", "2"))
+# Score thresholds above which an item is vetoed from each bucket.
+DUMP_CORE_VETO_THRESHOLD  = float(os.environ.get("DUMP_CORE_VETO_THRESHOLD", "70"))
+DUMP_SPICE_VETO_THRESHOLD = float(os.environ.get("DUMP_SPICE_VETO_THRESHOLD", "50"))
+
+# ---------------------------------------------------------------------------
+# PR12 — Backtest endpoint
+# ---------------------------------------------------------------------------
+# Admin key required to call GET /backtest/run (empty = open access in dev).
+BACKTEST_ADMIN_KEY = os.environ.get("BACKTEST_ADMIN_KEY", "")
+# Maximum days of history a single backtest request may span.
+BACKTEST_MAX_DAYS = int(os.environ.get("BACKTEST_MAX_DAYS", "30"))
+
+# ---------------------------------------------------------------------------
+# Trade plan — capital and position sizing defaults
+# ---------------------------------------------------------------------------
+# Default capital used by build_trade_plan() when no user-level capital is set.
+DEFAULT_CAPITAL_GP = int(os.environ.get("DEFAULT_CAPITAL_GP", "50000000"))

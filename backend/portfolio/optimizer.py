@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from backend.core.constants import (
     MAX_SINGLE_POSITION_PCT,
@@ -30,6 +30,70 @@ from backend.core.utils import ge_tax, safe_div, clamp, format_gp
 from backend.prediction.risk import kelly_fraction, stop_loss_pct as compute_stop_loss
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bucket classification thresholds (PR9)
+# ---------------------------------------------------------------------------
+
+# Core bucket: high-certainty flips
+_CORE_MIN_CONFIDENCE    = 0.55   # 0-1 scale (== 55 / 100)
+_CORE_MIN_FILL_PROB     = 0.45
+_CORE_MAX_DECAY         = 0.0    # stub; 0 = no decay filter yet
+
+# Spice bucket: higher upside but lower certainty
+_SPICE_MIN_CONFIDENCE   = 0.35
+_SPICE_MIN_FILL_PROB    = 0.30
+_SPICE_MIN_ROI          = 1.5    # %
+_SPICE_MAX_DECAY        = 0.0    # stub
+
+
+def is_core_candidate(metrics: dict) -> bool:
+    """Return True if the metrics qualify as a *core* flip candidate."""
+    if metrics.get("vetoed"):
+        return False
+    confidence   = metrics.get("confidence", 0.0)
+    fill_prob    = metrics.get("fill_probability", 0.0)
+    net_profit   = metrics.get("net_profit", 0)
+    dump_risk    = metrics.get("dump_risk_score", 0.0)     # PR11 stub (0 if absent)
+
+    from backend import config as _cfg
+    if dump_risk >= _cfg.DUMP_CORE_VETO_THRESHOLD:
+        return False
+
+    return (
+        net_profit > 0
+        and confidence >= _CORE_MIN_CONFIDENCE
+        and fill_prob  >= _CORE_MIN_FILL_PROB
+    )
+
+
+def is_spice_candidate(metrics: dict) -> bool:
+    """Return True if the metrics qualify as a *spice* flip candidate.
+
+    Spice items are NOT core items that have above-average upside.
+    """
+    if metrics.get("vetoed"):
+        return False
+    if is_core_candidate(metrics):
+        return False   # core takes priority; spice is the "non-core" bucket
+
+    confidence  = metrics.get("confidence", 0.0)
+    fill_prob   = metrics.get("fill_probability", 0.0)
+    roi_pct     = metrics.get("roi_pct", 0.0)
+    net_profit  = metrics.get("net_profit", 0)
+    dump_risk   = metrics.get("dump_risk_score", 0.0)     # PR11 stub
+
+    from backend import config as _cfg
+    if dump_risk >= _cfg.DUMP_SPICE_VETO_THRESHOLD:
+        return False
+
+    high_upside = (roi_pct >= _SPICE_MIN_ROI) or (net_profit >= 50_000)
+    return (
+        net_profit > 0
+        and high_upside
+        and confidence >= _SPICE_MIN_CONFIDENCE
+        and fill_prob  >= _SPICE_MIN_FILL_PROB
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +184,7 @@ def generate_optimal_portfolio(
     ge_slots: int = 8,
     min_score: float = MIN_SUGGEST_SCORE,
     risk_tolerance: str = "MEDIUM",
+    strategy_mode: str = "steady",
 ) -> PortfolioAllocation:
     """Generate an optimal GE portfolio allocation.
 
@@ -134,6 +199,13 @@ def generate_optimal_portfolio(
     risk_tolerance:
         ``"LOW"`` | ``"MEDIUM"`` | ``"HIGH"`` — adjusts position-size caps
         and minimum score threshold.
+    strategy_mode:
+        ``"steady"`` | ``"steady_spice"`` | ``"spice_only"`` (PR9).
+        Controls how many slots are allocated to core vs spice candidates.
+        - steady:       all slots from core bucket
+        - steady_spice: exactly 1 slot reserved for the best spice candidate;
+                        remaining slots filled from core
+        - spice_only:   all slots from spice bucket
 
     Returns
     -------
@@ -158,8 +230,11 @@ def generate_optimal_portfolio(
     max_deployable = int(capital * MAX_TOTAL_EXPOSURE_PCT)
     remaining = max_deployable
 
+    # Normalise strategy_mode
+    mode = (strategy_mode or "steady").lower()
+
     # Fetch candidate opportunities from the scoring pipeline
-    candidates = _fetch_candidates(min_score, limit=ge_slots * 4)
+    candidates = _fetch_candidates(min_score, limit=ge_slots * 6)
     if not candidates:
         plan.warnings.append("No opportunities scored above threshold — try lowering min_score")
         return plan
@@ -167,31 +242,42 @@ def generate_optimal_portfolio(
     # Sort by risk-adjusted GP/hour (primary) then by score (secondary)
     candidates.sort(key=lambda c: (_adj_gph(c), c.get("total_score", 0)), reverse=True)
 
-    # Greedy allocation: fill each slot with the best remaining candidate
-    item_exposure: Dict[int, int] = {}  # item_id → total GP allocated
-    used_item_ids = set()
+    # PR9 — Partition candidates into core and spice pools.
+    # Candidates without fill_probability (legacy / test data) default to a
+    # pass-through: treat the whole list as core when both pools are empty.
+    core_pool  = [c for c in candidates if is_core_candidate(c)]
+    spice_pool = [c for c in candidates if is_spice_candidate(c)]
 
-    for slot_idx in range(1, ge_slots + 1):
-        if remaining <= 0 or not candidates:
+    # Fallback: if strict gating leaves both pools empty, treat all non-vetoed
+    # candidates as core so legacy behaviour and existing tests aren't broken.
+    if not core_pool and not spice_pool:
+        core_pool = [c for c in candidates if not c.get("vetoed")]
+
+    # Build the ordered slot list according to strategy_mode
+    if mode == "spice_only":
+        pool = spice_pool or core_pool   # graceful fallback when no spice
+        ordered = _plan_slots(pool, [], ge_slots, 0)
+    elif mode == "steady_spice":
+        # Reserve exactly 1 slot for the best spice item
+        ordered = _plan_slots(core_pool, spice_pool, ge_slots, spice_slots=1)
+    else:  # "steady" (default)
+        ordered = _plan_slots(core_pool, [], ge_slots, 0)
+
+    # Greedy allocation over the ordered candidate list
+    item_exposure: Dict[int, int] = {}
+    used_item_ids: set = set()
+    slot_idx = 1
+
+    for chosen in ordered:
+        if remaining <= 0 or slot_idx > ge_slots:
             break
 
-        # Pick the best candidate not already in the portfolio
-        chosen = None
-        for cand in candidates:
-            iid = cand.get("item_id", 0)
-            if iid in used_item_ids:
-                continue
-            # Check item exposure
-            existing = item_exposure.get(iid, 0)
-            if existing >= capital * item_cap:
-                continue
-            chosen = cand
-            break
-
-        if chosen is None:
-            break
-
-        candidates.remove(chosen)
+        iid = chosen.get("item_id", 0)
+        if iid in used_item_ids:
+            continue
+        existing = item_exposure.get(iid, 0)
+        if existing >= capital * item_cap:
+            continue
 
         alloc = _build_slot_allocation(
             slot=slot_idx,
@@ -200,19 +286,20 @@ def generate_optimal_portfolio(
             remaining=remaining,
             position_cap=position_cap,
             item_cap=item_cap,
-            existing_exposure=item_exposure.get(chosen.get("item_id", 0), 0),
+            existing_exposure=existing,
         )
         if alloc is None:
             continue
 
         used_item_ids.add(alloc.item_id)
-        item_exposure[alloc.item_id] = item_exposure.get(alloc.item_id, 0) + alloc.investment
+        item_exposure[alloc.item_id] = existing + alloc.investment
         remaining -= alloc.investment
 
         plan.slots.append(alloc)
         plan.allocated_capital += alloc.investment
         plan.total_expected_profit += alloc.expected_net_profit
         plan.total_expected_gp_per_hour += alloc.gp_per_hour
+        slot_idx += 1
 
     plan.reserved_capital = capital - plan.allocated_capital
     plan.portfolio_roi_pct = safe_div(plan.total_expected_profit, plan.allocated_capital) * 100
@@ -225,6 +312,51 @@ def generate_optimal_portfolio(
         )
 
     return plan
+
+
+# ---------------------------------------------------------------------------
+# PR9 — Slot ordering helper
+# ---------------------------------------------------------------------------
+
+def _plan_slots(
+    core_pool: List[dict],
+    spice_pool: List[dict],
+    total_slots: int,
+    spice_slots: int,
+) -> List[dict]:
+    """Return an ordered list of candidates for slot filling.
+
+    core_pool  : list of core-bucket candidates (sorted best-first)
+    spice_pool : list of spice-bucket candidates (sorted best-first)
+    total_slots: total GE slots to fill
+    spice_slots: number of slots reserved for spice (0 or 1 for now)
+    """
+    core_slots = total_slots - spice_slots
+    ordered: List[dict] = []
+
+    # Fill core slots first
+    core_seen: set = set()
+    for c in core_pool:
+        if len(ordered) >= core_slots:
+            break
+        iid = c.get("item_id", 0)
+        if iid not in core_seen:
+            ordered.append(c)
+            core_seen.add(iid)
+
+    # Then append spice candidates at the end
+    spice_seen: set = set()
+    spice_added = 0
+    for s in spice_pool:
+        if spice_added >= spice_slots:
+            break
+        iid = s.get("item_id", 0)
+        if iid not in core_seen and iid not in spice_seen:
+            ordered.append(s)
+            spice_seen.add(iid)
+            spice_added += 1
+
+    return ordered
 
 
 # ---------------------------------------------------------------------------

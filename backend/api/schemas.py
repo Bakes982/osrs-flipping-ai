@@ -19,6 +19,20 @@ from pydantic import BaseModel, Field, RootModel
 
 
 # ---------------------------------------------------------------------------
+# Trade plan (build_trade_plan output — additive to any flip payload)
+# ---------------------------------------------------------------------------
+
+class TradePlan(BaseModel):
+    """Deterministic trade sizing plan for one flip opportunity."""
+    buy_price: int
+    sell_price: int
+    qty_to_buy: int
+    profit_per_item: int
+    total_profit: int
+    max_invest_gp: int
+
+
+# ---------------------------------------------------------------------------
 # Shared primitives
 # ---------------------------------------------------------------------------
 
@@ -141,6 +155,14 @@ class FlipSummary(BaseModel):
     reasons: List[str] = Field(default_factory=list)
     badges: List[str] = Field(default_factory=list)
     vetoed: bool = False
+    # PR10 stability
+    stable_for_cycles: int   = 0
+    stable_for_minutes: float = 0.0
+    # PR11 dump detection
+    dump_risk_score: float   = 0.0
+    dump_signal:     str     = "none"
+    # Trade plan
+    trade_plan: Optional[TradePlan] = None
 
 
 class FlipsTopResponse(BaseModel):
@@ -225,18 +247,30 @@ class RuneLiteFlip(BaseModel):
     p: int              = Field(alias="net_profit")
     r: float            = Field(alias="roi_pct")
     sc: float           = Field(alias="total_score")
-    c: float            = Field(alias="confidence_pct")
-    rl: str             = Field(alias="risk_level")
+    c: float            = Field(0.0, alias="confidence_pct")
+    rl: str             = Field("MEDIUM", alias="risk_level")
     reasons: List[str] = Field(default_factory=list)
     badges: List[str] = Field(default_factory=list)
+    # PR10 stability fields
+    stable_cycles: int  = Field(0, alias="stable_for_cycles")
+    stable_min: float   = Field(0.0, alias="stable_for_minutes")
+    # PR11 dump fields
+    dump_risk:  float   = Field(0.0, alias="dump_risk_score")
+    dump_sig:   str     = Field("none", alias="dump_signal")
+    # Trade plan
+    trade_plan: Optional[TradePlan] = None
 
     class Config:
         populate_by_name = True
 
 
 class RuneLiteTop5Response(BaseModel):
-    """Response for GET /flips/top5 — optimised for plugin latency."""
+    """Response for GET /flips/top5 — optimised for plugin latency.
+
+    Always served from the in-memory cache (no DB I/O) for <200 ms latency.
+    """
     ts: int             # Unix timestamp
+    cached: bool = True # PR10: always True — this is cache-served
     flips: List[RuneLiteFlip]
     cache_ts: Optional[datetime] = None
     cache_age_seconds: Optional[int] = None

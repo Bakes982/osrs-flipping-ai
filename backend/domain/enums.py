@@ -111,3 +111,20 @@ class VolumeRating(str, Enum):
     LOW    = "LOW"
     MEDIUM = "MEDIUM"
     HIGH   = "HIGH"
+
+
+# ---------------------------------------------------------------------------
+# Strategy mode (PR9) — governs core/spice slot allocation
+# ---------------------------------------------------------------------------
+
+class StrategyMode(str, Enum):
+    """
+    Controls how GE slots are allocated across risk buckets.
+
+    steady:       All slots from core bucket (high-certainty flips).
+    steady_spice: 7 core slots + 1 spice slot (default personal mode).
+    spice_only:   All slots from spice bucket (high-upside, lower certainty).
+    """
+    STEADY       = "steady"
+    STEADY_SPICE = "steady_spice"
+    SPICE_ONLY   = "spice_only"

@@ -32,6 +32,7 @@ from backend.api.schemas import (
     FlipsTopResponse,
     RuneLiteFlip,
     RuneLiteTop5Response,
+    TradePlan,
     PortfolioAllocationResponse,
     OptimizePortfolioRequest,
     HealthResponse,
@@ -92,9 +93,42 @@ def _meets_filter(
     return True
 
 
-def _to_summary(m: dict) -> FlipSummary:
+def _build_trade_plan_for(m: dict, capital_gp: int, position_cap_pct: float) -> TradePlan:
+    """Build a TradePlan from a scored metrics dict."""
+    from backend.analytics.trade_plan import build_trade_plan
+    from backend.core.constants import GE_TAX_RATE, GE_TAX_CAP, GE_TAX_FREE_BELOW
+
+    liq = m.get("liquidity_score", 0.0) or 0.0
+    liq_100 = liq * 100.0 if liq <= 1.0 else liq   # normalise to 0..100
+
+    raw = build_trade_plan(
+        buy_price=int(m.get("recommended_buy", 0) or 0),
+        sell_price=int(m.get("recommended_sell", 0) or 0),
+        item_limit=m.get("item_limit") or m.get("buy_limit") or None,
+        liquidity_score=liq_100 if liq_100 > 0 else None,
+        risk_profile_position_cap_pct=position_cap_pct,
+        capital_gp=capital_gp,
+        ge_tax_rate=GE_TAX_RATE,
+        ge_tax_cap=GE_TAX_CAP,
+        ge_tax_free_below=GE_TAX_FREE_BELOW,
+    )
+    return TradePlan(**raw)
+
+
+# Position cap per risk profile (mirrors portfolio optimizer thresholds)
+_PROFILE_POSITION_CAP = {
+    "conservative": 0.08,
+    "balanced":     0.15,
+    "aggressive":   0.20,
+}
+
+
+def _to_summary(m: dict, capital_gp: int = 0, position_cap_pct: float = 0.15) -> FlipSummary:
     conf_pct = _confidence_pct(m)
     reasons, badges = _explain_flip(m)
+    import backend.config as _cfg
+    effective_capital = capital_gp if capital_gp > 0 else _cfg.DEFAULT_CAPITAL_GP
+    trade_plan = _build_trade_plan_for(m, effective_capital, position_cap_pct)
     return FlipSummary(
         item_id=m["item_id"],
         item_name=m.get("item_name", ""),
@@ -128,6 +162,12 @@ def _to_summary(m: dict) -> FlipSummary:
         vetoed=m.get("vetoed", False),
         reasons=reasons,
         badges=badges,
+        # PR10 / PR11 fields
+        stable_for_cycles=m.get("stable_for_cycles", 0),
+        stable_for_minutes=m.get("stable_for_minutes", 0.0),
+        dump_risk_score=m.get("dump_risk_score", 0.0),
+        dump_signal=m.get("dump_signal", "none"),
+        trade_plan=trade_plan,
     )
 
 
@@ -376,7 +416,11 @@ async def get_top_flips(
     _sort_key = {"score": "total_score", "roi": "roi_pct", "gp_per_hour": "gp_per_hour"}.get(sort_by, "total_score")
     filtered.sort(key=lambda m: m.get(_sort_key, 0), reverse=True)
 
-    flips = [_to_summary(m) for m in filtered[:limit]]
+    import backend.config as _cfg
+    capital_gp = getattr(ctx, "capital_gp", None) or _cfg.DEFAULT_CAPITAL_GP
+    profile_key = getattr(active_profile, "value", active_profile)
+    pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
+    flips = [_to_summary(m, capital_gp=capital_gp, position_cap_pct=pos_cap) for m in filtered[:limit]]
     return FlipsTopResponse(
         count=len(flips),
         generated_at=datetime.now(timezone.utc),
@@ -390,18 +434,20 @@ async def get_top_flips(
 @flip_router.get(
     "/top5",
     response_model=RuneLiteTop5Response,
-    summary="Top-5 for RuneLite plugin (Phase 7)",
+    summary="Top-5 for RuneLite plugin (PR10: cache-only)",
     description=(
         "Minimal-payload endpoint optimised for RuneLite plugin polling. "
-        "Target response time < 200 ms.  Returns compact field names."
+        "Served entirely from the in-memory flip cache — no DB I/O. "
+        "Target response time < 200 ms. "
+        "profile: balanced | conservative | aggressive."
     ),
 )
 async def get_top5_runelite(
     request: Request,
     profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
-    min_score: float = Query(45.0, ge=0, le=100),
-    min_confidence: float = Query(0.0, ge=0, le=100),
 ):
+    """Cache-only top-5: reads from backend.flip_cache (no DB)."""
+    # Honour request.state.user_ctx if the caller doesn't specify a profile
     ctx = getattr(request.state, "user_ctx", None)
     active_profile = profile
     if profile == "balanced" and getattr(ctx, "risk_profile", None) is not None:
@@ -417,6 +463,11 @@ async def get_top5_runelite(
         raise HTTPException(status_code=503, detail="Top-5 cache not warmed yet")
     request.state.cache_hit = True
     record_cache_access(True)
+
+    import backend.config as _cfg
+    capital_gp = getattr(ctx, "capital_gp", None) or _cfg.DEFAULT_CAPITAL_GP
+    profile_key = getattr(active_profile, "value", active_profile)
+    pos_cap = _PROFILE_POSITION_CAP.get(str(profile_key), 0.15)
 
     flips = []
     for m in scored[:5]:
@@ -434,10 +485,16 @@ async def get_top5_runelite(
                 risk_level=m.get("risk_level", "MEDIUM"),
                 reasons=reasons,
                 badges=badges,
+                stable_for_cycles=m.get("stable_for_cycles", 0),
+                stable_for_minutes=m.get("stable_for_minutes", 0.0),
+                dump_risk_score=m.get("dump_risk_score", 0.0),
+                dump_signal=m.get("dump_signal", "none"),
+                trade_plan=_build_trade_plan_for(m, capital_gp, pos_cap),
             )
         )
     return RuneLiteTop5Response(
         ts=int(time.time()),
+        cached=True,
         flips=flips,
         cache_ts=cache_ts,
         cache_age_seconds=_cache_age_seconds(cache_ts),
@@ -594,6 +651,7 @@ def register_routes(app: FastAPI) -> None:
     from backend.routers import opportunities, portfolio, analysis, settings, alerts
     from backend.routers import blocklist as blocklist_router
     from backend.routers import user_profile
+    from backend.routers import backtest as backtest_router   # PR12
 
     app.include_router(opportunities.router)
     app.include_router(portfolio.router)
@@ -602,6 +660,7 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(alerts.router)
     app.include_router(blocklist_router.router)
     app.include_router(user_profile.router)
+    app.include_router(backtest_router.router)               # PR12
 
     # New unified endpoints
     app.include_router(flip_router)

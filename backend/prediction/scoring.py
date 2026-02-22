@@ -398,6 +398,24 @@ def calculate_flip_metrics(item_data: dict) -> dict:
     stale_data = stale_minutes > _cfg_float("STALE_MINUTES", 45.0)
     anomalous_spread = spread_cv > 1.5
 
+    # -- Dump risk (PR11) ---------------------------------------------------
+    _dump_input = {
+        "volatility_1h":    volatility_1h,
+        "volatility_24h":   volatility_24h,
+        "spread_compression": decay_penalty,
+        "fill_probability": fill_probability,
+    }
+    dump_score, dump_signal = _compute_dump_risk(_dump_input, points)
+    dump_risk_score = round(dump_score, 2)
+    if dump_signal == "high":
+        final_score = max(0.0, final_score - 30.0)
+        confidence  = confidence * 0.6
+        if "DUMP_HIGH" not in veto_reasons:
+            veto_reasons.append("DUMP_HIGH")
+    elif dump_signal == "watch":
+        if "DUMP_WATCH" not in veto_reasons:
+            veto_reasons.append("DUMP_WATCH")
+
     return {
         "item_id": item_id,
         "item_name": item_name,
@@ -454,6 +472,9 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         "risk_adjusted_gp_per_hour": round(risk_adjusted_gph, 2),
         "margin_after_tax": int(margin_after_tax),
         "final_score": float(final_score),
+        # PR11 — dump risk
+        "dump_risk_score": dump_risk_score,
+        "dump_signal": dump_signal,
     }
 
 
@@ -523,4 +544,116 @@ def _empty(item_id: int, item_name: str) -> Dict[str, Any]:
         "risk_adjusted_gp_per_hour": 0.0,
         "margin_after_tax": 0,
         "final_score": 0.0,
+        # PR11 — dump risk
+        "dump_risk_score": 0.0,
+        "dump_signal": "none",
     }
+
+
+# ---------------------------------------------------------------------------
+# PR11 — Dump Risk Score
+# ---------------------------------------------------------------------------
+
+def _compute_dump_risk(result: dict, snapshots: list) -> tuple[float, str]:
+    """Compute a dump risk score 0..100 for the item.
+
+    Signals used (weighted sum → clamp to 0-100):
+      35% short_return   — negative % price change over ~10-minute window
+      25% vol_spike      — volatility_1h / max(volatility_24h, 0.001)
+      25% spread_comp    — spread compression / spread widening spike proxy
+      15% fill_drop      — drop in fill_probability vs the current cycle baseline
+
+    Returns
+    -------
+    (dump_risk_score, dump_signal)
+        dump_risk_score : float  0–100
+        dump_signal     : str    "none" | "watch" | "high"
+    """
+    from backend import config as _cfg
+    _TINY = 1e-6
+
+    # 1) Short-return: % change in mid price over last N snapshots
+    #    A sharp negative return → high dump signal
+    window = _cfg.DUMP_SHORT_RETURN_WINDOW_MIN   # minutes
+    # Each snapshot is spaced ~1 min apart in the data model
+    n_snaps = max(1, window)
+    if len(snapshots) >= n_snaps + 1:
+        def _mid(p) -> float:
+            # p is either a normalized points dict (has "mid") or a snapshot object/dict
+            if isinstance(p, dict):
+                return p.get("mid") or (
+                    ((p.get("instant_buy") or p.get("high") or 0)
+                     + (p.get("instant_sell") or p.get("low") or 0)) / 2.0
+                ) or _TINY
+            return ((getattr(p, "instant_buy", 0) or 0)
+                    + (getattr(p, "instant_sell", 0) or 0)) / 2.0 or _TINY
+
+        old_mid = _mid(snapshots[-(n_snaps + 1)])
+        new_mid = _mid(snapshots[-1])
+        short_return = (new_mid - old_mid) / max(old_mid, _TINY)
+        # Negative return → dump; clamp to [-1, 0]
+        neg_return = max(-short_return, 0.0)   # 0 = no drop, 1 = 100% drop
+        norm_neg_return = min(neg_return * 10, 1.0)  # scale so -10% → 1.0
+    else:
+        norm_neg_return = 0.0
+
+    # 2) Volatility spike
+    vol_1h  = result.get("volatility_1h",  0.0)
+    vol_24h = result.get("volatility_24h", 0.0)
+    vol_ratio = vol_1h / max(vol_24h, _TINY)
+    norm_vol_spike = min((vol_ratio - 1.0) / 4.0, 1.0)   # 5× spike → 1.0
+    norm_vol_spike = max(0.0, norm_vol_spike)
+
+    # 3) Spread compression (a sudden spread compression may signal a dump
+    #    as market makers pull bids; we look for abnormal spread_compression)
+    spread_comp = result.get("spread_compression", 0.0)
+    # Negative spread_compression means spread widening → suspicious
+    norm_compression = min(max(-spread_comp, 0.0) / 0.05, 1.0)  # 5%/min → 1.0
+
+    # 4) Fill-probability drop (compare to a small baseline of 0.5)
+    #    If fill_probability is very low relative to expected, it signals dump
+    fill_prob = result.get("fill_probability", 0.5)
+    fill_drop = max(0.5 - fill_prob, 0.0) / 0.5   # 0 = normal, 1 = fill_prob=0
+    norm_fill_drop = min(fill_drop, 1.0)
+
+    # Weighted sum
+    raw = (
+        0.35 * norm_neg_return
+        + 0.25 * norm_vol_spike
+        + 0.25 * norm_compression
+        + 0.15 * norm_fill_drop
+    )
+    dump_score = min(max(raw, 0.0), 1.0) * 100.0
+
+    watch_threshold = _cfg.DUMP_WATCH_THRESHOLD
+    high_threshold  = _cfg.DUMP_HIGH_THRESHOLD
+
+    if dump_score >= high_threshold:
+        signal = "high"
+    elif dump_score >= watch_threshold:
+        signal = "watch"
+    else:
+        signal = "none"
+
+    return dump_score, signal
+
+
+def _apply_dump_penalties(result: dict, dump_signal: str) -> None:
+    """Add DUMP badges/reasons and penalise score when dump signal is elevated."""
+    if dump_signal == "none":
+        return
+
+    veto_reasons = result.setdefault("veto_reasons", [])
+
+    if dump_signal in ("watch", "high"):
+        if "DUMP_WATCH" not in veto_reasons:
+            veto_reasons.append("DUMP_WATCH")
+        result["reason"] = "Dump risk elevated (short-term drop / vol spike)"
+
+    if dump_signal == "high":
+        if "DUMP_HIGH" not in veto_reasons:
+            veto_reasons.append("DUMP_HIGH")
+        # Penalise total_score by 30 points for high-dump items
+        result["total_score"] = max(0.0, result.get("total_score", 0.0) - 30.0)
+        # Penalise confidence
+        result["confidence"]  = result.get("confidence", 0.0) * 0.6
