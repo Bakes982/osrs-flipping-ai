@@ -1,126 +1,155 @@
 """
-backend.alerts.item_name_resolver — OSRS item ID → name lookup with TTL cache.
+backend.alerts.item_name_resolver — Item ID → human-readable name (v2).
 
-Uses the OSRS Wiki mapping endpoint (no auth required).  The full mapping is
-fetched at most once per TTL window (default 6 h) and held in memory.  All
-public methods are safe to call from any thread (a threading.Lock protects
-the lazy-refresh path).
+Fetches the OSRS Wiki /mapping endpoint once and caches the result in
+module-level globals for 6 hours.  Avoids "Item 31099" appearing in Discord
+alerts by ensuring the mapping is always fresh and correctly indexed.
 
-Typical usage::
+Public API
+----------
+    resolve_item_name(item_id, fallback=None) -> str
+    invalidate_cache() -> None
 
-    from backend.alerts.item_name_resolver import resolver
-    name = resolver.resolve(4151)   # → "Abyssal whip"
+Resolution order:
+    1. If ``fallback`` is non-empty and does NOT start with "Item " → return it.
+    2. Look up the OSRS Wiki mapping (6-hour TTL cache) → return name.
+    3. Return f"Item {item_id}" as a last resort.
+
+Compatibility
+-------------
+A ``resolver`` singleton is also provided for legacy callers that use
+``resolver.resolve(item_id, fallback="")``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import threading
 import time
-import urllib.request
-from typing import Dict, Optional
+from typing import Optional
+
+import requests
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_MAPPING_URL = "https://prices.runescape.wiki/api/v1/osrs/mapping"
+_HEADERS = {
+    "User-Agent": (
+        "OSRS-Flipping-AI/2.0 "
+        "(github.com/Bakes982/osrs-flipping-ai; "
+        "contact: mike.baker982@hotmail.com)"
+    )
+}
+_TTL_SECONDS: int = 6 * 3600  # 6 hours
+
+# ---------------------------------------------------------------------------
+# Module-level cache (survives the process lifetime between refreshes)
+# ---------------------------------------------------------------------------
+
+_mapping_cache: Optional[dict[int, str]] = None
+_mapping_cache_ts: Optional[float] = None
 
 logger = logging.getLogger(__name__)
 
-_MAPPING_URL = "https://prices.runescape.wiki/api/v1/osrs/mapping"
-_USER_AGENT  = "OSRS-AI-Flipper v2.0 - Discord: bakes982"
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_mapping() -> dict[int, str]:
+    """Download the full item mapping from the OSRS Wiki and return {id: name}."""
+    resp = requests.get(_MAPPING_URL, headers=_HEADERS, timeout=10)
+    resp.raise_for_status()
+    entries = resp.json()  # list of dicts
+    result: dict[int, str] = {}
+    for entry in entries:
+        try:
+            result[int(entry["id"])] = str(entry["name"])
+        except (KeyError, ValueError, TypeError):
+            continue
+    return result
 
 
-class ItemNameResolver:
-    """Thread-safe item-ID-to-name resolver backed by OSRS Wiki mapping API.
+def _ensure_cache_fresh() -> dict[int, str]:
+    """Return the in-memory name mapping, refreshing it when stale or absent."""
+    global _mapping_cache, _mapping_cache_ts
+    now = time.time()
+    needs_refresh = (
+        _mapping_cache is None
+        or _mapping_cache_ts is None
+        or (now - _mapping_cache_ts) >= _TTL_SECONDS
+    )
+    if needs_refresh:
+        try:
+            new_cache = _fetch_mapping()
+            _mapping_cache = new_cache
+            _mapping_cache_ts = now
+            logger.info(
+                "item_name_resolver: mapping refreshed (%d items)", len(_mapping_cache)
+            )
+        except Exception as exc:
+            logger.warning("item_name_resolver: mapping fetch failed: %s", exc)
+            if _mapping_cache is None:
+                # First-ever fetch failed — use empty dict so the module stays usable
+                _mapping_cache = {}
+            # Do NOT update _mapping_cache_ts so the next call will retry
+    return _mapping_cache  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def resolve_item_name(item_id: int, fallback: Optional[str] = None) -> str:
+    """Resolve an OSRS item ID to its human-readable name.
 
     Parameters
     ----------
-    ttl_seconds:
-        How long the cached mapping is considered fresh.  After this period
-        the next ``resolve()`` call will attempt a background refresh.
-        Default: 6 hours.
+    item_id:
+        Integer item ID (e.g. 4151).
+    fallback:
+        Optional pre-existing name string (e.g. from a DB record or a
+        previous scan result).
+
+    Returns
+    -------
+    str
+        Human-readable name such as ``"Abyssal whip"``, or
+        ``"Item 4151"`` if resolution fails entirely.
     """
+    # Fast path: caller already has a real name that isn't a fallback placeholder
+    if fallback is not None:
+        stripped = fallback.strip()
+        if stripped and not stripped.startswith("Item "):
+            return stripped
 
-    def __init__(self, ttl_seconds: float = 6 * 3600) -> None:
-        self._ttl      = ttl_seconds
-        self._cache:   Dict[int, str] = {}
-        self._fetched_at: float       = 0.0
-        self._lock = threading.Lock()
+    # Fetch / use cached mapping
+    mapping = _ensure_cache_fresh()
+    name = mapping.get(int(item_id))
+    if name:
+        return name
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    return f"Item {item_id}"
+
+
+def invalidate_cache() -> None:
+    """Force the next call to re-fetch the mapping (useful in tests)."""
+    global _mapping_cache, _mapping_cache_ts
+    _mapping_cache = None
+    _mapping_cache_ts = None
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim for legacy callers using resolver.resolve(item_id)
+# ---------------------------------------------------------------------------
+
+class _ResolverCompat:
+    """Thin wrapper around resolve_item_name() for legacy callers."""
 
     def resolve(self, item_id: int, fallback: str = "") -> str:
-        """Return the display name for ``item_id``.
-
-        If the cache is stale a refresh is attempted; failures leave the
-        stale cache in place so callers always get *something*.
-
-        Parameters
-        ----------
-        item_id:
-            Numeric OSRS item ID.
-        fallback:
-            Returned when the item is not found in the mapping.
-            Defaults to ``"Item {item_id}"`` when empty.
-        """
-        if self.is_stale():
-            self._try_refresh()
-
-        name = self._cache.get(item_id)
-        if name:
-            return name
-        return fallback if fallback else f"Item {item_id}"
-
-    def is_stale(self) -> bool:
-        """True if the mapping has never been fetched or has expired."""
-        return (time.time() - self._fetched_at) > self._ttl
-
-    def prefetch(self) -> bool:
-        """Eagerly fetch the mapping.  Returns True on success."""
-        return self._try_refresh()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _try_refresh(self) -> bool:
-        """Attempt to refresh the mapping; silently swallows errors."""
-        with self._lock:
-            # Double-checked locking: another thread may have refreshed
-            # while we were waiting.
-            if not self.is_stale():
-                return True
-            try:
-                self._fetch()
-                return True
-            except Exception as exc:
-                logger.warning(
-                    "ItemNameResolver: mapping refresh failed — %s "
-                    "(stale cache has %d entries)",
-                    exc, len(self._cache),
-                )
-                return False
-
-    def _fetch(self) -> None:
-        """Fetch the OSRS Wiki mapping and update the cache (not thread-safe; hold lock)."""
-        req = urllib.request.Request(
-            _MAPPING_URL,
-            headers={"User-Agent": _USER_AGENT},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read()
-
-        items = json.loads(raw)
-        new_cache: Dict[int, str] = {}
-        for entry in items:
-            iid  = entry.get("id")
-            name = entry.get("name")
-            if isinstance(iid, int) and name:
-                new_cache[iid] = name
-
-        self._cache      = new_cache
-        self._fetched_at = time.time()
-        logger.debug("ItemNameResolver: refreshed mapping (%d items)", len(new_cache))
+        return resolve_item_name(item_id, fallback if fallback else None)
 
 
 # Module-level singleton shared across the process
-resolver = ItemNameResolver()
+resolver = _ResolverCompat()

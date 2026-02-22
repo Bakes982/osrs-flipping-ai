@@ -78,8 +78,6 @@ async def test_top5_cache_only_does_not_trigger_live_compute(monkeypatch):
     response = await routes.get_top5_runelite(
         _request("/flips/top5"),
         profile="balanced",
-        min_score=45.0,
-        min_confidence=0.0,
     )
     assert len(response.flips) == 1
     assert response.profile_used == "balanced"

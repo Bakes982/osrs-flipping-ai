@@ -1,212 +1,214 @@
 """
-Tests for backend.alerts.item_name_resolver.ItemNameResolver.
+Unit tests for backend.alerts.item_name_resolver.
 
-Covers:
-  1. resolve() returns name from populated cache
-  2. resolve() returns "Item {id}" default fallback when not found
-  3. resolve() returns custom fallback when provided and not found
-  4. is_stale() is True when never fetched; False after fetch
-  5. Stale cache triggers a refresh attempt on next resolve()
-  6. Network failure leaves stale cache in place (name still resolved from old data)
-  7. Network failure on empty cache returns fallback (no crash)
-  8. Successful refresh updates _fetched_at and populates cache
-  9. Double-checked locking: second call after fresh fetch does NOT re-fetch
- 10. _passes_dump_filters gate in flip_cache
- 11. Cooldown gate in _update_dump_persistence (no double-alert within 60 m)
+Tests
+-----
+* test_resolve_uses_fallback_when_valid
+    When a non-empty fallback that does NOT start with "Item " is supplied,
+    resolve_item_name must return it immediately without hitting the network.
+
+* test_resolve_fetches_mapping_when_fallback_is_Item_x
+    When fallback starts with "Item " (placeholder), the resolver must
+    call requests.get and return the real name from the mapping.
+
+* test_resolve_returns_Item_x_on_fetch_failure
+    When requests.get raises an exception the resolver must silently
+    degrade and return "Item {item_id}".
+
+* test_cache_ttl_not_expired_avoids_second_fetch
+    A second call within the TTL must NOT trigger another HTTP request.
+
+* test_cache_ttl_expired_triggers_refetch
+    Simulating an expired timestamp must trigger a fresh HTTP request.
+
+Also tests the legacy resolver.resolve() compatibility shim and
+flip_cache internal helpers (_passes_dump_filters, cooldown gate).
 """
 
 from __future__ import annotations
 
-import json
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from backend.alerts.item_name_resolver import ItemNameResolver
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _fresh_resolver(entries: list[dict] | None = None) -> ItemNameResolver:
-    """Return a resolver pre-populated with ``entries`` and a fresh timestamp."""
-    r = ItemNameResolver(ttl_seconds=3600)
-    if entries is not None:
-        r._cache      = {e["id"]: e["name"] for e in entries if "id" in e and "name" in e}
-        r._fetched_at = time.time()
-    return r
-
-
-def _stale_resolver(entries: list[dict] | None = None) -> ItemNameResolver:
-    """Return a resolver with an artificially expired timestamp."""
-    r = _fresh_resolver(entries)
-    r._fetched_at = 0.0    # force stale
-    return r
-
-
-def _mock_urlopen(payload: list[dict]):
-    """Context-manager mock for urllib.request.urlopen returning JSON payload."""
-    raw = json.dumps(payload).encode()
+def _make_mapping_response(items: list[dict]) -> MagicMock:
+    """Build a mock requests.Response that returns ``items`` as JSON."""
     mock_resp = MagicMock()
-    mock_resp.read.return_value = raw
-    mock_resp.__enter__ = lambda s: s
-    mock_resp.__exit__  = MagicMock(return_value=False)
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = items
     return mock_resp
 
 
-# ---------------------------------------------------------------------------
-# 1–3: resolve() basics
-# ---------------------------------------------------------------------------
-
-class TestResolveFromCache:
-    def test_known_id_returns_name(self):
-        r = _fresh_resolver([{"id": 4151, "name": "Abyssal whip"}])
-        assert r.resolve(4151) == "Abyssal whip"
-
-    def test_unknown_id_default_fallback(self):
-        r = _fresh_resolver([])
-        assert r.resolve(9999) == "Item 9999"
-
-    def test_unknown_id_custom_fallback(self):
-        r = _fresh_resolver([])
-        assert r.resolve(9999, fallback="Unknown") == "Unknown"
-
-    def test_multiple_items_all_resolved(self):
-        entries = [{"id": 1, "name": "Coins"}, {"id": 2, "name": "Cannonball"}]
-        r = _fresh_resolver(entries)
-        assert r.resolve(1) == "Coins"
-        assert r.resolve(2) == "Cannonball"
+# Reset the module-level cache before/after each test so tests are isolated.
+@pytest.fixture(autouse=True)
+def _reset_cache():
+    """Force the resolver to start each test with a cold cache."""
+    import backend.alerts.item_name_resolver as mod
+    mod._mapping_cache = None
+    mod._mapping_cache_ts = None
+    yield
+    mod._mapping_cache = None
+    mod._mapping_cache_ts = None
 
 
 # ---------------------------------------------------------------------------
-# 4: is_stale()
+# Tests — resolve_item_name functional API
 # ---------------------------------------------------------------------------
 
-class TestIsStale:
-    def test_never_fetched_is_stale(self):
-        r = ItemNameResolver()
-        assert r.is_stale()
 
-    def test_fresh_after_fetch(self):
-        r = _fresh_resolver([])
-        assert not r.is_stale()
+class TestResolveItemName:
+    def test_resolve_uses_fallback_when_valid(self):
+        """Non-placeholder fallback is returned without any HTTP call."""
+        from backend.alerts.item_name_resolver import resolve_item_name
 
-    def test_expires_after_ttl(self):
-        r = ItemNameResolver(ttl_seconds=1)
-        r._fetched_at = time.time() - 2    # 2 s ago, TTL=1 s
-        assert r.is_stale()
+        with patch("backend.alerts.item_name_resolver.requests.get") as mock_get:
+            result = resolve_item_name(4151, fallback="Dragon claws")
 
+        assert result == "Dragon claws"
+        mock_get.assert_not_called()
 
-# ---------------------------------------------------------------------------
-# 5: Stale triggers refresh
-# ---------------------------------------------------------------------------
+    def test_resolve_uses_fallback_strips_whitespace(self):
+        """Fallback with surrounding whitespace is stripped and accepted."""
+        from backend.alerts.item_name_resolver import resolve_item_name
 
-class TestStaleTriggersRefresh:
-    def test_stale_cache_refreshed_on_resolve(self):
-        r = _stale_resolver()
-        payload = [{"id": 1234, "name": "Dragon scimitar"}]
+        with patch("backend.alerts.item_name_resolver.requests.get") as mock_get:
+            result = resolve_item_name(4151, fallback="  Twisted bow  ")
 
-        with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
-            name = r.resolve(1234)
+        assert result == "Twisted bow"
+        mock_get.assert_not_called()
 
-        assert name == "Dragon scimitar"
+    def test_resolve_fetches_mapping_when_fallback_is_Item_x(self):
+        """Placeholder fallback 'Item 4151' triggers a Wiki mapping fetch."""
+        from backend.alerts.item_name_resolver import resolve_item_name
 
-    def test_after_refresh_cache_is_fresh(self):
-        r = _stale_resolver()
-        payload = [{"id": 1, "name": "Coins"}]
-
-        with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
-            r.resolve(1)
-
-        assert not r.is_stale()
-
-    def test_refresh_replaces_old_entries(self):
-        r = _stale_resolver([{"id": 1, "name": "OldName"}])
-        payload = [{"id": 1, "name": "NewName"}]
-
-        with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
-            name = r.resolve(1)
-
-        assert name == "NewName"
-
-
-# ---------------------------------------------------------------------------
-# 6–7: Network failure handling
-# ---------------------------------------------------------------------------
-
-class TestNetworkFailure:
-    def test_failure_keeps_stale_cache(self):
-        r = _stale_resolver([{"id": 1, "name": "Coins"}])
-
-        with patch("urllib.request.urlopen", side_effect=OSError("network down")):
-            name = r.resolve(1)
-
-        assert name == "Coins"    # stale cache still used
-
-    def test_failure_empty_cache_returns_fallback(self):
-        r = _stale_resolver([])   # empty stale cache
-
-        with patch("urllib.request.urlopen", side_effect=OSError("network down")):
-            name = r.resolve(4151)
-
-        assert name == "Item 4151"
-
-    def test_failure_does_not_raise(self):
-        r = _stale_resolver()
-
-        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
-            result = r.resolve(1)   # must not raise
-
-        assert isinstance(result, str)
-
-
-# ---------------------------------------------------------------------------
-# 8: Successful refresh updates state
-# ---------------------------------------------------------------------------
-
-class TestSuccessfulRefresh:
-    def test_prefetch_populates_cache(self):
-        r = ItemNameResolver()
-        payload = [{"id": 11802, "name": "Twisted bow"}]
-
-        with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
-            ok = r.prefetch()
-
-        assert ok is True
-        assert r._cache[11802] == "Twisted bow"
-        assert r._fetched_at > 0
-
-    def test_entries_without_id_or_name_skipped(self):
-        r = ItemNameResolver()
-        payload = [
-            {"id": 1,   "name": "Coins"},
-            {"name": "no-id"},          # missing id
-            {"id": 2},                  # missing name
-            {},
+        mapping_data = [
+            {"id": 4151, "name": "Abyssal whip"},
+            {"id": 20997, "name": "Twisted bow"},
         ]
-        with patch("urllib.request.urlopen", return_value=_mock_urlopen(payload)):
-            r.prefetch()
+        mock_resp = _make_mapping_response(mapping_data)
 
-        assert r._cache == {1: "Coins"}
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp) as mock_get:
+            result = resolve_item_name(4151, fallback="Item 4151")
+
+        mock_get.assert_called_once()
+        assert result == "Abyssal whip"
+
+    def test_resolve_fetches_mapping_when_no_fallback(self):
+        """With no fallback, the resolver must query the mapping and return the name."""
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        mapping_data = [{"id": 31099, "name": "Spectral spirit shield"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp):
+            result = resolve_item_name(31099)
+
+        assert result == "Spectral spirit shield"
+
+    def test_resolve_returns_Item_x_on_fetch_failure(self):
+        """Network failure must cause silent fallback to 'Item {item_id}'."""
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        with patch(
+            "backend.alerts.item_name_resolver.requests.get",
+            side_effect=ConnectionError("timeout"),
+        ):
+            result = resolve_item_name(31099, fallback="Item 31099")
+
+        assert result == "Item 31099"
+
+    def test_resolve_returns_Item_x_on_fetch_failure_no_fallback(self):
+        """Network failure with no fallback returns 'Item {item_id}'."""
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        with patch(
+            "backend.alerts.item_name_resolver.requests.get",
+            side_effect=OSError("DNS failure"),
+        ):
+            result = resolve_item_name(99999)
+
+        assert result == "Item 99999"
+
+    def test_cache_ttl_not_expired_avoids_second_fetch(self):
+        """Two calls within TTL must only fire one HTTP request."""
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        mapping_data = [{"id": 4151, "name": "Abyssal whip"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp) as mock_get:
+            resolve_item_name(4151)          # first call — cold cache
+            resolve_item_name(4151)          # second call — hot cache
+
+        mock_get.assert_called_once()
+
+    def test_cache_ttl_expired_triggers_refetch(self):
+        """Simulating an expired timestamp must trigger a new HTTP request."""
+        import backend.alerts.item_name_resolver as mod
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        mapping_data = [{"id": 4151, "name": "Abyssal whip"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp) as mock_get:
+            # Warm cache
+            resolve_item_name(4151)
+            assert mock_get.call_count == 1
+
+            # Expire the cache manually
+            mod._mapping_cache_ts = time.time() - (mod._TTL_SECONDS + 1)
+
+            # Should trigger a new fetch
+            resolve_item_name(4151)
+            assert mock_get.call_count == 2
+
+    def test_empty_fallback_triggers_mapping_lookup(self):
+        """Empty string fallback should NOT short-circuit; resolver fetches mapping."""
+        from backend.alerts.item_name_resolver import resolve_item_name
+
+        mapping_data = [{"id": 4151, "name": "Abyssal whip"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp) as mock_get:
+            result = resolve_item_name(4151, fallback="")
+
+        mock_get.assert_called_once()
+        assert result == "Abyssal whip"
 
 
 # ---------------------------------------------------------------------------
-# 9: No redundant re-fetch when already fresh
+# Tests — resolver compatibility shim
 # ---------------------------------------------------------------------------
 
-class TestNoRedundantFetch:
-    def test_fresh_resolver_does_not_call_urlopen(self):
-        r = _fresh_resolver([{"id": 1, "name": "Coins"}])
 
-        with patch("urllib.request.urlopen") as mock_open:
-            r.resolve(1)
-            mock_open.assert_not_called()
+class TestResolverShim:
+    def test_resolver_resolve_returns_name(self):
+        """Legacy resolver.resolve() must work via the shim."""
+        from backend.alerts.item_name_resolver import resolver
+
+        mapping_data = [{"id": 4151, "name": "Abyssal whip"}]
+        mock_resp = _make_mapping_response(mapping_data)
+
+        with patch("backend.alerts.item_name_resolver.requests.get", return_value=mock_resp):
+            result = resolver.resolve(4151)
+
+        assert result == "Abyssal whip"
+
+    def test_resolver_resolve_fallback_passthrough(self):
+        """resolver.resolve() with a valid fallback skips HTTP."""
+        from backend.alerts.item_name_resolver import resolver
+
+        with patch("backend.alerts.item_name_resolver.requests.get") as mock_get:
+            result = resolver.resolve(4151, fallback="Abyssal whip")
+
+        assert result == "Abyssal whip"
+        mock_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# 10: _passes_dump_filters (flip_cache internal)
+# Tests — _passes_dump_filters (flip_cache internal)
 # ---------------------------------------------------------------------------
 
 class TestPassesDumpFilters:
@@ -233,7 +235,7 @@ class TestPassesDumpFilters:
 
 
 # ---------------------------------------------------------------------------
-# 11: Cooldown gate in _update_dump_persistence
+# Tests — Cooldown gate in _update_dump_persistence
 # ---------------------------------------------------------------------------
 
 class TestDumpCooldown:
