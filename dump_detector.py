@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -362,35 +363,44 @@ class DumpDetector:
 
         Filters applied
         ---------------
-        1. min_price_gp         ≥ 500 000 GP
-        2. min_drop_pct         ≥ 4.0 %
-        3. total_5m_volume      ≥ 25
-        4. sell_ratio           ≥ 0.80
-        5. profit_per_item_net  ≥ 2 000 GP
+        1. min_price_gp           ≥ 500 000 GP
+        2. min_drop_pct           ≥ 4.0 %
+        3. total_5m_volume        ≥ 25
+        4. sell_ratio             ≥ 0.80
+        5. profit_per_item_net    ≥ 2 000 GP
         6. estimated_total_profit ≥ 150 000 GP
-        7. per-item cooldown    60 minutes
+        7. per-item cooldown      60 minutes
+        8. tick deadline          stops scan after DUMP_MAX_TICK_SECONDS
+        9. suppress LOW           skips LOW-confidence alerts when DUMP_SUPPRESS_LOW=True
         """
         if not _V2_NOTIFIER_AVAILABLE:
             logger.error("scan_for_dumps_v2: backend.alerts.dump_notifier not importable")
             return []
 
-        # Config (read from backend.config if available)
-        min_price_gp          = _read_cfg("DUMP_V2_MIN_PRICE_GP",          500_000)
-        min_drop_pct          = _read_cfg("DUMP_V2_MIN_DROP_PCT",           4.0)
-        min_volume_trades     = _read_cfg("DUMP_V2_MIN_VOLUME_TRADES",      25)
-        min_sell_ratio        = _read_cfg("DUMP_V2_MIN_SELL_RATIO",         0.80)
-        min_profit_per_item   = _read_cfg("DUMP_V2_MIN_PROFIT_PER_ITEM",    2_000)
-        min_total_profit      = _read_cfg("DUMP_V2_MIN_TOTAL_PROFIT",       150_000)
-        cooldown_seconds      = _read_cfg("DUMP_V2_COOLDOWN_MINUTES",       60) * 60
+        # ── Config ────────────────────────────────────────────────────────
+        min_price_gp        = _read_cfg("DUMP_V2_MIN_PRICE_GP",        500_000)
+        min_drop_pct        = _read_cfg("DUMP_V2_MIN_DROP_PCT",         4.0)
+        min_volume_trades   = _read_cfg("DUMP_V2_MIN_VOLUME_TRADES",    25)
+        min_sell_ratio      = _read_cfg("DUMP_V2_MIN_SELL_RATIO",       0.80)
+        min_profit_per_item = _read_cfg("DUMP_V2_MIN_PROFIT_PER_ITEM",  2_000)
+        min_total_profit    = _read_cfg("DUMP_V2_MIN_TOTAL_PROFIT",     150_000)
+        cooldown_seconds    = _read_cfg("DUMP_V2_COOLDOWN_MINUTES",     60) * 60
+        max_tick_seconds    = _read_cfg("DUMP_MAX_TICK_SECONDS",        10.0)
+        suppress_low        = _read_cfg("DUMP_SUPPRESS_LOW",            True)
+        show_chart          = _read_cfg("SHOW_FULL_DUMP_CHART",         False)
 
-        logger.info("scan_for_dumps_v2: starting scan")
+        tick_start = time.monotonic()
+        logger.info(
+            "DUMP_TICK start: scan_for_dumps_v2  max_tick=%.1fs  suppress_low=%s  charts=%s",
+            max_tick_seconds, suppress_low, show_chart,
+        )
 
         # ── Bulk API calls ────────────────────────────────────────────────
-        latest_prices = self.fetch_latest_prices()          # /latest
-        prices_5m     = self._fetch_5m_prices()             # /5m (bulk volume)
-        mapping_v1    = self.fetch_item_mapping()           # /mapping (legacy dict for buy_limit)
+        latest_prices = self.fetch_latest_prices()    # /latest
+        prices_5m     = self._fetch_5m_prices()       # /5m  (bulk volume)
+        mapping_v1    = self.fetch_item_mapping()      # /mapping (buy_limit)
 
-        # ── Build candidate list applying cheap pre-filters ───────────────
+        # ── Build candidate list with cheap pre-filters ───────────────────
         candidates = []
         for item_id_str, latest_data in latest_prices.items():
             try:
@@ -426,9 +436,9 @@ class DumpDetector:
                         continue
 
                 # Item name / limit from v1 mapping
-                item_info  = mapping_v1.get(item_id_str, {})
-                raw_name   = item_info.get("name", f"Item {item_id}")
-                buy_limit  = item_info.get("limit") or None
+                item_info = mapping_v1.get(item_id_str, {})
+                raw_name  = item_info.get("name", f"Item {item_id}")
+                buy_limit = item_info.get("limit") or None
 
                 # Skip noted / unnamed junk
                 if not raw_name or "(noted)" in raw_name.lower():
@@ -448,20 +458,33 @@ class DumpDetector:
                 continue
 
         logger.info(
-            "scan_for_dumps_v2: %d candidates after pre-filters (of %d items)",
+            "scan_for_dumps_v2: %d candidates after pre-filters (of %d items)  "
+            "elapsed=%.2fs",
             len(candidates), len(latest_prices),
+            time.monotonic() - tick_start,
         )
 
-        # ── Per-candidate historical analysis ─────────────────────────────
+        # ── Per-candidate historical analysis (with tick deadline) ─────────
         alerts: List[DumpAlertV2] = []
-        # Sort by price desc to hit expensive high-value items first
-        for candidate in sorted(candidates, key=lambda x: x["low"], reverse=True)[:300]:
+        sorted_candidates = sorted(candidates, key=lambda x: x["low"], reverse=True)[:300]
+
+        for i, candidate in enumerate(sorted_candidates):
+            # ── Tick deadline ───────────────────────────────────────────
+            elapsed_tick = time.monotonic() - tick_start
+            if elapsed_tick > max_tick_seconds:
+                remaining = len(sorted_candidates) - i
+                logger.info(
+                    "DUMP_TICK deadline: %.2fs / %.1fs — stopping with %d candidates remaining",
+                    elapsed_tick, max_tick_seconds, remaining,
+                )
+                break
+
             try:
-                item_id   = candidate["id"]
-                low       = candidate["low"]
-                high      = candidate["high"]
-                sold_5m   = candidate["sold_5m"]
-                bought_5m = candidate["bought_5m"]
+                item_id    = candidate["id"]
+                low        = candidate["low"]
+                high       = candidate["high"]
+                sold_5m    = candidate["sold_5m"]
+                bought_5m  = candidate["bought_5m"]
                 sell_ratio = candidate["sell_ratio"]
                 buy_limit  = candidate["buy_limit"]
 
@@ -470,7 +493,7 @@ class DumpDetector:
                 if len(history) < 5:
                     continue
 
-                averages = self.calculate_historical_averages(history)
+                averages  = self.calculate_historical_averages(history)
                 ref_price = averages.get("avg_4h")
                 if not ref_price:
                     continue
@@ -483,7 +506,7 @@ class DumpDetector:
                     continue
 
                 # Per-item profit after GE tax
-                tax_on_sell = min(int(high * GE_TAX_RATE), GE_TAX_CAP)
+                tax_on_sell         = min(int(high * GE_TAX_RATE), GE_TAX_CAP)
                 profit_per_item_net = high - low - tax_on_sell
 
                 # Filter 5: minimum per-item net profit
@@ -496,8 +519,8 @@ class DumpDetector:
                     sell_price=high,
                     item_limit=buy_limit,
                 )
-                qty_to_buy    = plan.get("qty_to_buy", 0)
-                max_invest_gp = plan.get("max_invest_gp", 0)
+                qty_to_buy       = plan.get("qty_to_buy", 0)
+                max_invest_gp    = plan.get("max_invest_gp", 0)
                 est_total_profit = profit_per_item_net * qty_to_buy
 
                 # Filter 6: minimum total profit
@@ -507,7 +530,7 @@ class DumpDetector:
                 # Confidence from z-score
                 avg_24h = averages.get("avg_24h", ref_price)
                 std_24h = averages.get("std_24h") or (ref_price * 0.02)
-                z = (low - avg_24h) / std_24h
+                z       = (low - avg_24h) / std_24h
                 if z < -2:
                     rec_pct, confidence = 0.8, "HIGH"
                 elif z < -1.5:
@@ -517,13 +540,19 @@ class DumpDetector:
                 else:
                     rec_pct, confidence = 0.5, "LOW"
 
+                # Filter 9: suppress LOW-confidence alerts
+                if suppress_low and confidence == "LOW":
+                    continue
+
                 predicted_recovery = int(low + (drop_amount * rec_pct))
 
-                # ── Chart ──────────────────────────────────────────────────
+                # ── Chart (opt-in via SHOW_FULL_DUMP_CHART) ────────────────
+                # Disabled by default — chart generation is slow (~2–5 s/item).
+                # Set SHOW_FULL_DUMP_CHART=1 in env to enable.
                 chart_path: Optional[str] = None
-                if _CHARTS_ENABLED:
+                if show_chart and _CHARTS_ENABLED:
                     try:
-                        chart_gen = get_chart_generator()
+                        chart_gen  = get_chart_generator()
                         chart_path = chart_gen.create_dump_alert_chart(
                             item_name=candidate["name"],
                             item_id=item_id,
@@ -563,8 +592,11 @@ class DumpDetector:
                 alerts.append(alert)
 
                 logger.info(
-                    "DUMP DETECTED (v2): %s  -%.1f%%  net_profit/item=%d GP  total=%d GP",
-                    alert.resolved_name, drop_pct, profit_per_item_net, est_total_profit,
+                    "DUMP DETECTED (v2): %s  -%.1f%%  conf=%s  "
+                    "net/item=%d GP  total=%d GP  tick=%.2fs",
+                    alert.resolved_name, drop_pct, confidence,
+                    profit_per_item_net, est_total_profit,
+                    time.monotonic() - tick_start,
                 )
 
             except Exception as exc:
@@ -574,9 +606,14 @@ class DumpDetector:
                 )
                 continue
 
-        # Sort by estimated total profit
+        # Sort by estimated total profit (highest first)
         alerts.sort(key=lambda a: a.estimated_total_profit, reverse=True)
-        logger.info("scan_for_dumps_v2: found %d quality dump alerts", len(alerts))
+
+        tick_elapsed = time.monotonic() - tick_start
+        logger.info(
+            "DUMP_TICK end: scan_for_dumps_v2 complete  total=%.2fs  alerts=%d",
+            tick_elapsed, len(alerts),
+        )
         return alerts
 
     # ------------------------------------------------------------------

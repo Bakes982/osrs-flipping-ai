@@ -131,12 +131,15 @@ class TestDumpEmbedTitleResolved:
         )
 
     def test_embed_title_is_resolved_name_not_placeholder(self):
+        """Title must show item name + star rating (Copilot-style), not 'DUMP DETECTED:'."""
         from backend.alerts.dump_notifier import DumpAlertNotifierV2
         alert = self._make_alert("Abyssal whip")
         notifier = DumpAlertNotifierV2("https://discord.com/api/webhooks/111/fake")
         embed = notifier._build_embed(alert, "Abyssal whip")
-        assert embed["title"] == "DUMP DETECTED: Abyssal whip"
+        assert "Abyssal whip" in embed["title"]
+        assert "⭐" in embed["title"]
         assert "Item 4151" not in embed["title"]
+        assert "DUMP DETECTED" not in embed["title"]
 
     def test_embed_title_never_shows_item_number_placeholder(self):
         """Even if item_name is a placeholder, _build_embed title uses the
@@ -146,7 +149,7 @@ class TestDumpEmbedTitleResolved:
         notifier = DumpAlertNotifierV2("https://discord.com/api/webhooks/111/fake")
         # caller resolves name before building embed
         embed = notifier._build_embed(alert, "Abyssal whip")  # resolved name passed
-        assert embed["title"] == "DUMP DETECTED: Abyssal whip"
+        assert "Abyssal whip" in embed["title"]
         assert "Item 4151" not in embed["title"]
 
 

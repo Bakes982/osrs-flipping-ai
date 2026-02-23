@@ -156,3 +156,12 @@ DUMP_V2_MIN_TOTAL_PROFIT = int(os.environ.get("DUMP_V2_MIN_TOTAL_PROFIT", "15000
 DUMP_V2_COOLDOWN_MINUTES = int(os.environ.get("DUMP_V2_COOLDOWN_MINUTES", "60"))
 # Position cap used when computing trade plan quantity (fraction of capital).
 DUMP_V2_POSITION_CAP_PCT = float(os.environ.get("DUMP_V2_POSITION_CAP_PCT", "0.10"))
+# ---------------------------------------------------------------------------
+# Dump Detector v2 — speed + alert quality knobs
+# ---------------------------------------------------------------------------
+# Max seconds the candidate scan loop may run before cutting off early.
+DUMP_MAX_TICK_SECONDS = float(os.environ.get("DUMP_MAX_TICK_SECONDS", "10.0"))
+# Suppress LOW-confidence (⭐☆☆) dump alerts to reduce noise.
+DUMP_SUPPRESS_LOW = _env_bool("DUMP_SUPPRESS_LOW", True)
+# Include a full price chart PNG in dump embeds (slow).  Skip by default.
+SHOW_FULL_DUMP_CHART = _env_bool("SHOW_FULL_DUMP_CHART", False)

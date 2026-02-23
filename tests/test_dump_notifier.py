@@ -1,11 +1,17 @@
 """
 Unit tests for backend.alerts.dump_notifier (v2).
 
+Phase 4 — Copilot-style embed format
+-------------------------------------
+* Title:       "{name}  ⭐⭐⭐  HIGH"  (stars + confidence level)
+* Description: 4-line trade plan (buy/sell, qty/invest, profit, links)
+* Fields:      Drop | Sell Ratio | Volume 5m  (3 inline fields only)
+* Footer:      "OSRS Flipping AI • Dump Detector · X min ago"
+
 Tests
 -----
 * test_embed_title_uses_resolved_name
-    The Discord embed title must contain the resolved item name, not
-    a raw "Item XXXXX" placeholder.
+    The Discord embed title must contain the real item name + star rating.
 
 * test_chart_attachment_included_when_chart_path_returned
     When the alert has a valid chart_path, the notifier must send via
@@ -25,7 +31,7 @@ Tests
     Empty webhook URL causes send() to return False immediately.
 
 * test_embed_fields_contain_expected_keys
-    Embed fields dict must include sell_ratio, drop, profit, qty, etc.
+    Embed fields dict must include Drop, Sell Ratio, and Volume 5m.
 """
 
 from __future__ import annotations
@@ -122,40 +128,49 @@ class TestDumpAlertV2:
 
 class TestBuildEmbed:
     def test_embed_title_uses_resolved_name(self):
-        """Embed title must show the real item name, not 'Item XXXXX'."""
+        """Embed title must show the real item name + star rating, not 'DUMP DETECTED: ...'."""
         alert = _make_alert()
         notifier = DumpAlertNotifierV2(FAKE_WEBHOOK)
         embed = notifier._build_embed(alert, "Abyssal whip")
-        assert embed["title"] == "DUMP DETECTED: Abyssal whip"
+        # Copilot format: "{name}  ⭐⭐⭐  HIGH"
+        assert "Abyssal whip" in embed["title"]
+        assert "⭐" in embed["title"]
         assert "Item 4151" not in embed["title"]
+        assert "DUMP DETECTED" not in embed["title"]
 
     def test_embed_footer_text(self):
+        """Footer must start with brand prefix followed by relative time."""
         alert = _make_alert()
         notifier = DumpAlertNotifierV2(FAKE_WEBHOOK)
         embed = notifier._build_embed(alert, "Abyssal whip")
-        assert embed["footer"]["text"] == "OSRS Flipping AI • Dump Detector"
+        # Footer now includes relative time: "OSRS Flipping AI • Dump Detector · X min ago"
+        assert embed["footer"]["text"].startswith("OSRS Flipping AI • Dump Detector ·")
+
+    def test_embed_description_contains_trade_plan(self):
+        """Description must show a 4-line trade plan with buy/sell prices and profit."""
+        alert = _make_alert()
+        notifier = DumpAlertNotifierV2(FAKE_WEBHOOK)
+        embed = notifier._build_embed(alert, "Abyssal whip")
+        desc = embed["description"]
+        assert "Buy" in desc
+        assert "Sell" in desc
+        assert "Qty" in desc
+        assert "Est Profit" in desc
+        # Links block
+        assert "Wiki" in desc
+        assert "Prices" in desc
 
     def test_embed_fields_contain_expected_keys(self):
-        """Embed must include sell_ratio, price drop, profit, qty, invest fields."""
+        """Embed must include exactly the 3 Copilot-style compact fields."""
         alert = _make_alert()
         notifier = DumpAlertNotifierV2(FAKE_WEBHOOK)
         embed = notifier._build_embed(alert, "Abyssal whip")
         field_names = {f["name"] for f in embed["fields"]}
-        required = {
-            "Item ID",
-            "Current Price",
-            "Ref Avg (4h)",
-            "Price Drop",
-            "Sell Ratio",
-            "Sold 5m",
-            "Bought 5m",
-            "Profit / item (net)",
-            "Predicted Recovery",
-            "Recommended Qty",
-            "Max Invest",
-            "Est Total Profit",
-        }
+        required = {"Drop", "Sell Ratio", "Volume 5m"}
         assert required.issubset(field_names), f"Missing fields: {required - field_names}"
+        # Old verbose fields must be gone
+        old_fields = {"Item ID", "Current Price", "Recommended Qty", "Est Total Profit"}
+        assert old_fields.isdisjoint(field_names), f"Old fields still present: {old_fields & field_names}"
 
     def test_sell_ratio_formatted_as_percent(self):
         alert = _make_alert()

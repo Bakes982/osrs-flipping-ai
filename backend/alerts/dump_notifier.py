@@ -32,14 +32,30 @@ from backend.alerts.item_name_resolver import resolve_item_name
 
 logger = logging.getLogger(__name__)
 
+
+def _cfg_bool(attr: str, default: bool = False) -> bool:
+    """Read a boolean from backend.config, with a safe fallback."""
+    try:
+        from backend import config as _c
+        return bool(getattr(_c, attr, default))
+    except Exception:
+        return default
+
+
 # ---------------------------------------------------------------------------
-# Embed colours (keyed by confidence level)
+# Embed colours and star ratings (keyed by confidence level)
 # ---------------------------------------------------------------------------
 
 _COLOUR: dict[str, int] = {
     "HIGH":   0x00FF00,   # green  — high-confidence dump-buy opportunity
     "MEDIUM": 0xFFA726,   # orange
     "LOW":    0xEF5350,   # red    — low confidence, monitor only
+}
+
+_STARS: dict[str, str] = {
+    "HIGH":   "⭐⭐⭐  HIGH",
+    "MEDIUM": "⭐⭐☆  MEDIUM",
+    "LOW":    "⭐☆☆  LOW",
 }
 
 
@@ -105,6 +121,14 @@ class DumpAlertNotifierV2:
             logger.warning("DumpAlertNotifierV2.send: no webhook URL configured")
             return False
 
+        # Suppress ⭐☆☆ LOW alerts when DUMP_SUPPRESS_LOW=True (default).
+        if _cfg_bool("DUMP_SUPPRESS_LOW", True) and alert.confidence == "LOW":
+            logger.info(
+                "DumpAlertNotifierV2: suppressing LOW-confidence alert for item %d (%s)",
+                alert.item_id, alert.item_name,
+            )
+            return False
+
         name = alert.resolved_name
         embed = self._build_embed(alert, name)
 
@@ -123,29 +147,60 @@ class DumpAlertNotifierV2:
 
     @staticmethod
     def _build_embed(alert: DumpAlertV2, name: str) -> dict:
-        """Construct the full Discord embed dict."""
+        """Copilot-style compact embed: stars title, 4-line trade plan, 3 fields.
+
+        Format
+        ------
+        Title:       "{name}  ⭐⭐⭐  HIGH"
+        Description: 4-line trade plan (buy → sell, qty / max invest,
+                     est profit, Wiki + Prices links)
+        Fields:      Drop % | Sell Ratio | Volume 5m  (3 inline only)
+        Footer:      "OSRS Flipping AI • Dump Detector · X min ago"
+        """
         color = _COLOUR.get(alert.confidence, 0xFFA726)
+        stars = _STARS.get(alert.confidence, "⭐⭐⭐  HIGH")
+
         total_vol = alert.sold_5m + alert.bought_5m
         sell_ratio_str = f"{alert.sell_ratio:.0%}" if total_vol > 0 else "N/A"
 
+        # Relative time string for footer
+        elapsed_s = (datetime.utcnow() - alert.timestamp).total_seconds()
+        if elapsed_s < 90:
+            time_str = "just now"
+        elif elapsed_s < 3600:
+            time_str = f"{int(elapsed_s / 60)} min ago"
+        else:
+            time_str = f"{elapsed_s / 3600:.1f}h ago"
+
+        # External links
+        name_url = name.replace(" ", "_")
+        wiki_url   = f"https://oldschool.runescape.wiki/w/{name_url}"
+        prices_url = f"https://prices.runescape.wiki/osrs/item/{alert.item_id}"
+
+        # Profit % on invested capital
+        profit_pct = (
+            (alert.estimated_total_profit / alert.max_invest_gp) * 100
+            if alert.max_invest_gp > 0
+            else 0.0
+        )
+
+        description = "\n".join([
+            f"💰 **Buy:** {alert.current_price:,} GP → **Sell:** {alert.predicted_recovery:,} GP",
+            f"📦 **Qty:** {alert.qty_to_buy:,}  |  **Max Invest:** {alert.max_invest_gp:,} GP",
+            f"📈 **Est Profit:** {alert.estimated_total_profit:,} GP  (+{profit_pct:.1f}%)",
+            f"🔗 [Wiki]({wiki_url}) | [Prices]({prices_url})",
+        ])
+
         return {
-            "title": f"DUMP DETECTED: {name}",
-            "color": color,
-            "timestamp": alert.timestamp.isoformat(),
-            "footer": {"text": "OSRS Flipping AI • Dump Detector"},
+            "title":       f"{name}  {stars}",
+            "description": description,
+            "color":       color,
+            "timestamp":   alert.timestamp.isoformat(),
+            "footer":      {"text": f"OSRS Flipping AI • Dump Detector · {time_str}"},
             "fields": [
-                {"name": "Item ID",              "value": str(alert.item_id),                              "inline": True},
-                {"name": "Current Price",        "value": f"{alert.current_price:,} GP",                  "inline": True},
-                {"name": "Ref Avg (4h)",         "value": f"{alert.reference_price:,} GP",                "inline": True},
-                {"name": "Price Drop",           "value": f"-{alert.drop_pct:.1f}% ({alert.drop_amount:,} GP)", "inline": True},
-                {"name": "Sell Ratio",           "value": sell_ratio_str,                                 "inline": True},
-                {"name": "Sold 5m",              "value": f"{alert.sold_5m:,}",                           "inline": True},
-                {"name": "Bought 5m",            "value": f"{alert.bought_5m:,}",                         "inline": True},
-                {"name": "Profit / item (net)",  "value": f"{alert.profit_per_item_net:,} GP",            "inline": True},
-                {"name": "Predicted Recovery",   "value": f"{alert.predicted_recovery:,} GP",             "inline": True},
-                {"name": "Recommended Qty",      "value": f"{alert.qty_to_buy:,}",                        "inline": True},
-                {"name": "Max Invest",           "value": f"{alert.max_invest_gp:,} GP",                  "inline": True},
-                {"name": "Est Total Profit",     "value": f"{alert.estimated_total_profit:,} GP",         "inline": True},
+                {"name": "Drop",       "value": f"-{alert.drop_pct:.1f}%  ({alert.drop_amount:,} GP)", "inline": True},
+                {"name": "Sell Ratio", "value": sell_ratio_str,                                        "inline": True},
+                {"name": "Volume 5m",  "value": f"{total_vol:,}",                                      "inline": True},
             ],
         }
 
