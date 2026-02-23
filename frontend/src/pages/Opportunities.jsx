@@ -36,12 +36,12 @@ function trendBadge(trend) {
 const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
 
 const FILTERS = [
-  { key: 'All',            icon: null,        desc: 'All items' },
-  { key: 'High Score',     icon: Target,      desc: 'Score ≥ 60' },
-  { key: 'High Margin',    icon: TrendingUp,  desc: 'Margin > 2%' },
-  { key: 'High Liquidity', icon: BarChart3,   desc: 'Volume > 10' },
-  { key: 'Best EV',        icon: Zap,         desc: 'Profit × Volume' },
-  { key: 'Low Risk',       icon: Shield,      desc: 'Stability ≥ 60' },
+  { key: 'All', icon: null, desc: 'All items' },
+  { key: 'High Volume', icon: BarChart3, desc: 'Volume ≥ 500' },
+  { key: 'High Value 1M+', icon: TrendingUp, desc: 'Buy price ≥ 1M' },
+  { key: 'High Value 10M+', icon: TrendingUp, desc: 'Buy price ≥ 10M' },
+  { key: 'Low Risk', icon: Shield, desc: 'Stable / calm setups' },
+  { key: 'Best EV', icon: Zap, desc: 'Best expected value (profit × volume)' },
 ];
 
 
@@ -59,7 +59,7 @@ function LoadingSkeletonRows({ rows = 8 }) {
     <table className="data-table">
       <thead>
         <tr>
-          <th style={{ width: 30 }}>#</th><th>Item</th><th>Score</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
+          <th style={{ width: 30 }}>#</th><th>Item</th><th>RUNE SCORE</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
         </tr>
       </thead>
       <tbody>
@@ -92,6 +92,41 @@ function DumpSparkline({ dumpPrice, refAvg }) {
   );
 }
 
+
+function riskBadge(opp) {
+  const safety = Number(opp.stability_score || 0);
+  const score = Number(opp.flip_score || 0);
+  if (safety >= 70 && score >= 60) return { label: 'CALM', cls: 'badge-cyan' };
+  if (score >= 65) return { label: 'HOT', cls: 'badge-green' };
+  return { label: 'SPIKY', cls: 'badge-yellow' };
+}
+
+function scoreChips(opp) {
+  return [
+    `VOLUME ${Math.round(Number(opp.volume_score || 0))}`,
+    `MARGIN ${Math.round(Number(opp.spread_score || 0))}`,
+    `SAFETY ${Math.round(Number(opp.stability_score || 0))}`,
+    `SPEED ${Math.round(Number(opp.freshness_score || 0))}`,
+  ];
+}
+
+function MiniSparkline({ buyPrice, sellPrice }) {
+  const a = Number(buyPrice || 0);
+  const b = Number(sellPrice || 0);
+  const low = Math.min(a || 1, b || 1);
+  const high = Math.max(a || 1, b || 1);
+  const n = (v) => 22 - ((v - low) / Math.max(1, high - low)) * 14;
+  const y1 = n(a || low);
+  const y2 = n((a + b) / 2 || low);
+  const y3 = n(b || low);
+  return (
+    <svg width="68" height="24" viewBox="0 0 68 24" aria-hidden>
+      <polyline points={`2,${y1} 34,${y2} 66,${y3}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
+      <circle cx="66" cy={y3} r="2" fill="var(--green)" />
+    </svg>
+  );
+}
+
 /* ── Score bar mini-component ────────────────────────────────────────────── */
 
 function ScoreBar({ score, max = 100 }) {
@@ -114,10 +149,10 @@ function ExpandedDetail({ opp }) {
     <tr>
       <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
         <div style={{ padding: '16px 20px', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, fontSize: 12 }}>
-          {/* Score Breakdown */}
+          {/* RUNE SCORE Breakdown */}
           <div>
             <div style={{ fontWeight: 600, marginBottom: 10, color: 'var(--cyan)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              Score Breakdown
+              RUNE SCORE Breakdown
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -275,11 +310,11 @@ export default function Opportunities() {
       items = items.filter(o => o.name?.toLowerCase().includes(q) || String(o.item_id).includes(q));
     }
 
-    if (filter === 'High Score') items = items.filter(o => o.flip_score >= 60);
-    else if (filter === 'High Margin') items = items.filter(o => o.margin_pct > 2);
-    else if (filter === 'High Liquidity') items = items.filter(o => o.volume > 10);
+    if (filter === 'High Volume') items = items.filter(o => (o.volume || 0) >= 500);
+    else if (filter === 'High Value 1M+') items = items.filter(o => (o.buy_price || 0) >= 1_000_000);
+    else if (filter === 'High Value 10M+') items = items.filter(o => (o.buy_price || 0) >= 10_000_000);
     else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume || 1)) - (a.potential_profit * (a.volume || 1)));
-    else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 60);
+    else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
     items.sort((a, b) => {
       const av = a[sortCol] ?? 0;
@@ -483,7 +518,7 @@ export default function Opportunities() {
               <tr>
                 <th style={{ width: 30 }}>#</th>
                 <th>Item</th>
-                {th('Score', 'flip_score')}
+                {th('RUNE SCORE', 'flip_score')}
                 {th('Buy', 'buy_price')}
                 {th('Sell', 'sell_price')}
                 {th('Margin', 'margin_pct')}
@@ -512,7 +547,18 @@ export default function Opportunities() {
                           style={{ imageRendering: 'pixelated', flexShrink: 0 }}
                           onError={e => { e.target.style.display = 'none'; }} />
                         <div>
-                          <div style={{ fontWeight: 600, fontSize: 13 }}>{opp.name}</div>
+                          <div style={{ fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
+                            {opp.name}
+                            <span className={`badge ${riskBadge(opp).cls}`} style={{ fontSize: 10 }}>{riskBadge(opp).label}</span>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <MiniSparkline buyPrice={opp.buy_price} sellPrice={opp.sell_price} />
+                            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                              {scoreChips(opp).map((chip) => (
+                                <span key={chip} className="badge badge-cyan" style={{ fontSize: 9 }}>{chip}</span>
+                              ))}
+                            </div>
+                          </div>
                           {opp.win_rate != null && (
                             <div className="text-muted" style={{ fontSize: 10 }}>
                               {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR
