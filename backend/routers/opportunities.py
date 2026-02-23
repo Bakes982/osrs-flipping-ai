@@ -17,11 +17,10 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from backend.cache import get_redis
-from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, PriceSnapshot
+from backend.database import get_db, get_price_history, get_item_flips, get_item, PriceSnapshot
 from backend.smart_pricer import SmartPricer
-from backend.flip_scorer import FlipScorer, FlipScore
+from backend.flip_scorer import FlipScorer
 from backend.arbitrage_finder import ArbitrageFinder
-from backend.position_sizer import PositionSizer
 from ai_strategist import analyze_single_item
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
@@ -29,7 +28,6 @@ router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
 _pricer = SmartPricer()
 _scorer = FlipScorer()
 _arb_finder = ArbitrageFinder()
-_sizer = PositionSizer()
 
 # ------- Wiki API helpers (fallback when DB has no data) -------
 

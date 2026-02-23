@@ -1564,6 +1564,52 @@ class FlipCacheWorker:
     CYCLE_SECONDS = 60
 
     @staticmethod
+    def _to_dashboard_opportunity(item: dict) -> dict:
+        """Convert worker scoring metrics to dashboard opportunity schema."""
+        expected_profit = int(item.get("expected_profit") or item.get("net_profit") or 0)
+        volume_5m = int(item.get("volume_5m") or 0)
+        qty_suggested = int(item.get("qty_suggested") or 0)
+        buy_price = int(item.get("recommended_buy") or 0)
+
+        return {
+            "item_id": item.get("item_id"),
+            "name": item.get("item_name"),
+            "buy_price": buy_price,
+            "sell_price": int(item.get("recommended_sell") or 0),
+            "instant_buy": int(item.get("recommended_buy") or 0),
+            "instant_sell": int(item.get("recommended_sell") or 0),
+            "margin": int(item.get("spread") or 0),
+            "margin_pct": float(item.get("spread_pct") or 0),
+            "potential_profit": expected_profit,
+            "roi_pct": float(item.get("roi_pct") or 0),
+            "tax": int(item.get("tax") or 0),
+            "volume": volume_5m,
+            "trend": item.get("trend"),
+            "ml_confidence": float(item.get("confidence") or 0),
+            "flip_score": float(item.get("total_score") or 0),
+            "spread_score": float(item.get("score_spread") or 0),
+            "volume_score": float(item.get("score_volume") or 0),
+            "freshness_score": float(item.get("score_freshness") or 0),
+            "trend_score": float(item.get("score_trend") or 0),
+            "history_score": float(item.get("score_history") or 0),
+            "stability_score": float(item.get("score_stability") or 0),
+            "ml_signal_score": float(item.get("score_ml") or 0),
+            "ml_direction": None,
+            "ml_prediction_confidence": None,
+            "ml_method": "none",
+            "win_rate": item.get("win_rate"),
+            "total_flips": int(item.get("total_flips") or 0),
+            "avg_profit": item.get("avg_profit"),
+            "reason": item.get("reason") or "",
+            "position_sizing": {
+                "kelly": min(0.25, max(0.0, float(item.get("fill_probability") or 0) * 0.25)),
+                "max_investment": int(max(0, qty_suggested * buy_price)),
+                "quantity": qty_suggested,
+                "stop_loss_pct": round(float(item.get("risk_score") or 0) * 1.5, 1),
+            },
+        }
+
+    @staticmethod
     def _persist_top_opportunities(top_opportunities: List[dict]) -> None:
         """Store top-ranked opportunities in Redis (or cache fallback)."""
         redis = get_redis()
@@ -1597,17 +1643,19 @@ class FlipCacheWorker:
                         flips = get_item_flips(db, item_id, days=30)
                         item  = get_item(db, item_id)
                         latest = snaps[-1]
+                        volume_5m = (latest.buy_volume or 0) + (latest.sell_volume or 0)
                         metrics = calculate_flip_metrics({
                             "item_id":    item_id,
                             "item_name":  item.name if item else f"Item {item_id}",
                             "instant_buy":  latest.instant_buy,
                             "instant_sell": latest.instant_sell,
-                            "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
+                            "volume_5m": volume_5m,
                             "buy_time":  latest.buy_time,
                             "sell_time": latest.sell_time,
                             "snapshots": snaps,
                             "flip_history": flips,
                         })
+                        metrics["volume_5m"] = int(volume_5m or 0)
                         results.append(metrics)
                     except Exception:
                         continue
@@ -1619,8 +1667,8 @@ class FlipCacheWorker:
             scored = await asyncio.to_thread(_sync)
             _cache.update_cache(scored, cycle_seconds=self.CYCLE_SECONDS)
             top_opportunities = sorted(
-                scored,
-                key=lambda item: float(item.get("total_score", 0) or 0),
+                (self._to_dashboard_opportunity(item) for item in scored),
+                key=lambda item: float(item.get("flip_score", 0) or 0),
                 reverse=True,
             )[:50]
             asyncio.create_task(
