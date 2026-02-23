@@ -5,23 +5,24 @@ GET /api/opportunities/{id}  - detailed analysis for a single item
 """
 
 import asyncio
+import json
 import sys
 import os
-from typing import Optional
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, HTTPException
 
 # Ensure project root is on sys.path so we can import top-level modules
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, get_setting, PriceSnapshot
+from backend.cache import get_redis
+from backend.database import get_db, get_price_history, get_latest_price, get_item_flips, get_item, PriceSnapshot
 from backend.smart_pricer import SmartPricer
-from backend.flip_scorer import FlipScorer, FlipScore, score_opportunities
+from backend.flip_scorer import FlipScorer, FlipScore
 from backend.arbitrage_finder import ArbitrageFinder
 from backend.position_sizer import PositionSizer
-from ai_strategist import scan_all_items_for_flips, analyze_single_item
+from ai_strategist import analyze_single_item
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
 
@@ -79,112 +80,25 @@ def _fetch_wiki_item_name(item_id: int) -> str:
 
 
 @router.get("")
-async def list_opportunities(
-    min_profit: int = Query(0, description="Minimum net profit in GP"),
-    min_price: int = Query(0, description="Minimum item buy price in GP"),
-    min_score: float = Query(15, ge=0, le=100, description="Minimum flip score (0-100)"),
-    max_risk: int = Query(8, description="Maximum risk score (1-10) for initial scan"),
-    min_volume: int = Query(1, description="Minimum 5-minute volume"),
-    sort_by: str = Query("total_score", description="Sort field: total_score, expected_profit, spread_pct, volume_5m"),
-    limit: int = Query(50, ge=1, le=200, description="Max results"),
-):
-    """Return a ranked list of current flip opportunities.
+async def list_opportunities():
+    """Return latest ranked opportunities from Redis cache."""
+    redis = get_redis()
+    raw = redis.get("opportunities:top")
 
-    Pipeline:
-    1. Scan all items via ai_strategist (Wiki API)
-    2. Score each through FlipScorer (veto + 0-100 composite)
-    3. Filter by minimum score, profit, volume
-    4. Return sorted results
-    """
+    if not raw:
+        return {
+            "generated_at": None,
+            "count": 0,
+            "items": [],
+        }
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+
     try:
-        raw = await asyncio.to_thread(
-            scan_all_items_for_flips,
-            min_price=max(10_000, min_price),
-            max_price=2_000_000_000,  # was 500M — raised to 2B to include Twisted Bow, Scythe, Elysian etc.
-            min_margin_pct=0.2,
-            max_risk=max_risk,
-            limit=limit * 4,  # over-fetch for scoring
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch market data: {e}")
-
-    # Score all items through the composite scorer (has sync DB calls)
-    scored = await asyncio.to_thread(score_opportunities, raw, min_score, limit * 2)
-
-    # Load blocklist once
-    def _get_blocklist():
-        db = get_db()
-        try:
-            return set(get_setting(db, "blacklisted_item_ids") or [])
-        finally:
-            db.close()
-
-    blocklist_ids = await asyncio.to_thread(_get_blocklist)
-
-    # Post-filter
-    results = []
-    for fs in scored:
-        if fs.item_id in blocklist_ids:
-            continue
-        if fs.expected_profit is not None and fs.expected_profit < min_profit:
-            continue
-        if fs.volume_5m < min_volume:
-            continue
-
-        results.append({
-            "item_id": fs.item_id,
-            "name": fs.item_name,
-            "buy_price": fs.recommended_buy,
-            "sell_price": fs.recommended_sell,
-            "instant_buy": fs.instant_buy,
-            "instant_sell": fs.instant_sell,
-            "margin": fs.spread,
-            "margin_pct": round(fs.spread_pct, 2) if fs.spread_pct else 0,
-            "potential_profit": fs.expected_profit,
-            "roi_pct": round(fs.expected_profit_pct, 2) if fs.expected_profit_pct else 0,
-            "tax": fs.tax,
-            "volume": fs.volume_5m,
-            "trend": fs.trend,
-            "ml_confidence": round(fs.confidence, 3),
-
-            # Composite score
-            "flip_score": round(fs.total_score, 1),
-            "spread_score": round(fs.spread_score, 1),
-            "volume_score": round(fs.volume_score, 1),
-            "freshness_score": round(fs.freshness_score, 1),
-            "trend_score": round(fs.trend_score, 1),
-            "history_score": round(fs.history_score, 1),
-            "stability_score": round(fs.stability_score, 1),
-            "ml_signal_score": round(fs.ml_score, 1),
-
-            # ML prediction details
-            "ml_direction": fs.ml_direction,
-            "ml_prediction_confidence": round(fs.ml_confidence, 3) if fs.ml_confidence else None,
-            "ml_method": fs.ml_method,
-
-            # Historical
-            "win_rate": round(fs.win_rate * 100, 1) if fs.win_rate is not None else None,
-            "total_flips": fs.total_flips,
-            "avg_profit": int(fs.avg_profit) if fs.avg_profit else None,
-
-            "reason": fs.reason,
-
-            # Position sizing (lightweight for list view)
-            "position_sizing": _quick_sizing(fs),
-        })
-
-    # Sort
-    valid_sort_keys = {
-        "total_score": "flip_score",
-        "expected_profit": "potential_profit",
-        "spread_pct": "margin_pct",
-        "volume_5m": "volume",
-        "flip_score": "flip_score",
-    }
-    sort_key = valid_sort_keys.get(sort_by, "flip_score")
-    results.sort(key=lambda x: x.get(sort_key) or 0, reverse=True)
-
-    return {"items": results[:limit], "total": len(results)}
+        return json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid cached opportunities payload: {exc}")
 
 
 @router.get("/arbitrage")

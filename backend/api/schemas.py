@@ -294,6 +294,7 @@ class HealthResponse(BaseModel):
     cache_hit_rate: float = 0.0
     alert_sent_count: int = 0
     errors_last_hour: int = 0
+    opp_cached: bool = False
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
