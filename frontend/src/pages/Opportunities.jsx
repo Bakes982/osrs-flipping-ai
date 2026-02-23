@@ -239,11 +239,13 @@ export default function Opportunities() {
   const [search, setSearch]       = useState('');
   const [minPrice, setMinPrice]   = useState(0);
   const [profile, setProfile]     = useState('balanced');
-  const [expandedId, setExpandedId] = useState(null);
+  const [expandedId, setExpandedId]     = useState(null);
+  const [autoRefresh, setAutoRefresh]   = useState(true);
 
   const { data: raw, loading, error, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
-    [minPrice, profile], 120000,
+    [minPrice, profile],
+    autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
 
   const opps        = raw?.items || raw || [];
@@ -327,6 +329,14 @@ export default function Opportunities() {
             <option value="balanced">Balanced</option>
             <option value="aggressive">Aggressive</option>
           </select>
+          <button
+            className={`pill ${autoRefresh ? 'active' : ''}`}
+            onClick={() => setAutoRefresh(v => !v)}
+            title={autoRefresh ? 'Auto-refresh ON (60s) – click to pause' : 'Auto-refresh OFF – click to enable'}
+            style={{ fontSize: 11 }}
+          >
+            {autoRefresh ? '⟳ Live' : '⟳ Paused'}
+          </button>
           <button className="btn" onClick={reload} disabled={loading}>
             <RefreshCw size={14} style={loading ? { animation: 'spin 1s linear infinite' } : {}} /> Refresh
           </button>

@@ -56,11 +56,26 @@ function authHeaders(hasBody = false) {
 async function fetchJSON(path, options = {}, retries = 3) {
   const url = `${API_BASE}${path}`;
   const hasBody = !!options.body;
+  // Merge any externally-provided AbortSignal with our own 30 s timeout signal.
+  const timeoutCtrl = new AbortController();
+  const timeoutId   = setTimeout(() => timeoutCtrl.abort(new DOMException('Request timed out', 'TimeoutError')), 30_000);
+  const externalSignal = options.signal ?? null;
+  // Combine: abort if either the external signal or our timeout fires.
+  let signal = timeoutCtrl.signal;
+  if (externalSignal) {
+    const combo = new AbortController();
+    const abort = () => combo.abort(externalSignal.reason ?? timeoutCtrl.signal.reason);
+    externalSignal.addEventListener('abort', abort);
+    timeoutCtrl.signal.addEventListener('abort', abort);
+    signal = combo.signal;
+  }
+  const { signal: _drop, ...restOptions } = options; // don't double-pass signal
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, {
         headers: authHeaders(hasBody),
-        ...options,
+        signal,
+        ...restOptions,
       });
 
       // If the backend returns HTML instead of JSON, something is wrong.
@@ -95,15 +110,19 @@ async function fetchJSON(path, options = {}, retries = 3) {
       const text = await res.text();
       return text ? JSON.parse(text) : null;
     } catch (err) {
+      // Don't retry aborted requests (user navigated away or timeout)
+      if (err.name === 'AbortError') { clearTimeout(timeoutId); throw err; }
       if (attempt < retries && err instanceof TypeError) {
         // Network error (CORS block, DNS, offline) – retry
         const delay = 5000 * (attempt + 1);
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
+      clearTimeout(timeoutId);
       throw err;
     }
   }
+  clearTimeout(timeoutId);
 }
 
 // ---------------------------------------------------------------------------
