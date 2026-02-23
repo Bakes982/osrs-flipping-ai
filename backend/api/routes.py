@@ -657,7 +657,7 @@ def register_routes(app: FastAPI) -> None:
     Call this once from ``backend.app`` after creating the FastAPI instance.
     """
     # Existing routers (retain their own prefixes)
-    from backend.routers import opportunities, portfolio, analysis, settings, alerts, trades
+    from backend.routers import opportunities, portfolio, analysis, settings, alerts, trades, dumps
     from backend.routers import blocklist as blocklist_router
     from backend.routers import user_profile
     from backend.routers import backtest as backtest_router   # PR12
@@ -668,6 +668,7 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(settings.router)
     app.include_router(alerts.router)
     app.include_router(trades.router)
+    app.include_router(dumps.router)
     app.include_router(blocklist_router.router)
     app.include_router(user_profile.router)
     app.include_router(backtest_router.router)               # PR12

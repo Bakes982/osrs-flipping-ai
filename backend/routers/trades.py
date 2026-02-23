@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -33,6 +34,7 @@ class AcceptTradeRequest(BaseModel):
     qty_target: int = Field(ge=1)
     max_invest_gp: int = Field(ge=0)
     type: str = Field(default="normal", pattern="^(normal|dump)$")
+    volume_5m: Optional[int] = Field(default=None, ge=0)
     replace_trade_id: Optional[str] = None
 
 
@@ -47,6 +49,47 @@ def _trades_collection(db):
 
 def _now() -> datetime:
     return datetime.utcnow()
+
+
+def _get_positions_webhook_sync(db) -> tuple[Optional[str], Optional[str]]:
+    env_url = os.environ.get("DISCORD_WEBHOOK_POSITIONS", "").strip()
+    if env_url:
+        return env_url, "env"
+
+    for key in ("positions_webhook_url", "sell_alert_webhook_url"):
+        url = (get_setting(db, key) or "").strip()
+        if url:
+            return url, "db"
+    return None, None
+
+
+def _notify_dump_trade_accepted(db, trade: Dict[str, Any]) -> None:
+    webhook_url, source = _get_positions_webhook_sync(db)
+    if not webhook_url:
+        return
+
+    try:
+        import requests
+
+        embed = {
+            "title": f"⚠️ Accepted dump trade: {trade['name']}",
+            "color": 0xF59E0B,
+            "fields": [
+                {"name": "Slot", "value": str(trade.get("slot_index")), "inline": True},
+                {"name": "Buy", "value": f"{int(trade.get('buy_target') or 0):,} GP", "inline": True},
+                {"name": "Sell", "value": f"{int(trade.get('sell_target') or 0):,} GP", "inline": True},
+                {"name": "Qty", "value": str(int(trade.get("qty_target") or 0)), "inline": True},
+                {"name": "Risk", "value": f"SL {trade.get('stop_loss_pct', 0)}% · max {trade.get('max_duration_minutes', 0)}m", "inline": False},
+            ],
+            "footer": {"text": "OSRS Flipping AI • Positions"},
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        import logging
+        logging.getLogger(__name__).info("NOTIFIER=positions WEBHOOK_SOURCE=%s", source or "unknown")
+    except Exception:
+        return
+
 
 
 @router.post("/accept")
@@ -80,6 +123,20 @@ async def accept_trade(body: AcceptTradeRequest):
 
             ts = _now()
             trade_id = f"tr_{uuid4().hex[:12]}"
+
+            risk_fields = {}
+            if body.type == "dump":
+                min_dump_volume = int(get_setting(db, "dump_trade_min_volume", 120) or 120)
+                volume_5m = int(body.volume_5m or 0)
+                if volume_5m < min_dump_volume:
+                    raise HTTPException(status_code=400, detail=f"Dump requires volume_5m >= {min_dump_volume}")
+                risk_fields = {
+                    "max_duration_minutes": int(get_setting(db, "dump_trade_max_duration_minutes", 20) or 20),
+                    "stop_loss_pct": float(get_setting(db, "dump_trade_stop_loss_pct", 1.8) or 1.8),
+                    "min_volume_required": min_dump_volume,
+                    "volume_5m": volume_5m,
+                }
+
             doc = {
                 "trade_id": trade_id,
                 "item_id": body.item_id,
@@ -95,8 +152,11 @@ async def accept_trade(body: AcceptTradeRequest):
                 "type": body.type,
                 "last_action": "ACCEPTED",
                 "last_alert_ts": None,
+                **risk_fields,
             }
             coll.insert_one(doc)
+            if body.type == "dump":
+                _notify_dump_trade_accepted(db, doc)
             active_count = coll.count_documents({"state": {"$in": list(ACTIVE_STATES)}})
             return {
                 "ok": True,

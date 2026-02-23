@@ -736,15 +736,13 @@ class AlertMonitor:
         v2 improvements over the original:
           - All thresholds are env-configurable (DUMP_V2_* vars)
           - Item names resolved via Wiki mapping (never shows "Item XXXXX")
-          - Rich Discord embed with price chart, trade sizing, confidence tier
-          - Webhook routed via DISCORD_WEBHOOK_DUMPS env var
-          - Per-item cooldown via DUMP_V2_COOLDOWN_MINUTES
+          - Writes top dump candidates to Redis (dumps:top)
+          - Slot-aware acceptance handles downstream notifications
 
         Does NOT rely on MongoDB snapshots — uses the in-memory _price_cache (latest,
         updated every 10s) and _5m_cache (5m averages + volumes, updated every 60s).
         """
         from backend.alerts.item_name_resolver import resolve_item_name
-        from backend.alerts.dump_notifier import DumpAlertV2, DumpAlertNotifierV2
         # generate_opportunity_chart is imported lazily inside the chart try/except
         # so that a missing matplotlib install never prevents alerts from firing.
 
@@ -760,11 +758,10 @@ class AlertMonitor:
         MIN_SELL_RATIO   = config.DUMP_V2_MIN_SELL_RATIO      # 0.80 default
         MIN_PROFIT       = config.DUMP_V2_MIN_PROFIT_PER_ITEM # 2_000 GP default
         MIN_TOTAL_PROFIT = config.DUMP_V2_MIN_TOTAL_PROFIT    # 150_000 GP default
-        COOLDOWN_MIN     = config.DUMP_V2_COOLDOWN_MINUTES    # 60 min default
         POSITION_CAP     = config.DUMP_V2_POSITION_CAP_PCT    # 0.10 default
         CAPITAL          = config.DEFAULT_CAPITAL_GP           # 50_000_000 default
 
-        dump_webhook_url, dump_webhook_source = self._get_dump_alert_webhook_sync(db)
+        dump_candidates: List[dict] = []
 
         for item_id_str, instant in _price_cache.items():
             try:
@@ -803,16 +800,7 @@ class AlertMonitor:
                 if price_drop_pct < MIN_DROP_PCT:
                     continue
 
-                # Both dump signals confirmed — check cooldown before heavier work
                 item_id = int(item_id_str)
-                recent_alert = db.alerts.find_one({
-                    "item_id":    item_id,
-                    "alert_type": "dump",
-                    "timestamp":  {"$gte": now - timedelta(minutes=COOLDOWN_MIN)},
-                })
-                if recent_alert:
-                    logger.info("DUMP_SUPPRESSED cooldown id=%s", item_id)
-                    continue
 
                 # Resolve item name — NEVER show "Item XXXXX" if mapping has a real name
                 item_row  = get_item(db, item_id)
@@ -846,116 +834,35 @@ class AlertMonitor:
                 else:
                     confidence = "LOW"
 
-                # Build DumpAlertV2 (name is already resolved)
-                alert_v2 = DumpAlertV2(
-                    item_id=item_id,
-                    item_name=resolved_name,
-                    current_price=int(instant_sell),
-                    reference_price=int(avg_sell),
-                    drop_pct=round(price_drop_pct, 1),
-                    drop_amount=int(avg_sell - instant_sell),
-                    sold_5m=sell_vol,
-                    bought_5m=buy_vol,
-                    sell_ratio=round(sell_ratio, 3),
-                    profit_per_item_net=profit_per_item,
-                    predicted_recovery=int(avg_sell),
-                    confidence=confidence,
-                    qty_to_buy=qty,
-                    max_invest_gp=max_invest_gp,
-                    estimated_total_profit=estimated_total_profit,
-                    chart_path=None,
-                    timestamp=now,
-                )
-
-                # Chart generation — best-effort; never crashes the alert.
-                # Imported lazily so that a missing matplotlib install never
-                # prevents alerts from firing (chart just won't be attached).
-                chart_tmp_path = None
-                try:
-                    from backend.discord_notifier import generate_opportunity_chart
-                    chart_bytes = generate_opportunity_chart(
-                        item_name=resolved_name,
-                        item_id=item_id,
-                        buy_price=int(instant_sell),
-                        sell_price=int(avg_sell),
-                        score=min(100.0, price_drop_pct * sell_ratio * 10),
-                        trend="FALLING",
-                        hours=6,
-                    )
-                    if chart_bytes:
-                        tf = tempfile.NamedTemporaryFile(
-                            suffix=f"_dump_{item_id}.png", delete=False
-                        )
-                        tf.write(chart_bytes)
-                        tf.close()
-                        chart_tmp_path = tf.name
-                        alert_v2.chart_path = chart_tmp_path
-                        logger.info("DUMP_CHART_OK path=%s", chart_tmp_path)
-                except Exception as chart_exc:
-                    logger.warning("DUMP_CHART_FAIL %s", chart_exc)
-
-                # Send to Discord via DumpAlertNotifierV2
-                if dump_webhook_url:
-                    logger.info("NOTIFIER=dump WEBHOOK_SOURCE=%s", dump_webhook_source or "unknown")
-                    DumpAlertNotifierV2(dump_webhook_url).send(alert_v2)
-
-                # Persist to DB (drives cooldown checks for future cycles)
-                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
-                db_alert = Alert(
-                    item_id=item_id,
-                    item_name=resolved_name,
-                    alert_type="dump",
-                    message=(
-                        f"{resolved_name}: {price_drop_pct:.1f}% below 5m avg "
-                        f"({int(instant_sell):,} vs avg {int(avg_sell):,} GP) — "
-                        f"{sell_vol:,} sold vs {buy_vol:,} bought "
-                        f"({sell_ratio:.0%} sell ratio) — "
-                        f"~{profit_per_item:+,} GP/item recovery potential"
-                    ),
-                    data={
-                        "dump_type":       "volume_dump",
-                        "instant_sell":    int(instant_sell),
-                        "instant_buy":     int(instant_buy) if instant_buy else None,
-                        "avg_sell":        int(avg_sell),
-                        "avg_buy":         int(avg_buy) if avg_buy else None,
-                        "price_drop_pct":  round(price_drop_pct, 1),
-                        "sell_volume":     sell_vol,
-                        "buy_volume":      buy_vol,
-                        "sell_ratio":      round(sell_ratio, 2),
-                        "profit_per_item": profit_per_item,
-                        "severity":        severity,
-                        "confidence":      confidence,
-                    },
-                )
-                insert_alert(db, db_alert)
-                logger.info(
-                    "Dump alert [%s]: %s — %.1f%% drop, %d sold vs %d bought",
-                    confidence, resolved_name, price_drop_pct, sell_vol, buy_vol,
-                )
-
-                # Clean up temp chart file
-                if chart_tmp_path:
-                    try:
-                        os.unlink(chart_tmp_path)
-                    except Exception:
-                        pass
+                stars = 3 if confidence == "HIGH" else 2 if confidence == "MEDIUM" else 1
+                dump_candidates.append({
+                    "item_id": item_id,
+                    "name": resolved_name,
+                    "dump_price": int(instant_sell),
+                    "ref_avg": int(avg_sell),
+                    "drop_pct": round(price_drop_pct, 1),
+                    "sell_ratio": round(sell_ratio, 3),
+                    "volume_5m": int(total_vol),
+                    "est_profit": int(estimated_total_profit),
+                    "confidence": confidence,
+                    "stars": stars,
+                    "buy_price": int(instant_sell),
+                    "sell_price": int(avg_sell),
+                    "potential_profit": int(profit_per_item),
+                })
 
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
 
-    def _get_dump_alert_webhook_sync(self, db) -> tuple[Optional[str], Optional[str]]:
-        """Return dump webhook URL and source (env|db), without cross-channel fallback."""
-        env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
-        if env_url:
-            return env_url, "env"
-
-        try:
-            url = (get_setting(db, "dump_alert_webhook_url") or "").strip()
-            if url:
-                return str(url), "db"
-        except Exception as e:
-            logger.debug("Dump webhook lookup failed: %s", e)
-        return None, None
+        dump_candidates.sort(key=lambda d: (d.get("stars", 0), d.get("est_profit", 0)), reverse=True)
+        top_dumps = dump_candidates[:50]
+        redis = get_redis()
+        redis.set(
+            "dumps:top",
+            json.dumps({"generated_at": time.time(), "count": len(top_dumps), "items": top_dumps}),
+            ex=150,
+        )
+        logger.info("DUMPS_CACHE_WRITE count=%d", len(top_dumps))
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
