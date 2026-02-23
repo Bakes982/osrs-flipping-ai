@@ -5,6 +5,7 @@
  */
 import { createContext, useContext, useState, useCallback } from 'react';
 
+// eslint-disable-next-line react-refresh/only-export-components
 export const ErrorContext = createContext(null);
 
 // Maximum errors shown simultaneously
@@ -40,6 +41,7 @@ export function ErrorProvider({ children }) {
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useErrorPanel() {
   return useContext(ErrorContext);
 }

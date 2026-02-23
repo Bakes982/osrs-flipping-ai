@@ -144,21 +144,24 @@ export default function App() {
             <AccountSelector />
           </div>
           <div className="nav-links">
-            {NAV_ITEMS.map(({ path, label, icon: Icon }) => (
-              <NavLink
-                key={path}
-                to={path}
-                end={path === '/'}
-                className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
-                onClick={() => setMobileMenuOpen(false)}
-              >
-                <Icon size={18} />
-                <span>{label}</span>
-                {path === '/alerts' && alertCount > 0 && (
-                  <span className="alert-badge">{alertCount}</span>
-                )}
-              </NavLink>
-            ))}
+            {NAV_ITEMS.map(({ path, label, icon }) => {
+              const NavIcon = icon;
+              return (
+                <NavLink
+                  key={path}
+                  to={path}
+                  end={path === '/'}
+                  className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+                  onClick={() => setMobileMenuOpen(false)}
+                >
+                  <NavIcon size={18} />
+                  <span>{label}</span>
+                  {path === '/alerts' && alertCount > 0 && (
+                    <span className="alert-badge">{alertCount}</span>
+                  )}
+                </NavLink>
+              );
+            })}
           </div>
           <div className="sidebar-footer">
             {user && (

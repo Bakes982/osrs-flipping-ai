@@ -29,6 +29,7 @@ export default function Blocklist() {
 
   useEffect(() => {
     if (blocklistData?.items) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setBlockedIds(new Set(blocklistData.items.map(i => i.item_id)));
     }
   }, [blocklistData]);

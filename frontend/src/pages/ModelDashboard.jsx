@@ -7,7 +7,6 @@ const HORIZON_LABELS = { '1m': '1 Min', '5m': '5 Min', '30m': '30 Min', '2h': '2
 
 export default function ModelDashboard() {
   const { data: status, loading, error, reload } = useApi(() => api.getModelStatus(), [], 30000);
-  const { data: metrics } = useApi(() => api.getModelMetrics(), [], 60000);
 
   if (loading) return <div className="loading">Loading ML pipeline status...</div>;
   if (error) return (
@@ -166,7 +165,6 @@ export default function ModelDashboard() {
             <tbody>
               {HORIZONS.map(h => {
                 const hd = horizonData[h] || {};
-                const md = metrics?.horizons?.[h] || {};
                 return (
                   <tr key={h}>
                     <td style={{ fontWeight: 600 }}>{HORIZON_LABELS[h]}</td>

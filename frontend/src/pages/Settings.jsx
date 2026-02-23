@@ -23,6 +23,7 @@ export default function SettingsPage() {
   const [newDiscordId, setNewDiscordId] = useState('');
 
   // Sync local state when settings load
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (settings) {
       setWebhookUrl(settings.discord_webhook?.url || settings.discord_webhook_url || '');
@@ -34,6 +35,7 @@ export default function SettingsPage() {
       setAutoArchiveDays(settings.position_auto_archive_days ?? 7);
     }
   }, [settings]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const showMsg = (text, duration = 2500) => {
     setMsg(text);
