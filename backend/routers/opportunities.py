@@ -8,8 +8,10 @@ import asyncio
 import json
 import sys
 import os
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, Request
 
 # Ensure project root is on sys.path so we can import top-level modules
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,9 +19,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from backend.cache import get_redis
-from backend.database import get_db, get_price_history, get_item_flips, get_item, PriceSnapshot
+from backend.database import get_db, get_price_history, get_item_flips, get_item, get_setting, PriceSnapshot
 from backend.smart_pricer import SmartPricer
-from backend.flip_scorer import FlipScorer
+from backend.flip_scorer import FlipScorer, FlipScore
 from backend.arbitrage_finder import ArbitrageFinder
 from ai_strategist import analyze_single_item
 
@@ -57,6 +59,87 @@ def _fetch_wiki_snapshot(item_id: int):
 
 
 _wiki_name_cache: dict = {}
+
+
+def _score_to_reason(item: Dict[str, Any]) -> str:
+    bullets: List[str] = []
+    volume = int(item.get("volume_5m") or item.get("volume") or 0)
+    margin_pct = float(item.get("spread_pct") or item.get("margin_pct") or 0)
+    stability = float(item.get("score_stability") or item.get("stability_score") or 0)
+
+    if volume >= 2000:
+        bullets.append(f"High liquidity ({volume:,}/5m)")
+    elif volume >= 500:
+        bullets.append(f"Healthy liquidity ({volume:,}/5m)")
+
+    if margin_pct >= 2.0:
+        bullets.append(f"Strong margin ({margin_pct:.1f}% after spread)")
+    elif margin_pct >= 1.0:
+        bullets.append(f"Usable margin ({margin_pct:.1f}%)")
+
+    if stability >= 70:
+        bullets.append("Stable pricing profile")
+
+    if not bullets:
+        bullets.append("Balanced score across spread, volume, and risk")
+
+    return "\n".join(f"• {b}" for b in bullets[:2])
+
+
+def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
+    buy_price = int(item.get("recommended_buy") or item.get("buy_price") or 0)
+    sell_price = int(item.get("recommended_sell") or item.get("sell_price") or 0)
+    volume_5m = int(item.get("volume_5m") or item.get("volume") or 0)
+    potential_profit = int(item.get("expected_profit") or item.get("potential_profit") or item.get("net_profit") or 0)
+
+    mapped = {
+        "item_id": item.get("item_id"),
+        "name": item.get("item_name") or item.get("name") or "Unknown",
+        "buy_price": buy_price,
+        "sell_price": sell_price,
+        "instant_buy": int(item.get("instant_buy") or buy_price),
+        "instant_sell": int(item.get("instant_sell") or sell_price),
+        "margin": int(item.get("spread") or 0),
+        "margin_pct": float(item.get("spread_pct") or item.get("margin_pct") or 0),
+        "potential_profit": potential_profit,
+        "expected_profit": potential_profit,
+        "roi_pct": float(item.get("roi_pct") or 0),
+        "tax": int(item.get("tax") or 0),
+        "volume": volume_5m,
+        "volume_5m": volume_5m,
+        "trend": item.get("trend"),
+        "ml_confidence": float(item.get("confidence") or item.get("ml_confidence") or 0),
+        "flip_score": float(item.get("total_score") or item.get("flip_score") or 0),
+        "spread_score": float(item.get("score_spread") or item.get("spread_score") or 0),
+        "volume_score": float(item.get("score_volume") or item.get("volume_score") or 0),
+        "freshness_score": float(item.get("score_freshness") or item.get("freshness_score") or 0),
+        "trend_score": float(item.get("score_trend") or item.get("trend_score") or 0),
+        "history_score": float(item.get("score_history") or item.get("history_score") or 0),
+        "stability_score": float(item.get("score_stability") or item.get("stability_score") or 0),
+        "ml_signal_score": float(item.get("score_ml") or item.get("ml_signal_score") or 0),
+        "ml_direction": item.get("ml_direction"),
+        "ml_prediction_confidence": item.get("ml_prediction_confidence"),
+        "ml_method": item.get("ml_method"),
+        "win_rate": item.get("win_rate"),
+        "total_flips": int(item.get("total_flips") or 0),
+        "avg_profit": item.get("avg_profit"),
+        "position_sizing": item.get("position_sizing") or {},
+    }
+    mapped["reason"] = _score_to_reason(item | mapped)
+    return mapped
+
+
+def _parse_generated_at(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        iso = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def _fetch_wiki_item_name(item_id: int) -> str:
@@ -124,43 +207,105 @@ def _normalize_item(m: dict) -> dict:
 
 @router.get("")
 async def list_opportunities(
-    profile: str = "balanced",
-    limit: int = 200,
-    min_price: int = 0,
+    request: Request,
+    profile: Optional[str] = Query(None, pattern="^(conservative|balanced|aggressive)$"),
+    limit: int = Query(100, ge=1, le=200),
+    min_price: Optional[int] = Query(None, ge=0),
+    min_volume: Optional[int] = Query(None, ge=0),
+    min_roi_pct: Optional[float] = Query(None, ge=0),
+    min_profit_gp: Optional[int] = Query(None, ge=0),
 ):
-    """Return latest ranked opportunities from the warm flip-cache.
+    """Return cached opportunities from worker cache with server-side filtering."""
 
-    Reads from ``flips:top100:{profile}`` (written by the background worker
-    every ~30-90 s) and normalises field names to match the frontend contract.
-    """
-    from backend.cache_backend import get_cache_backend
+    def _load_prefs() -> Dict[str, Any]:
+        db = get_db()
+        try:
+            return {
+                "min_price": int(get_setting(db, "min_price", 0) or 0),
+                "min_volume": int(get_setting(db, "min_volume", 1) or 0),
+                "min_roi_pct": float(get_setting(db, "min_roi_pct", 0) or 0),
+                "min_profit_gp": int(get_setting(db, "min_profit", 0) or 0),
+            }
+        finally:
+            db.close()
 
-    cache = get_cache_backend()
+    prefs = await asyncio.to_thread(_load_prefs)
 
-    # ── 1. Load the cached flip list ──────────────────────────────────────
-    payload = cache.get_json(f"flips:top100:{profile}")
-    if not payload:
-        # Fallback: try balanced if the requested profile hasn't warmed yet
-        if profile != "balanced":
-            payload = cache.get_json("flips:top100:balanced")
-        if not payload:
-            return {"generated_at": None, "count": 0, "items": [], "profile": profile}
+    user_ctx = getattr(request.state, "user_ctx", None)
+    active_profile = profile or getattr(getattr(user_ctx, "risk_profile", None), "value", None) or "balanced"
 
-    items: list = payload.get("flips", []) if isinstance(payload, dict) else []
-    generated_at = payload.get("ts") if isinstance(payload, dict) else None
+    effective_min_price = int(min_price) if min_price is not None else int(prefs["min_price"])
+    effective_min_volume = int(min_volume) if min_volume is not None else int(prefs["min_volume"])
+    effective_min_roi_pct = float(min_roi_pct) if min_roi_pct is not None else float(prefs["min_roi_pct"])
+    effective_min_profit_gp = int(min_profit_gp) if min_profit_gp is not None else int(prefs["min_profit_gp"])
 
-    # ── 2. Apply optional min_price filter ────────────────────────────────
-    if min_price > 0:
-        items = [m for m in items if m.get("recommended_buy", 0) >= min_price]
+    redis = get_redis()
+    raw = redis.get(f"flips:top100:{active_profile}")
 
-    # ── 3. Normalize field names for the frontend ─────────────────────────
-    items = [_normalize_item(m) for m in items[:limit]]
+    if not raw:
+        return {
+            "generated_at": None,
+            "count": 0,
+            "items": [],
+            "profile": active_profile,
+            "prefs": {
+                "min_price": effective_min_price,
+                "min_volume": effective_min_volume,
+                "min_roi_pct": effective_min_roi_pct,
+                "min_profit_gp": effective_min_profit_gp,
+            },
+        }
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid cached opportunities payload: {exc}")
+
+    source_items = parsed.get("flips") if isinstance(parsed, dict) else None
+    if not isinstance(source_items, list):
+        source_items = parsed.get("items") if isinstance(parsed, dict) else []
+
+    mapped_items = [_map_cached_flip(item) for item in source_items if isinstance(item, dict)]
+
+    filtered_items: List[Dict[str, Any]] = []
+    for item in mapped_items:
+        buy_price = int(item.get("buy_price") or item.get("recommended_buy") or 0)
+        volume_5m = int(item.get("volume_5m") or item.get("volume") or 0)
+        roi_pct = float(item.get("roi_pct") or 0)
+        profit_gp = int(item.get("expected_profit") or item.get("potential_profit") or 0)
+
+        if buy_price < effective_min_price:
+            continue
+        if volume_5m < effective_min_volume:
+            continue
+        if roi_pct < effective_min_roi_pct:
+            continue
+        if profit_gp < effective_min_profit_gp:
+            continue
+
+        filtered_items.append(item)
+
+    filtered_items.sort(key=lambda x: float(x.get("flip_score") or 0), reverse=True)
+    filtered_items = filtered_items[:limit]
+
+    generated_at = _parse_generated_at(parsed.get("ts") if isinstance(parsed, dict) else None)
+    if generated_at is None and isinstance(parsed, dict):
+        generated_at = parsed.get("generated_at")
 
     return {
         "generated_at": generated_at,
-        "count": len(items),
-        "items": items,
-        "profile": profile,
+        "count": len(filtered_items),
+        "items": filtered_items,
+        "profile": active_profile,
+        "prefs": {
+            "min_price": effective_min_price,
+            "min_volume": effective_min_volume,
+            "min_roi_pct": effective_min_roi_pct,
+            "min_profit_gp": effective_min_profit_gp,
+        },
     }
 
 

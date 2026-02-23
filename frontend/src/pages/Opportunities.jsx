@@ -97,25 +97,43 @@ const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif
 
 /* ── Skeleton loader row ─────────────────────────────────────────────────── */
 
-function SkeletonRow() {
+
+function timeAgo(ts) {
+  if (!ts) return 'Never';
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
+  if (delta < 10) return 'just now';
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  return `${Math.floor(delta / 3600)}h ago`;
+}
+
+function LoadingSkeletonRows({ rows = 8 }) {
   return (
-    <tr style={{ opacity: 0.5 }}>
-      {[30, 220, 54, 80, 80, 60, 80, 60, 50, 50, 60, 32].map((w, i) => (
-        <td key={i}>
-          <div style={{
-            height: 14, borderRadius: 4, background: 'var(--bg-secondary)',
-            width: w, animation: 'pulse 1.4s ease-in-out infinite',
-          }} />
-        </td>
-      ))}
-    </tr>
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th style={{ width: 30 }}>#</th><th>Item</th><th>Score</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {Array.from({ length: rows }).map((_, i) => (
+          <tr key={`skeleton-${i}`}>
+            {Array.from({ length: 12 }).map((__, j) => (
+              <td key={`${i}-${j}`}>
+                <div style={{ height: 10, borderRadius: 6, background: 'var(--bg-secondary)', opacity: 0.8, width: j === 1 ? '90%' : '70%' }} />
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
-/* ── Score bar ───────────────────────────────────────────────────────────── */
+/* ── Score bar mini-component ────────────────────────────────────────────── */
 
-function ScoreBar({ score }) {
-  const pct = Math.min(100, score ?? 0);
+function ScoreBar({ score, max = 100 }) {
+  const pct = Math.min(100, (score / max) * 100);
   const color = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--cyan)' : 'var(--red)';
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 80 }}>
@@ -248,8 +266,10 @@ export default function Opportunities() {
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
 
-  const opps        = raw?.items || raw || [];
-  const lastUpdated = raw?.generated_at ? relativeTime(raw.generated_at) : null;
+  const opps = useMemo(() => raw?.items || [], [raw]);
+  const activePrefs = raw?.prefs || {};
+  const activeMode = raw?.profile || 'balanced';
+  const lastUpdated = timeAgo(raw?.generated_at);
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -314,9 +334,8 @@ export default function Opportunities() {
         <div>
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
-            {loading ? 'Loading…' : `${filtered.length} items`}
-            {!loading && ` · ranked by ${sortCol === 'flip_score' ? 'score' : sortCol}`}
-            {lastUpdated && <span className="text-muted"> · updated {lastUpdated}</span>}
+            {filtered.length} items · ranked by{' '}
+            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -343,8 +362,16 @@ export default function Opportunities() {
         </div>
       </div>
 
-      {/* ── Summary Cards ── */}
-      {(summaryStats || loading) && (
+      <div className="filter-bar" style={{ marginBottom: 12 }}>
+        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
+        <span className="pill">Min Price: {formatGP(activePrefs.min_price || 0)}</span>
+        <span className="pill">Min Volume: {(activePrefs.min_volume ?? 0).toLocaleString()}</span>
+        <span className="pill">Min ROI: {(activePrefs.min_roi_pct ?? 0).toFixed(1)}%</span>
+        <span className="pill">Min Profit: {formatGP(activePrefs.min_profit_gp || 0)}</span>
+      </div>
+
+      {/* Summary Stats */}
+      {summaryStats && (
         <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginBottom: 20 }}>
           {[
             { title: 'Items Shown',       value: loading ? '…' : filtered.length,                             color: null },
@@ -402,14 +429,21 @@ export default function Opportunities() {
 
       {/* ── Table ── */}
       <div className="card" style={{ padding: 0, overflow: 'auto' }}>
-        {error ? (
-          <div className="empty" style={{ color: '#ef4444', padding: '40px 20px' }}>
-            <AlertTriangle size={28} style={{ marginBottom: 12 }} />
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>Failed to load opportunities</div>
-            <div className="text-muted" style={{ fontSize: 12, marginBottom: 16 }}>
-              {error.message || 'Connection error'}
-            </div>
-            <button className="btn" onClick={reload}><RefreshCw size={13} /> Retry</button>
+        {loading ? (
+          <div>
+            <div className="text-muted" style={{ padding: '10px 14px' }}>Refreshing opportunities…</div>
+            <LoadingSkeletonRows rows={8} />
+          </div>
+        ) : error ? (
+          <div className="empty" style={{ color: '#ef4444' }}>
+            <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
+            <strong>Failed to load opportunities</strong><br />
+            <small className="text-muted">{error.message || 'Connection error'} — auto-retrying</small>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="empty">
+            <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
+            No items match your filters. Try adjusting criteria.
           </div>
         ) : (
           <table className="data-table">
@@ -430,26 +464,7 @@ export default function Opportunities() {
               </tr>
             </thead>
             <tbody>
-              {loading
-                ? Array.from({ length: 8 }, (_, i) => <SkeletonRow key={i} />)
-                : filtered.length === 0
-                ? (
-                  <tr>
-                    <td colSpan={12}>
-                      <div className="empty" style={{ padding: '40px 20px' }}>
-                        <Filter size={24} style={{ marginBottom: 12, opacity: 0.4 }} />
-                        <div style={{ fontWeight: 600, marginBottom: 6 }}>No opportunities found</div>
-                        <div className="text-muted" style={{ fontSize: 12, marginBottom: 16 }}>
-                          Try lowering your filters or switching to a different profile
-                        </div>
-                        <button className="btn" onClick={() => { setFilter('All'); setSearch(''); setMinPrice(0); }}>
-                          Clear Filters
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                )
-                : filtered.map((opp, i) => {
+              {filtered.map((opp, i) => {
                     const t    = trendBadge(opp.trend);
                     const cb   = confBadge(opp.ml_confidence, opp.flip_score);
                     const isX  = expandedId === opp.item_id;
