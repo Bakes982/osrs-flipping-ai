@@ -79,6 +79,13 @@ WORKER_CIRCUIT_FAILURE_THRESHOLD = int(os.environ.get("WORKER_CIRCUIT_FAILURE_TH
 WORKER_CIRCUIT_OPEN_SECONDS = int(os.environ.get("WORKER_CIRCUIT_OPEN_SECONDS", "300"))
 SCORE_STALE_MAX_MINUTES = int(os.environ.get("SCORE_STALE_MAX_MINUTES", "45"))
 WORKER_OK_MAX_AGE_SECONDS = int(os.environ.get("WORKER_OK_MAX_AGE_SECONDS", "180"))
+BUY_ADJUST_PCT = float(os.environ.get("BUY_ADJUST_PCT", "2.0"))
+BUY_STALL_MINUTES = int(os.environ.get("BUY_STALL_MINUTES", "8"))
+MIN_MARGIN_GP = int(os.environ.get("MIN_MARGIN_GP", "1000"))
+GUIDANCE_COOLDOWN_SECONDS = int(os.environ.get("GUIDANCE_COOLDOWN_SECONDS", "300"))
+SELL_UNDERCUT_PCT = float(os.environ.get("SELL_UNDERCUT_PCT", "1.0"))
+WATCH_DRAW_DOWN_RATIO = float(os.environ.get("WATCH_DRAW_DOWN_RATIO", "0.6"))
+GE_SLOT_CAPACITY = int(os.environ.get("GE_SLOT_CAPACITY", "8"))
 
 # ---------------------------------------------------------------------------
 # CORS — Starlette mirrors the request Origin when credentials=True + "*",

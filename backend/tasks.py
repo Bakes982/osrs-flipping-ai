@@ -21,6 +21,7 @@ import httpx
 
 from backend import config
 from backend.cache import get_redis
+from backend.cache_backend import get_cache_backend
 from backend.database import (
     get_db,
     PriceSnapshot,
@@ -36,10 +37,12 @@ from backend.database import (
     upsert_item_feature,
     get_item,
     find_active_positions,
+    find_active_strategy_trades,
     dismiss_position,
-    find_pending_sells,
     get_price_history,
 )
+from backend.logic.guidance_engine import compute_guidance_state
+from backend.notifier import send_guidance_alert
 from backend.websocket import manager
 
 logger = logging.getLogger(__name__)
@@ -660,8 +663,8 @@ class AlertMonitor:
         db = get_db()
         try:
             await self._check_price_targets(db)
-            await asyncio.to_thread(self._check_dump_alerts_sync, db)
-            await asyncio.to_thread(self._check_opportunity_alerts_sync, db)
+            # Legacy per-poll dump/opportunity alerting disabled.
+            # Position guidance alerts now run through PositionMonitor state transitions.
         except Exception as e:
             logger.error("AlertMonitor check error: %s", e)
         finally:
@@ -931,17 +934,7 @@ class AlertMonitor:
 # ---------------------------------------------------------------------------
 
 class PositionMonitor:
-    """Monitors active positions (unmatched BUY trades) for price changes.
-
-    Every 60 seconds:
-    1. Finds all open positions (BOUGHT but not yet matched to a flip)
-    2. Looks up the current market price for each held item
-    3. Re-calculates the recommended sell price via SmartPricer
-    4. If the price has moved significantly since the last alert, fires:
-       - A WebSocket broadcast so the dashboard updates live
-       - A Discord notification (if enabled) for large changes
-       - An in-DB Alert record
-    """
+    """Monitors strategy_trades and sends guidance on state transitions."""
 
     CHECK_INTERVAL = 30  # seconds between checks
     SMALL_CHANGE_PCT = 2.0   # % change to flag on dashboard
@@ -958,6 +951,7 @@ class PositionMonitor:
         # item_id → {last_alerted_price, last_alerted_at, last_rec_sell}
         self._state: Dict[int, dict] = {}
         self._pricer = None
+        self._cache = get_cache_backend()
 
     def _get_pricer(self):
         if self._pricer is None:
@@ -1116,110 +1110,98 @@ class PositionMonitor:
             })
 
     async def check_positions(self):
-        """Main tick: scan open positions and check for price movement."""
-        positions = await asyncio.to_thread(self._get_positions)
-        if not positions:
+        """Evaluate active strategy trades and notify only on guidance transitions."""
+        trades = await asyncio.to_thread(self._get_active_strategy_trades)
+        if not trades:
             return
 
-        pricer = self._get_pricer()
-        if pricer is None:
-            return
-
-        now = datetime.utcnow()
-        updates = []
-
-        for pos in positions:
-            item_id = pos["item_id"]
-            buy_price = pos["buy_price"]
-            quantity = pos["quantity"]
-
+        for trade in trades:
             try:
-                result = await asyncio.to_thread(
-                    self._evaluate_position, pricer, pos
-                )
-                if result is None:
+                market = _price_cache.get(str(trade.get("item_id")))
+                if not market:
                     continue
 
-                current_price = result["current_price"]
-                rec_sell = result["recommended_sell"]
-                pnl_pct = result["pnl_pct"]
-                rec_profit = result["recommended_profit"]
-                rec_profit_pct = result["recommended_profit_pct"]
+                new_state = compute_guidance_state(trade, market)
+                old_state = trade.get("last_guidance_state")
+                if new_state == old_state:
+                    continue
 
-                # Build the position update payload
-                update = {
-                    "item_id": item_id,
-                    "item_name": pos["item_name"],
-                    "quantity": quantity,
-                    "buy_price": buy_price,
-                    "current_price": current_price,
-                    "recommended_sell": rec_sell,
-                    "pnl_pct": round(pnl_pct, 2),
-                    "recommended_profit": rec_profit,
-                    "recommended_profit_pct": round(rec_profit_pct, 2),
-                    "bought_at": pos.get("bought_at"),
-                    "trade_id": pos.get("trade_id"),
-                }
+                cooldown_key = f"guidance:{trade.get('_id')}:{new_state}"
+                if self._cache.get(cooldown_key):
+                    continue
 
-                updates.append(update)
+                replacement = None
+                if new_state == "EXIT":
+                    replacement = self._suggest_replacement(trade)
 
-                # Check if we should fire an alert
-                state = self._state.get(item_id, {})
-                last_alerted = state.get("last_alerted_price", buy_price)
-                last_alerted_at = state.get("last_alerted_at")
-                change_from_alert = ((current_price - last_alerted) / last_alerted * 100) if last_alerted else 0
-
-                # Cooldown check
-                on_cooldown = (
-                    last_alerted_at
-                    and (now - last_alerted_at).total_seconds() < self.COOLDOWN_MINUTES * 60
+                await asyncio.to_thread(send_guidance_alert, trade, market, new_state, replacement)
+                self._cache.set(
+                    cooldown_key,
+                    "1",
+                    ttl_seconds=max(1, int(config.GUIDANCE_COOLDOWN_SECONDS)),
+                )
+                await asyncio.to_thread(self._persist_guidance_state, trade["_id"], new_state)
+            except Exception as exc:
+                logger.debug(
+                    "PositionMonitor guidance error for %s: %s",
+                    trade.get("item_name", trade.get("item_id")),
+                    exc,
                 )
 
-                if abs(change_from_alert) >= self.SMALL_CHANGE_PCT and not on_cooldown:
-                    direction = "dropped" if change_from_alert < 0 else "risen"
-                    alert_msg = (
-                        f"{pos['item_name']} has {direction} {abs(change_from_alert):.1f}% "
-                        f"since your buy ({buy_price:,} → {current_price:,} GP). "
-                        f"Recommended sell: {rec_sell:,} GP "
-                        f"(est. profit: {'+' if rec_profit >= 0 else ''}{rec_profit:,} GP)"
-                    )
+    def _get_active_strategy_trades(self) -> List[Dict]:
+        db = get_db()
+        try:
+            return find_active_strategy_trades(db)
+        finally:
+            db.close()
 
-                    # Save alert to DB
-                    await asyncio.to_thread(
-                        self._save_alert, item_id, pos["item_name"],
-                        alert_msg, update
-                    )
+    def _persist_guidance_state(self, trade_id, new_state: str) -> None:
+        db = get_db()
+        try:
+            set_fields = {
+                "last_guidance_state": new_state,
+                "last_guidance_ts": datetime.utcnow(),
+                "guidance_state": new_state,
+                "updated_at": datetime.utcnow(),
+            }
+            if new_state == "EXIT":
+                set_fields["state"] = "CLOSED"
+                set_fields["closed_at"] = datetime.utcnow()
+            db.strategy_trades.update_one({"_id": trade_id}, {"$set": set_fields})
+        finally:
+            db.close()
 
-                    # Update state
-                    self._state[item_id] = {
-                        "last_alerted_price": current_price,
-                        "last_alerted_at": now,
-                        "last_rec_sell": rec_sell,
-                    }
+    def _suggest_replacement(self, trade: Dict) -> Optional[str]:
+        profile = str(trade.get("profile") or "balanced")
+        payload = self._cache.get_json(f"flips:top100:{profile}") or {}
+        flips = payload.get("flips") if isinstance(payload, dict) else payload
+        if not isinstance(flips, list):
+            return None
 
-                    # Discord for large moves:
-                    # - PRICE DROP: always notify (losing more is always actionable)
-                    # - PRICE RISE: only notify if the position has crossed into profit.
-                    #   A bounce from -74% to -73% is noise, not a signal.
-                    is_now_profitable = update.get("pnl_pct", -1) >= 0
-                    should_discord = abs(change_from_alert) >= self.LARGE_CHANGE_PCT and (
-                        change_from_alert < 0 or is_now_profitable
-                    )
-                    if should_discord:
-                        asyncio.create_task(
-                            self._send_discord_position_alert(pos, update, change_from_alert)
-                        )
+        for flip in flips:
+            if not isinstance(flip, dict):
+                continue
+            if flip.get("item_id") == trade.get("item_id"):
+                continue
 
-            except Exception as e:
-                logger.debug("PositionMonitor: error checking %s: %s", pos["item_name"], e)
-
-        # Broadcast all position updates to connected frontends
-        if updates:
-            await manager.broadcast_json({
-                "type": "position_update",
-                "timestamp": now.isoformat(),
-                "positions": updates,
-            })
+            margin = (
+                flip.get("margin_after_tax")
+                or flip.get("net_profit")
+                or flip.get("potential_profit")
+                or 0
+            )
+            volume = (
+                flip.get("volume")
+                or flip.get("volume_5m")
+                or flip.get("liquidity_score")
+                or 0
+            )
+            try:
+                if float(margin) >= float(config.MIN_MARGIN_GP) and float(volume) > 0:
+                    return str(flip.get("item_name") or flip.get("name") or f"Item {flip.get('item_id')}")
+            except Exception:
+                continue
+        return None
 
     def _get_positions(self, source: Optional[str] = None, player: Optional[str] = None) -> List[Dict]:
         """Sync: find active positions from DB."""
@@ -1295,43 +1277,8 @@ class PositionMonitor:
             db.close()
 
     async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
-        """Send a Discord embed for a large price move on an active position."""
-        try:
-            webhook_url, webhook_source = await self._get_positions_webhook()
-            if not webhook_url:
-                return
-
-            import requests as _requests
-
-            pnl_pct = update.get("pnl_pct", 0)
-            if change_pct < 0:
-                direction = "\U0001f4c9 PRICE DROP"
-                color = 0xFF4444
-            else:
-                # Only reaches here when pnl_pct >= 0 (gated in check_positions)
-                direction = "\U0001f4b0 NOW PROFITABLE \u2014 CONSIDER SELLING"
-                color = 0x00FF88
-
-            embed = {
-                "title": f"{direction}: {pos['item_name']}",
-                "color": color,
-                "fields": [
-                    {"name": "\U0001f6d2 Buy Price", "value": f"{pos['buy_price']:,} GP", "inline": True},
-                    {"name": "\U0001f4b2 Current Price", "value": f"{update['current_price']:,} GP", "inline": True},
-                    {"name": "\U0001f4c9 Change", "value": f"{change_pct:+.1f}%", "inline": True},
-                    {"name": "\U0001f3af Recommended Sell", "value": f"{update['recommended_sell']:,} GP", "inline": True},
-                    {"name": "\U0001f4b0 Est. Profit", "value": f"{update['recommended_profit']:+,} GP ({update['recommended_profit_pct']:+.1f}%)", "inline": True},
-                    {"name": "\U0001f4e6 Quantity", "value": f"{pos['quantity']:,}", "inline": True},
-                ],
-                "footer": {"text": "OSRS Flipping AI \u2022 Position Monitor"},
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-
-            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
-            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-            logger.info("Discord position alert sent for %s", pos["item_name"])
-        except Exception as e:
-            logger.error("Failed to send Discord position alert: %s", e)
+        """Legacy position price-move Discord alerts are disabled."""
+        return
 
     def get_positions_with_prices(self, source: Optional[str] = None, player: Optional[str] = None) -> List[Dict]:
         """Get all active positions with live pricing (for API endpoint)."""
@@ -1368,135 +1315,12 @@ class PositionMonitor:
         return await asyncio.to_thread(_sync)
 
     async def check_selling_offers(self):
-        """Check active SELLING offers against current market price.
-
-        If the current instant-buy price (what buyers pay) has dropped more than
-        SELL_DROP_THRESHOLD% below the player's listed sell price, fire:
-        - WS broadcast so the Portfolio page highlights the row
-        - Discord alert via the dedicated sell-alert webhook
-        - DB Alert record
-        """
-        def _get_sells():
-            db = get_db()
-            try:
-                return find_pending_sells(db)
-            finally:
-                db.close()
-
-        sells = await asyncio.to_thread(_get_sells)
-        if not sells:
-            return
-
-        pricer = self._get_pricer()
-        now = datetime.utcnow()
-        sell_alerts = []
-
-        for sell in sells:
-            item_id = sell["item_id"]
-            listed_price = sell["listed_sell_price"]
-            if not listed_price:
-                continue
-
-            try:
-                def _eval(iid=item_id):
-                    db = get_db()
-                    try:
-                        snaps = get_price_history(db, iid, hours=1)
-                        if not snaps:
-                            return None
-                        latest = snaps[-1]
-                        # instant_buy = what buyers are currently paying (the relevant price for sell offers)
-                        return latest.instant_buy or latest.instant_sell
-                    finally:
-                        db.close()
-
-                current_market = await asyncio.to_thread(_eval)
-                if not current_market:
-                    continue
-
-                drop_pct = (listed_price - current_market) / listed_price * 100
-                if drop_pct < self.SELL_DROP_THRESHOLD:
-                    continue
-
-                # Cooldown check (use a sell-specific state key)
-                state_key = f"sell_{item_id}"
-                state = self._state.get(state_key, {})
-                last_alerted_at = state.get("last_alerted_at")
-                on_cooldown = (
-                    last_alerted_at
-                    and (now - last_alerted_at).total_seconds() < self.COOLDOWN_MINUTES * 60
-                )
-                if on_cooldown:
-                    continue
-
-                alert_msg = (
-                    f"{sell['item_name']} market price dropped {drop_pct:.1f}% below your "
-                    f"listed sell price ({listed_price:,} GP → market {current_market:,} GP). "
-                    f"Consider re-listing at {int(current_market * 0.99):,} GP."
-                )
-
-                sell_alert = {
-                    "item_id": item_id,
-                    "item_name": sell["item_name"],
-                    "listed_sell_price": listed_price,
-                    "current_market_price": current_market,
-                    "drop_pct": round(drop_pct, 1),
-                    "suggested_relist": int(current_market * 0.99),
-                    "quantity": sell["quantity"],
-                    "listed_at": sell["listed_at"],
-                }
-                sell_alerts.append(sell_alert)
-
-                self._state[state_key] = {"last_alerted_at": now}
-
-                # Save DB alert
-                await asyncio.to_thread(
-                    self._save_alert, item_id, sell["item_name"], alert_msg, sell_alert
-                )
-
-                # Discord for drops >= LARGE_CHANGE_PCT
-                if drop_pct >= self.LARGE_CHANGE_PCT:
-                    asyncio.create_task(self._send_discord_sell_alert(sell_alert))
-
-            except Exception as e:
-                logger.debug("PositionMonitor: sell-check error for %s: %s", sell.get("item_name"), e)
-
-        # Broadcast all sell alerts to connected frontends
-        if sell_alerts:
-            await manager.broadcast_json({
-                "type": "selling_price_alert",
-                "timestamp": now.isoformat(),
-                "alerts": sell_alerts,
-            })
+        """Legacy sell-price-drop alerting is disabled (state guidance only)."""
+        return
 
     async def _send_discord_sell_alert(self, alert: dict):
-        """Send a Discord embed for a sell offer that has been undercut by the market."""
-        try:
-            webhook_url, webhook_source = await self._get_positions_webhook()
-            if not webhook_url:
-                return
-
-            import requests as _requests
-
-            embed = {
-                "title": f"📉 SELL PRICE DROP: {alert['item_name']}",
-                "color": 0xFF4444,
-                "fields": [
-                    {"name": "🏷️ Listed Sell Price", "value": f"{alert['listed_sell_price']:,} GP", "inline": True},
-                    {"name": "📊 Current Market", "value": f"{alert['current_market_price']:,} GP", "inline": True},
-                    {"name": "📉 Drop", "value": f"{alert['drop_pct']:+.1f}%", "inline": True},
-                    {"name": "💡 Suggested Re-list", "value": f"{alert['suggested_relist']:,} GP", "inline": True},
-                    {"name": "📦 Quantity", "value": f"{alert['quantity']:,}", "inline": True},
-                ],
-                "description": "Market price has dropped below your listed sell price — you may be stuck selling for hours. Consider cancelling and re-listing.",
-                "footer": {"text": "OSRS Flipping AI • Sell Price Watcher"},
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
-            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-            logger.info("Discord sell-price alert sent for %s", alert["item_name"])
-        except Exception as e:
-            logger.error("Failed to send Discord sell alert: %s", e)
+        """Legacy sell-price-drop Discord alerts are disabled."""
+        return
 
     def _auto_archive_stale_positions(self):
         """Auto-dismiss positions that have been open longer than the configured
@@ -1567,7 +1391,6 @@ class PositionMonitor:
             try:
                 await self.check_positions()
                 await self.check_selling_offers()
-                await self.check_trade_guidance()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
 

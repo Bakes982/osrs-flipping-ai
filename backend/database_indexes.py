@@ -157,6 +157,11 @@ INDEXES: dict[str, list[IndexModel]] = {
                    sparse=True),
         IndexModel([("status", ASCENDING)], name="status"),
     ],
+    "strategy_trades": [
+        IndexModel([("state", ASCENDING), ("updated_at", DESCENDING)], name="state_updated"),
+        IndexModel([("item_id", ASCENDING), ("state", ASCENDING)], name="item_state"),
+        IndexModel([("slot_index", ASCENDING), ("state", ASCENDING)], name="slot_state"),
+    ],
 }
 
 

@@ -440,6 +440,7 @@ class Database:
         self.price_snapshots = db["price_snapshots"]
         self.price_aggregates = db["price_aggregates"]
         self.trades = db["trades"]
+        self.strategy_trades = db["strategy_trades"]
         self.flip_history = db["flip_history"]
         self.predictions = db["predictions"]
         self.model_metrics = db["model_metrics"]
@@ -447,6 +448,10 @@ class Database:
         self.alerts = db["alerts"]
         self.settings = db["settings"]
         self.strategy_trades = db["strategy_trades"]
+
+    @property
+    def db(self):
+        return self._db
 
     def close(self):
         """No-op. Pymongo connection pooling handles cleanup."""
@@ -552,6 +557,14 @@ def init_db():
         )
         _wrapper.trades.create_index(
             [("timestamp", DESCENDING)],
+            background=True,
+        )
+        _wrapper.strategy_trades.create_index(
+            [("state", ASCENDING), ("updated_at", DESCENDING)],
+            background=True,
+        )
+        _wrapper.strategy_trades.create_index(
+            [("item_id", ASCENDING), ("state", ASCENDING)],
             background=True,
         )
         _wrapper.flip_history.create_index(
@@ -792,6 +805,80 @@ def insert_trade(db: Database, trade: Trade) -> str:
     result = db.trades.insert_one(doc)
     trade.id = str(result.inserted_id)
     return trade.id
+
+
+def _default_strategy_trade_state(doc: Dict[str, Any]) -> str:
+    state = str(doc.get("state") or "").upper().strip()
+    if state in {"BUYING", "SELLING", "HOLDING"}:
+        return state
+
+    status = str(doc.get("status") or "").upper().strip()
+    if status in {"BUYING", "BOUGHT"}:
+        return "BUYING"
+    if status in {"SELLING", "SOLD"}:
+        return "SELLING"
+    return "HOLDING" if str(doc.get("type") or "").lower() == "dump" else "BUYING"
+
+
+def ensure_strategy_trade_defaults(db: Database, doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure strategy trade doc has required state fields and defaults."""
+    if not doc:
+        return {}
+
+    set_fields: Dict[str, Any] = {}
+
+    if "state" not in doc or str(doc.get("state") or "").upper() not in {"BUYING", "SELLING", "HOLDING"}:
+        set_fields["state"] = _default_strategy_trade_state(doc)
+    if "guidance_state" not in doc:
+        set_fields["guidance_state"] = "HEALTHY"
+    if "last_guidance_state" not in doc:
+        set_fields["last_guidance_state"] = None
+    if "last_guidance_ts" not in doc:
+        set_fields["last_guidance_ts"] = None
+    if "slot_index" not in doc:
+        set_fields["slot_index"] = int(doc.get("slot") or 0)
+    if "type" not in doc:
+        set_fields["type"] = "normal"
+    if "stop_loss_pct" not in doc:
+        set_fields["stop_loss_pct"] = None
+
+    if set_fields:
+        db.strategy_trades.update_one({"_id": doc["_id"]}, {"$set": set_fields})
+        doc.update(set_fields)
+
+    return doc
+
+
+def count_active_strategy_trades(db: Database) -> int:
+    return int(
+        db.strategy_trades.count_documents(
+            {"state": {"$in": ["BUYING", "SELLING", "HOLDING"]}}
+        )
+    )
+
+
+def find_active_strategy_trades(db: Database, limit: int = 200) -> List[Dict[str, Any]]:
+    docs = list(
+        db.strategy_trades.find(
+            {"state": {"$in": ["BUYING", "SELLING", "HOLDING"]}}
+        ).sort("updated_at", DESCENDING).limit(limit)
+    )
+    return [ensure_strategy_trade_defaults(db, d) for d in docs]
+
+
+def insert_strategy_trade(db: Database, trade: Dict[str, Any]) -> str:
+    payload = dict(trade or {})
+    payload.setdefault("created_at", datetime.utcnow())
+    payload["updated_at"] = datetime.utcnow()
+    payload.setdefault("state", _default_strategy_trade_state(payload))
+    payload.setdefault("guidance_state", "HEALTHY")
+    payload.setdefault("last_guidance_state", None)
+    payload.setdefault("last_guidance_ts", None)
+    payload.setdefault("slot_index", int(payload.get("slot_index") or 0))
+    payload.setdefault("type", "normal")
+    payload.setdefault("stop_loss_pct", None)
+    result = db.strategy_trades.insert_one(payload)
+    return str(result.inserted_id)
 
 
 def insert_flip(db: Database, flip: FlipHistory) -> str:

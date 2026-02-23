@@ -21,6 +21,7 @@ from collections import defaultdict
 
 import httpx
 from fastapi import APIRouter, Request, HTTPException, Query, UploadFile, File
+from pydantic import BaseModel
 
 # Ensure project root is on sys.path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,7 +42,11 @@ from backend.database import (
     insert_flip,
     get_matched_buy_trade_ids,
     get_distinct_players,
+    count_active_strategy_trades,
+    find_active_strategy_trades,
+    insert_strategy_trade,
 )
+from backend import config
 from backend.websocket import manager
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,31 @@ USER_AGENT = "OSRS-AI-Flipper v2.0 - Discord: bakes982"
 
 _wiki_name_to_id: dict = {}
 _wiki_id_to_name: dict = {}
+
+
+class AcceptTradeBody(BaseModel):
+    item_id: int
+    item_name: str
+    state: str = "BUYING"  # BUYING | SELLING | HOLDING
+    buy_target: Optional[int] = None
+    sell_target: Optional[int] = None
+    buy_price: Optional[int] = None
+    slot_index: int = 0
+    type: str = "normal"  # normal | dump
+    stop_loss_pct: Optional[float] = None
+    quantity: Optional[int] = None
+    profile: Optional[str] = "balanced"
+
+
+def _next_action_from_guidance(guidance_state: str) -> tuple[str, str]:
+    state = (guidance_state or "HEALTHY").upper()
+    if state == "EXIT":
+        return "Close position", "Risk thresholds breached or margin no longer viable."
+    if state == "ADJUST":
+        return "Adjust target", "Current target is likely unrealistic at current market levels."
+    if state == "WATCH":
+        return "Monitor closely", "Conditions are weakening but not yet a forced exit."
+    return "No action", "Position is within healthy operating thresholds."
 
 
 def _ensure_wiki_mapping():
@@ -218,6 +248,99 @@ async def get_trades(
             db.close()
 
     return await asyncio.to_thread(_sync)
+
+
+@router.get("/api/trades/active")
+async def get_active_strategy_trades():
+    """Return currently active strategy trades with guidance action metadata."""
+
+    def _sync():
+        db = get_db()
+        try:
+            docs = find_active_strategy_trades(db, limit=500)
+            rows = []
+            for doc in docs:
+                guidance_state = str(doc.get("guidance_state") or "HEALTHY").upper()
+                next_action, next_reason = _next_action_from_guidance(guidance_state)
+                ts = doc.get("last_guidance_ts")
+                rows.append({
+                    "trade_id": str(doc.get("_id")),
+                    "item_id": doc.get("item_id"),
+                    "item_name": doc.get("item_name"),
+                    "state": doc.get("state"),
+                    "type": doc.get("type", "normal"),
+                    "slot_index": doc.get("slot_index", 0),
+                    "buy_target": doc.get("buy_target"),
+                    "sell_target": doc.get("sell_target"),
+                    "buy_price": doc.get("buy_price"),
+                    "stop_loss_pct": doc.get("stop_loss_pct"),
+                    "guidance_state": guidance_state,
+                    "last_guidance_state": doc.get("last_guidance_state"),
+                    "last_guidance_ts": ts.isoformat() if hasattr(ts, "isoformat") and ts else None,
+                    "next_action": next_action,
+                    "next_reason": next_reason,
+                })
+            return rows
+        finally:
+            db.close()
+
+    trades = await asyncio.to_thread(_sync)
+    return {
+        "trades": trades,
+        "total": len(trades),
+        "active_count": len(trades),
+        "slot_capacity": config.GE_SLOT_CAPACITY,
+    }
+
+
+@router.post("/api/trades/accept")
+async def accept_trade(body: AcceptTradeBody):
+    """Accept a strategy trade if a GE slot is available."""
+    state = body.state.upper().strip()
+    if state not in {"BUYING", "SELLING", "HOLDING"}:
+        raise HTTPException(status_code=400, detail="state must be BUYING, SELLING, or HOLDING")
+
+    trade_type = body.type.lower().strip()
+    if trade_type not in {"normal", "dump"}:
+        raise HTTPException(status_code=400, detail="type must be normal or dump")
+
+    def _sync_accept():
+        db = get_db()
+        try:
+            active_count = count_active_strategy_trades(db)
+            if active_count >= config.GE_SLOT_CAPACITY:
+                return {
+                    "ok": False,
+                    "active_count": active_count,
+                    "slot_capacity": config.GE_SLOT_CAPACITY,
+                }
+
+            payload = body.model_dump()
+            payload["state"] = state
+            payload["type"] = trade_type
+            payload["slot_index"] = int(payload.get("slot_index") or active_count)
+            payload["guidance_state"] = "HEALTHY"
+            payload["last_guidance_state"] = None
+            payload["last_guidance_ts"] = None
+            payload["created_at"] = datetime.utcnow()
+            payload["updated_at"] = datetime.utcnow()
+            trade_id = insert_strategy_trade(db, payload)
+            return {
+                "ok": True,
+                "trade_id": trade_id,
+                "active_count": active_count + 1,
+                "slot_capacity": config.GE_SLOT_CAPACITY,
+            }
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_sync_accept)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"GE slot capacity reached ({result['active_count']}/{result['slot_capacity']})",
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
