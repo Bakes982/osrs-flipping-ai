@@ -764,7 +764,7 @@ class AlertMonitor:
         POSITION_CAP     = config.DUMP_V2_POSITION_CAP_PCT    # 0.10 default
         CAPITAL          = config.DEFAULT_CAPITAL_GP           # 50_000_000 default
 
-        dump_webhook_url = self._get_dump_alert_webhook_sync(db)
+        dump_webhook_url, dump_webhook_source = self._get_dump_alert_webhook_sync(db)
 
         for item_id_str, instant in _price_cache.items():
             try:
@@ -896,7 +896,7 @@ class AlertMonitor:
 
                 # Send to Discord via DumpAlertNotifierV2
                 if dump_webhook_url:
-                    logger.info("DUMP_WEBHOOK target=%s", dump_webhook_url[:35])
+                    logger.info("NOTIFIER=dump WEBHOOK_SOURCE=%s", dump_webhook_source or "unknown")
                     DumpAlertNotifierV2(dump_webhook_url).send(alert_v2)
 
                 # Persist to DB (drives cooldown checks for future cycles)
@@ -943,37 +943,19 @@ class AlertMonitor:
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
 
-    def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
-        """Return dedicated dump-alert webhook URL.
-
-        Priority order:
-          1. DISCORD_WEBHOOK_DUMPS env var  (explicit dump channel)
-          2. dump_alert_webhook_url DB setting
-          3. General discord_webhook DB setting (fallback only)
-        """
-        # 1. Env var — highest priority, set this in Railway for the dump channel
+    def _get_dump_alert_webhook_sync(self, db) -> tuple[Optional[str], Optional[str]]:
+        """Return dump webhook URL and source (env|db), without cross-channel fallback."""
         env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
         if env_url:
-            return env_url
+            return env_url, "env"
 
-        # 2. DB settings
         try:
-            url = get_setting(db, "dump_alert_webhook_url")
+            url = (get_setting(db, "dump_alert_webhook_url") or "").strip()
             if url:
-                return str(url).strip()
-
-            wh = get_setting(db, "discord_webhook")
-            if isinstance(wh, dict):
-                if wh.get("enabled", False) and wh.get("url"):
-                    return str(wh.get("url")).strip()
-
-            url = get_setting(db, "discord_webhook_url")
-            enabled = get_setting(db, "discord_alerts_enabled", False)
-            if url and enabled:
-                return str(url).strip()
+                return str(url), "db"
         except Exception as e:
             logger.debug("Dump webhook lookup failed: %s", e)
-        return None
+        return None, None
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
@@ -1256,7 +1238,7 @@ class PositionMonitor:
     async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
         """Send a Discord embed for a large price move on an active position."""
         try:
-            webhook_url = await self._get_sell_alert_webhook()
+            webhook_url, webhook_source = await self._get_positions_webhook()
             if not webhook_url:
                 return
 
@@ -1286,6 +1268,7 @@ class PositionMonitor:
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
             logger.info("Discord position alert sent for %s", pos["item_name"])
         except Exception as e:
@@ -1306,21 +1289,21 @@ class PositionMonitor:
             enriched.append(pos)
         return enriched
 
-    async def _get_sell_alert_webhook(self) -> Optional[str]:
-        """Return the dedicated sell-alert webhook URL (or general webhook as fallback)."""
+    async def _get_positions_webhook(self) -> tuple[Optional[str], Optional[str]]:
+        """Return positions webhook URL and source (env|db), without cross-channel fallback."""
         def _sync():
+            env_url = os.environ.get("DISCORD_WEBHOOK_POSITIONS", "").strip()
+            if env_url:
+                return env_url, "env"
+
             db = get_db()
             try:
-                url = get_setting(db, "sell_alert_webhook_url")
-                if url:
-                    return url
-                # Fallback to general webhook if enabled
-                wh = get_setting(db, "discord_webhook")
-                if isinstance(wh, dict):
-                    return wh.get("url") if wh.get("enabled") else None
-                url = get_setting(db, "discord_webhook_url")
-                enabled = get_setting(db, "discord_alerts_enabled", False)
-                return url if url and enabled else None
+                # Allow explicit DB keys for positions channel only.
+                for key in ("positions_webhook_url", "sell_alert_webhook_url"):
+                    url = (get_setting(db, key) or "").strip()
+                    if url:
+                        return url, "db"
+                return None, None
             finally:
                 db.close()
         return await asyncio.to_thread(_sync)
@@ -1430,7 +1413,7 @@ class PositionMonitor:
     async def _send_discord_sell_alert(self, alert: dict):
         """Send a Discord embed for a sell offer that has been undercut by the market."""
         try:
-            webhook_url = await self._get_sell_alert_webhook()
+            webhook_url, webhook_source = await self._get_positions_webhook()
             if not webhook_url:
                 return
 
@@ -1450,6 +1433,7 @@ class PositionMonitor:
                 "footer": {"text": "OSRS Flipping AI • Sell Price Watcher"},
                 "timestamp": datetime.utcnow().isoformat(),
             }
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
             logger.info("Discord sell-price alert sent for %s", alert["item_name"])
         except Exception as e:
@@ -1697,34 +1681,31 @@ class FlipCacheWorker:
 class OpportunityNotifier:
     """Periodically sends a top-5 opportunity digest to Discord.
 
-    Reads the webhook URL and interval from the settings collection.
-    Settings keys:
-        discord_webhook  → { url: "...", enabled: true/false }
-        discord_top5_interval_minutes → int  (default 30)
+    Webhook routing:
+      - DISCORD_WEBHOOK_OPPORTUNITIES env var (preferred)
+      - opportunities_webhook_url / opportunity_webhook_url in DB
+
+    Interval key:
+      - discord_top5_interval_minutes (default 30)
     """
 
     DEFAULT_INTERVAL_MIN = 30  # minutes between digests
     _last_sent: Optional[datetime] = None
 
-    async def _get_webhook_url(self) -> Optional[str]:
-        """Read webhook URL from DB settings. Returns None if disabled."""
+    async def _get_webhook_url(self) -> tuple[Optional[str], Optional[str]]:
+        """Read opportunity webhook URL and source (env|db), no generic fallback."""
         def _sync():
+            env_url = os.environ.get("DISCORD_WEBHOOK_OPPORTUNITIES", "").strip()
+            if env_url:
+                return env_url, "env"
+
             db = get_db()
             try:
-                wh = get_setting(db, "discord_webhook")
-                if not wh:
-                    # Also try the flat key used by settings page
-                    url = get_setting(db, "discord_webhook_url")
-                    enabled = get_setting(db, "discord_alerts_enabled", False)
-                    if url and enabled:
-                        return url
-                    return None
-                if isinstance(wh, dict):
-                    if not wh.get("enabled", False):
-                        return None
-                    return wh.get("url") or None
-                # Plain string
-                return wh if wh else None
+                for key in ("opportunities_webhook_url", "opportunity_webhook_url"):
+                    url = (get_setting(db, key) or "").strip()
+                    if url:
+                        return url, "db"
+                return None, None
             finally:
                 db.close()
         return await asyncio.to_thread(_sync)
@@ -1786,7 +1767,7 @@ class OpportunityNotifier:
 
     async def maybe_send(self):
         """Check if it's time to send, and send if so."""
-        webhook_url = await self._get_webhook_url()
+        webhook_url, webhook_source = await self._get_webhook_url()
         if not webhook_url:
             return  # webhook not configured or disabled
 
@@ -1806,6 +1787,7 @@ class OpportunityNotifier:
         from backend.discord_notifier import DiscordOpportunityNotifier
         notifier = DiscordOpportunityNotifier(webhook_url)
 
+        logger.info("NOTIFIER=opportunities WEBHOOK_SOURCE=%s", webhook_source or "unknown")
         ok = await asyncio.to_thread(
             notifier.send_top_opportunities, top, max_items=5, include_charts=True
         )
@@ -1828,17 +1810,17 @@ class OpportunityNotifier:
         if self._send_status in ("scanning", "sending"):
             return {"ok": True, "status": self._send_status, "message": "Already in progress"}
 
-        webhook_url = await self._get_webhook_url()
+        webhook_url, webhook_source = await self._get_webhook_url()
         if not webhook_url:
             return {"ok": False, "error": "Discord webhook not configured or disabled"}
 
         # Launch background work
         self._send_status = "scanning"
         self._send_result = None
-        asyncio.create_task(self._do_send_background(webhook_url))
+        asyncio.create_task(self._do_send_background(webhook_url, webhook_source))
         return {"ok": True, "status": "scanning", "message": "Scanning for opportunities…"}
 
-    async def _do_send_background(self, webhook_url: str):
+    async def _do_send_background(self, webhook_url: str, webhook_source: Optional[str]):
         """Heavy lifting: scan → score → chart → Discord. Runs as a task."""
         try:
             top = await self._get_top_opportunities(limit=5)
@@ -1850,6 +1832,7 @@ class OpportunityNotifier:
             self._send_status = "sending"
             from backend.discord_notifier import DiscordOpportunityNotifier
             notifier = DiscordOpportunityNotifier(webhook_url)
+            logger.info("NOTIFIER=opportunities WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             ok = await asyncio.to_thread(
                 notifier.send_top_opportunities, top, max_items=5, include_charts=True
             )
@@ -1939,23 +1922,6 @@ async def _emergency_compact_db():
     await asyncio.to_thread(_sync)
 
 
-async def _seed_sell_alert_webhook():
-    """One-time seed: if sell_alert_webhook_url is unset in DB, write the default."""
-    _SELL_ALERT_DEFAULT = "https://discord.com/api/webhooks/1474337747446796351/EjVW1qDmMl3th8gAQ-ra8idgw3qHVSlQbpt_GqPeZ3bG3-teskzT2NKICLJGdEKsgirJ"
-
-    def _sync():
-        db = get_db()
-        try:
-            existing = get_setting(db, "sell_alert_webhook_url")
-            if not existing:
-                set_setting(db, "sell_alert_webhook_url", _SELL_ALERT_DEFAULT)
-                logger.info("Seeded sell_alert_webhook_url in settings")
-        finally:
-            db.close()
-
-    await asyncio.to_thread(_sync)
-
-
 async def start_background_tasks():
     """Create and start all background asyncio tasks, staggered to avoid
     overloading MongoDB with simultaneous queries."""
@@ -1963,7 +1929,6 @@ async def start_background_tasks():
 
     # Immediately compact the DB to reclaim space before any new writes
     await _emergency_compact_db()
-    await _seed_sell_alert_webhook()
 
     collector = PriceCollector()
     feature_computer = FeatureComputer()
