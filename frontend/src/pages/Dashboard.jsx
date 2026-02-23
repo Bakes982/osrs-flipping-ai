@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom';
-import { useState, useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   RefreshCw, TrendingUp, TrendingDown, Minus, DollarSign, Trophy,
   BarChart3, Target, Zap, Clock, ArrowUpRight, ArrowDownRight, Percent,
@@ -51,14 +51,14 @@ export default function Dashboard() {
     () => api.getOpportunities({ limit: 20, sort_by: 'total_score' }),
     [], 120000,
   );
-  const { data: perf, loading: perfLoading } = useApi(
+  const { data: perf } = useApi(
     () => api.getPerformance(activeAccount), [activeAccount], 120000,
   );
   const { data: portfolio } = useApi(
     () => api.getPortfolio(activeAccount), [activeAccount], 120000,
   );
 
-  const opps = raw?.items || raw || [];
+  const opps = useMemo(() => raw?.items || raw || [], [raw]);
 
   // Derived stats
   const totalInvested = useMemo(() => {
@@ -112,13 +112,12 @@ export default function Dashboard() {
   }, [opps]);
 
   // Cumulative profit for chart
-  const cumulativeProfit = useMemo(() => {
-    let running = 0;
-    return profitHistory.map(d => {
-      running += d.profit;
-      return { ...d, cumulative: running };
-    });
-  }, [profitHistory]);
+  const cumulativeProfit = useMemo(() =>
+    profitHistory.reduce((acc, d) => [
+      ...acc,
+      { ...d, cumulative: (acc[acc.length - 1]?.cumulative ?? 0) + d.profit },
+    ], [])
+  , [profitHistory]);
 
   const bestFlip = perf?.best_flip;
   const worstFlip = perf?.worst_flip;

@@ -1,8 +1,8 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  RefreshCw, Search, TrendingUp, Filter,
-  ArrowUpRight, Zap, Shield, BarChart3, Target, AlertTriangle,
+  RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
+  ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle, Check,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -15,23 +15,6 @@ function formatGP(n) {
   if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return n.toLocaleString();
-}
-
-function formatVol(n) {
-  if (n == null || n === 0) return '—';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
-
-function relativeTime(isoStr) {
-  if (!isoStr) return null;
-  try {
-    const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
-    if (diff < 5)    return 'just now';
-    if (diff < 60)   return `${diff}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    return `${Math.floor(diff / 3600)}h ago`;
-  } catch { return null; }
 }
 
 /* ── Score pill ──────────────────────────────────────────────────────────── */
@@ -55,17 +38,6 @@ function ScorePill({ score }) {
       {score != null ? score.toFixed(0) : '—'}
     </span>
   );
-}
-
-/* ── Confidence badge ────────────────────────────────────────────────────── */
-
-function confBadge(conf, score) {
-  const c = (conf ?? 0) > 1 ? (conf ?? 0) / 100 : (conf ?? 0);
-  const isHigh = c > 0.70 || score >= 70;
-  const isMed  = c > 0.50 || score >= 55;
-  if (isHigh) return { label: 'HIGH', color: '#22c55e', bg: 'rgba(34,197,94,0.12)' };
-  if (isMed)  return { label: 'MED',  color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' };
-  return              { label: 'LOW',  color: '#ef4444', bg: 'rgba(239,68,68,0.12)' };
 }
 
 /* ── Trend badge ─────────────────────────────────────────────────────────── */
@@ -95,27 +67,104 @@ function Chip({ label, color }) {
 
 const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
 
+const FILTERS = [
+  { key: 'All', icon: null, desc: 'All items' },
+  { key: 'High Volume', icon: BarChart3, desc: 'Volume ≥ 500' },
+  { key: 'High Value 1M+', icon: TrendingUp, desc: 'Buy price ≥ 1M' },
+  { key: 'High Value 10M+', icon: TrendingUp, desc: 'Buy price ≥ 10M' },
+  { key: 'Low Risk', icon: Shield, desc: 'Stable / calm setups' },
+  { key: 'Best EV', icon: Zap, desc: 'Best expected value (profit × volume)' },
+];
+
 /* ── Skeleton loader row ─────────────────────────────────────────────────── */
 
-function SkeletonRow() {
+
+function timeAgo(ts) {
+  if (!ts) return 'Never';
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
+  if (delta < 10) return 'just now';
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  return `${Math.floor(delta / 3600)}h ago`;
+}
+
+function LoadingSkeletonRows({ rows = 8 }) {
   return (
-    <tr style={{ opacity: 0.5 }}>
-      {[30, 220, 54, 80, 80, 60, 80, 60, 50, 50, 60, 32].map((w, i) => (
-        <td key={i}>
-          <div style={{
-            height: 14, borderRadius: 4, background: 'var(--bg-secondary)',
-            width: w, animation: 'pulse 1.4s ease-in-out infinite',
-          }} />
-        </td>
-      ))}
-    </tr>
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th style={{ width: 30 }}>#</th><th>Item</th><th>RUNE SCORE</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {Array.from({ length: rows }).map((_, i) => (
+          <tr key={`skeleton-${i}`}>
+            {Array.from({ length: 12 }).map((__, j) => (
+              <td key={`${i}-${j}`}>
+                <div style={{ height: 10, borderRadius: 6, background: 'var(--bg-secondary)', opacity: 0.8, width: j === 1 ? '90%' : '70%' }} />
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
-/* ── Score bar ───────────────────────────────────────────────────────────── */
 
-function ScoreBar({ score }) {
-  const pct = Math.min(100, score ?? 0);
+function DumpSparkline({ dumpPrice, refAvg }) {
+  const low = Math.min(dumpPrice || 0, refAvg || 0) || 1;
+  const high = Math.max(dumpPrice || 0, refAvg || 0) || 1;
+  const norm = (v) => 28 - ((v - low) / Math.max(1, high - low)) * 20;
+  const y1 = norm(refAvg || low);
+  const y2 = norm(dumpPrice || low);
+  return (
+    <svg width="90" height="30" viewBox="0 0 90 30" aria-hidden>
+      <polyline points={`2,${y1} 45,${(y1 + y2) / 2} 88,${y2}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
+      <circle cx="88" cy={y2} r="2.5" fill="var(--red)" />
+    </svg>
+  );
+}
+
+
+function riskBadge(opp) {
+  const safety = Number(opp.stability_score || 0);
+  const score = Number(opp.flip_score || 0);
+  if (safety >= 70 && score >= 60) return { label: 'CALM', cls: 'badge-cyan' };
+  if (score >= 65) return { label: 'HOT', cls: 'badge-green' };
+  return { label: 'SPIKY', cls: 'badge-yellow' };
+}
+
+function scoreChips(opp) {
+  return [
+    `VOLUME ${Math.round(Number(opp.volume_score || 0))}`,
+    `MARGIN ${Math.round(Number(opp.spread_score || 0))}`,
+    `SAFETY ${Math.round(Number(opp.stability_score || 0))}`,
+    `SPEED ${Math.round(Number(opp.freshness_score || 0))}`,
+  ];
+}
+
+function MiniSparkline({ buyPrice, sellPrice }) {
+  const a = Number(buyPrice || 0);
+  const b = Number(sellPrice || 0);
+  const low = Math.min(a || 1, b || 1);
+  const high = Math.max(a || 1, b || 1);
+  const n = (v) => 22 - ((v - low) / Math.max(1, high - low)) * 14;
+  const y1 = n(a || low);
+  const y2 = n((a + b) / 2 || low);
+  const y3 = n(b || low);
+  return (
+    <svg width="68" height="24" viewBox="0 0 68 24" aria-hidden>
+      <polyline points={`2,${y1} 34,${y2} 66,${y3}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
+      <circle cx="66" cy={y3} r="2" fill="var(--green)" />
+    </svg>
+  );
+}
+
+/* ── Score bar mini-component ────────────────────────────────────────────── */
+
+function ScoreBar({ score, max = 100 }) {
+  const pct = Math.min(100, (score / max) * 100);
   const color = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--cyan)' : 'var(--red)';
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 80 }}>
@@ -132,13 +181,13 @@ function ScoreBar({ score }) {
 function ExpandedDetail({ opp }) {
   return (
     <tr>
-      <td colSpan={12} style={{ padding: 0, background: 'rgba(6,182,212,0.03)', borderBottom: '1px solid var(--border)' }}>
+      <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
         <div style={{ padding: '16px 20px', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, fontSize: 12 }}>
 
-          {/* Score Breakdown */}
+          {/* RUNE SCORE Breakdown */}
           <div>
             <div style={{ fontWeight: 600, marginBottom: 10, color: 'var(--cyan)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              Score Breakdown
+              RUNE SCORE Breakdown
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
               {[
@@ -220,36 +269,71 @@ function ExpandedDetail({ opp }) {
 
 /* ── Filter definitions ──────────────────────────────────────────────────── */
 
-const FILTERS = [
-  { key: 'All',            icon: null,       desc: 'All items' },
-  { key: 'High Score',     icon: Target,     desc: 'Score ≥ 60' },
-  { key: 'High Margin',    icon: TrendingUp, desc: 'Margin > 2%' },
-  { key: 'High Liquidity', icon: BarChart3,  desc: 'Vol score > 50' },
-  { key: 'Best EV',        icon: Zap,        desc: 'Profit × liquidity' },
-  { key: 'Low Risk',       icon: Shield,     desc: 'Risk = LOW' },
-];
-
 /* ── Main Component ──────────────────────────────────────────────────────── */
 
 export default function Opportunities() {
   const nav = useNavigate();
-  const [filter, setFilter]       = useState('All');
-  const [sortCol, setSortCol]     = useState('flip_score');
-  const [sortDir, setSortDir]     = useState('desc');
-  const [search, setSearch]       = useState('');
-  const [minPrice, setMinPrice]   = useState(0);
-  const [profile, setProfile]     = useState('balanced');
-  const [expandedId, setExpandedId]     = useState(null);
-  const [autoRefresh, setAutoRefresh]   = useState(true);
+  const [filter, setFilter] = useState('All');
+  const [sortCol, setSortCol] = useState('flip_score');
+  const [sortDir, setSortDir] = useState('desc');
+  const [search, setSearch] = useState('');
+  const [minPrice, setMinPrice] = useState(0);
+  const [profile, setProfile] = useState('balanced');
+  const [expandedId, setExpandedId] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [replaceForItem, setReplaceForItem] = useState(null);
+  const [acceptingId, setAcceptingId] = useState(null);
+  const [viewMode, setViewMode] = useState('opportunities');
 
   const { data: raw, loading, error, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
     [minPrice, profile],
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
+  const { data: tradeData, reload: reloadTrades } = useApi(
+    () => api.getActiveTrades(),
+    [], 10000,
+  );
+  const { data: dumpsRaw, loading: dumpsLoading, error: dumpsError, reload: reloadDumps } = useApi(
+    () => api.getDumps(),
+    [], 120000,
+  );
 
-  const opps        = raw?.items || raw || [];
-  const lastUpdated = raw?.generated_at ? relativeTime(raw.generated_at) : null;
+  const opps = useMemo(() => raw?.items || [], [raw]);
+  const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
+  const activePrefs = raw?.prefs || {};
+  const activeMode = raw?.profile || 'balanced';
+  const lastUpdated = timeAgo(raw?.generated_at);
+  const activeTrades = tradeData?.items || [];
+  const slotsUsed = tradeData?.slots_used || 0;
+  const slotsTotal = tradeData?.slots_total || 8;
+  const freeSlots = Math.max(0, tradeData?.free_slots ?? (slotsTotal - slotsUsed));
+
+
+  const acceptOpportunity = async (opp, replaceTradeId = null, overrides = {}) => {
+    try {
+      setAcceptingId(opp.item_id);
+      await api.acceptTrade({
+        item_id: opp.item_id,
+        name: opp.name,
+        buy_target: opp.buy_price || opp.instant_buy || opp.dump_price || 0,
+        sell_target: opp.sell_price || opp.instant_sell || opp.ref_avg || 0,
+        qty_target: Math.max(1, opp.position_sizing?.quantity || 1),
+        max_invest_gp: Math.max(0, opp.position_sizing?.max_investment || (opp.buy_price || opp.dump_price || 0)),
+        type: (opp.dump_signal || '').toLowerCase() === 'high' ? 'dump' : 'normal',
+        volume_5m: opp.volume_5m || opp.volume,
+        replace_trade_id: replaceTradeId,
+        ...overrides,
+      });
+      setReplaceForItem(null);
+      reloadTrades();
+      if (viewMode === "dumps") reloadDumps();
+    } catch (e) {
+      window.alert(e.message || 'Failed to accept trade');
+    } finally {
+      setAcceptingId(null);
+    }
+  };
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -266,14 +350,11 @@ export default function Opportunities() {
       );
     }
 
-    if      (filter === 'High Score')     items = items.filter(o => (o.flip_score ?? 0) >= 60);
-    else if (filter === 'High Margin')    items = items.filter(o => (o.margin_pct ?? 0) > 2);
-    else if (filter === 'High Liquidity') items = items.filter(o => (o.volume_score ?? o.volume ?? 0) > 50);
-    else if (filter === 'Best EV')        items.sort((a, b) =>
-      (b.potential_profit ?? 0) * Math.max(1, b.volume_score ?? b.volume ?? 1) -
-      (a.potential_profit ?? 0) * Math.max(1, a.volume_score ?? a.volume ?? 1)
-    );
-    else if (filter === 'Low Risk')       items = items.filter(o => (o.risk_level ?? '').toUpperCase() === 'LOW');
+    if (filter === 'High Volume') items = items.filter(o => (o.volume || 0) >= 500);
+    else if (filter === 'High Value 1M+') items = items.filter(o => (o.buy_price || 0) >= 1_000_000);
+    else if (filter === 'High Value 10M+') items = items.filter(o => (o.buy_price || 0) >= 10_000_000);
+    else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume || 1)) - (a.potential_profit * (a.volume || 1)));
+    else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
     items.sort((a, b) => {
       const av = a[sortCol] ?? 0;
@@ -314,9 +395,8 @@ export default function Opportunities() {
         <div>
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
-            {loading ? 'Loading…' : `${filtered.length} items`}
-            {!loading && ` · ranked by ${sortCol === 'flip_score' ? 'score' : sortCol}`}
-            {lastUpdated && <span className="text-muted"> · updated {lastUpdated}</span>}
+            {filtered.length} items · ranked by{' '}
+            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated} · slots {slotsUsed}/{slotsTotal}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -337,14 +417,28 @@ export default function Opportunities() {
           >
             {autoRefresh ? '⟳ Live' : '⟳ Paused'}
           </button>
-          <button className="btn" onClick={reload} disabled={loading}>
+          <button className="btn" onClick={() => (viewMode === 'opportunities' ? reload() : reloadDumps())} disabled={loading}>
             <RefreshCw size={14} style={loading ? { animation: 'spin 1s linear infinite' } : {}} /> Refresh
           </button>
         </div>
       </div>
 
-      {/* ── Summary Cards ── */}
-      {(summaryStats || loading) && (
+
+      <div className="filter-bar" style={{ marginBottom: 12 }}>
+        <button className={`pill ${viewMode === 'opportunities' ? 'active' : ''}`} onClick={() => setViewMode('opportunities')}>Opportunities</button>
+        <button className={`pill ${viewMode === 'dumps' ? 'active' : ''}`} onClick={() => setViewMode('dumps')}>Dumps</button>
+      </div>
+
+      <div className="filter-bar" style={{ marginBottom: 12 }}>
+        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
+        <span className="pill">Min Price: {formatGP(activePrefs.min_price || 0)}</span>
+        <span className="pill">Min Volume: {(activePrefs.min_volume ?? 0).toLocaleString()}</span>
+        <span className="pill">Min ROI: {(activePrefs.min_roi_pct ?? 0).toFixed(1)}%</span>
+        <span className="pill">Min Profit: {formatGP(activePrefs.min_profit_gp || 0)}</span>
+      </div>
+
+      {/* Summary Stats */}
+      {summaryStats && (
         <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginBottom: 20 }}>
           {[
             { title: 'Items Shown',       value: loading ? '…' : filtered.length,                             color: null },
@@ -400,149 +494,209 @@ export default function Opportunities() {
         </div>
       </div>
 
-      {/* ── Table ── */}
-      <div className="card" style={{ padding: 0, overflow: 'auto' }}>
-        {error ? (
-          <div className="empty" style={{ color: '#ef4444', padding: '40px 20px' }}>
-            <AlertTriangle size={28} style={{ marginBottom: 12 }} />
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>Failed to load opportunities</div>
-            <div className="text-muted" style={{ fontSize: 12, marginBottom: 16 }}>
-              {error.message || 'Connection error'}
+      {viewMode === 'dumps' ? (
+        <div>
+          {dumpsLoading ? (
+            <div className="card" style={{ padding: 16 }}>Loading dump candidates…</div>
+          ) : dumpsError ? (
+            <div className="empty" style={{ color: '#ef4444' }}>{dumpsError.message || 'Failed to load dumps'}</div>
+          ) : dumps.length === 0 ? (
+            <div className="empty">No dump candidates right now.</div>
+          ) : (
+            <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))' }}>
+              {dumps.map((d) => (
+                <div key={d.item_id} className="card" style={{ padding: 14 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontWeight: 700 }}>{d.name}</div>
+                    <span className={`badge ${d.stars >= 3 ? 'badge-red' : d.stars === 2 ? 'badge-yellow' : 'badge-cyan'}`}>{'★'.repeat(d.stars || 1)}</span>
+                  </div>
+                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <DumpSparkline dumpPrice={d.dump_price} refAvg={d.ref_avg} />
+                    <div style={{ fontSize: 12 }}>
+                      <div>Drop: <strong>{d.drop_pct?.toFixed?.(1) ?? d.drop_pct}%</strong></div>
+                      <div>Vol: <strong>{(d.volume_5m || 0).toLocaleString()}</strong></div>
+                      <div>Est profit: <strong>+{formatGP(d.est_profit)}</strong></div>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+                    {freeSlots > 0 ? (
+                      <button className="btn" onClick={() => acceptOpportunity(d, null, { type: 'dump' })}>
+                        <Check size={12} /> Accept dump
+                      </button>
+                    ) : (
+                      <select
+                        defaultValue=""
+                        onChange={(e) => e.target.value && acceptOpportunity(d, e.target.value, { type: 'dump' })}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="" disabled>Replace slot to accept</option>
+                        {activeTrades.map(t => (
+                          <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-            <button className="btn" onClick={reload}><RefreshCw size={13} /> Retry</button>
+          )}
+        </div>
+      ) : (
+      /* ── Table ── */
+      <div className="card" style={{ padding: 0, overflow: 'auto' }}>
+        {loading ? (
+          <div>
+            <div className="text-muted" style={{ padding: '10px 14px' }}>Refreshing opportunities…</div>
+            <LoadingSkeletonRows rows={8} />
+          </div>
+        ) : error ? (
+          <div className="empty" style={{ color: '#ef4444' }}>
+            <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
+            <strong>Failed to load opportunities</strong><br />
+            <small className="text-muted">{error.message || 'Connection error'} — auto-retrying</small>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="empty">
+            <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
+            No items match your filters. Try adjusting criteria.
           </div>
         ) : (
           <table className="data-table">
             <thead>
               <tr>
                 <th style={{ width: 30 }}>#</th>
-                <th style={{ minWidth: 200 }}>Item</th>
-                {th('Score',  'flip_score')}
-                {th('Buy',    'buy_price')}
-                {th('Sell',   'sell_price')}
+                <th>Item</th>
+                {th('RUNE SCORE', 'flip_score')}
+                {th('Buy', 'buy_price')}
+                {th('Sell', 'sell_price')}
                 {th('Margin', 'margin_pct')}
                 {th('Profit', 'potential_profit')}
                 {th('ROI',    'roi_pct')}
                 {th('Vol',    'volume_score')}
                 <th>Trend</th>
-                <th>Conf</th>
-                <th style={{ width: 32 }}></th>
+                <th>AI</th>
+                <th style={{ width: 30 }}></th>
+                <th style={{ width: 180 }}>Trade</th>
               </tr>
             </thead>
             <tbody>
-              {loading
-                ? Array.from({ length: 8 }, (_, i) => <SkeletonRow key={i} />)
-                : filtered.length === 0
-                ? (
-                  <tr>
-                    <td colSpan={12}>
-                      <div className="empty" style={{ padding: '40px 20px' }}>
-                        <Filter size={24} style={{ marginBottom: 12, opacity: 0.4 }} />
-                        <div style={{ fontWeight: 600, marginBottom: 6 }}>No opportunities found</div>
-                        <div className="text-muted" style={{ fontSize: 12, marginBottom: 16 }}>
-                          Try lowering your filters or switching to a different profile
-                        </div>
-                        <button className="btn" onClick={() => { setFilter('All'); setSearch(''); setMinPrice(0); }}>
-                          Clear Filters
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                )
-                : filtered.map((opp, i) => {
-                    const t    = trendBadge(opp.trend);
-                    const cb   = confBadge(opp.ml_confidence, opp.flip_score);
-                    const isX  = expandedId === opp.item_id;
-                    const profit = opp.potential_profit ?? 0;
-                    const margin = opp.margin_pct ?? 0;
-                    return [
-                      <tr
-                        key={`row-${opp.item_id ?? i}`}
-                        onClick={() => setExpandedId(isX ? null : opp.item_id)}
-                        style={isX ? { background: 'rgba(6,182,212,0.04)', cursor: 'pointer' } : { cursor: 'pointer' }}
-                      >
-                        <td className="text-muted" style={{ fontSize: 11 }}>{i + 1}</td>
-
-                        {/* Item chip */}
-                        <td>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <img
-                              src={IMG(opp.item_id)} alt="" width={26} height={26}
-                              style={{ imageRendering: 'pixelated', flexShrink: 0, borderRadius: 4 }}
-                              onError={e => { e.target.style.display = 'none'; }}
-                            />
-                            <div>
-                              <div style={{ fontWeight: 600, fontSize: 13, lineHeight: 1.2 }}>
-                                {opp.name || opp.item_name}
-                              </div>
-                              <div style={{ display: 'flex', gap: 3, marginTop: 3, flexWrap: 'wrap' }}>
-                                {opp.risk_level && (
-                                  <Chip
-                                    label={opp.risk_level}
-                                    color={opp.risk_level === 'LOW' ? '#22c55e' : opp.risk_level === 'MEDIUM' ? '#f59e0b' : '#ef4444'}
-                                  />
-                                )}
-                                {(opp.volume_score ?? 0) >= 65 && <Chip label="Liquid" color="#06b6d4" />}
-                                {(opp.flip_score ?? 0) >= 70   && <Chip label="Top"    color="#22c55e" />}
-                              </div>
+              {filtered.map((opp, i) => {
+                const t = trendBadge(opp.trend);
+                const isExpanded = expandedId === opp.item_id;
+                return [
+                  <tr key={`row-${i}`}
+                    onClick={() => setExpandedId(isExpanded ? null : opp.item_id)}
+                    style={isExpanded ? { background: 'rgba(6,182,212,0.05)' } : {}}
+                  >
+                    <td className="text-muted">{i + 1}</td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <img src={IMG(opp.item_id)} alt="" width={28} height={28}
+                          style={{ imageRendering: 'pixelated', flexShrink: 0 }}
+                          onError={e => { e.target.style.display = 'none'; }} />
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
+                            {opp.name}
+                            <span className={`badge ${riskBadge(opp).cls}`} style={{ fontSize: 10 }}>{riskBadge(opp).label}</span>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <MiniSparkline buyPrice={opp.buy_price} sellPrice={opp.sell_price} />
+                            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                              {scoreChips(opp).map((chip) => (
+                                <span key={chip} className="badge badge-cyan" style={{ fontSize: 9 }}>{chip}</span>
+                              ))}
                             </div>
                           </div>
-                        </td>
-
-                        <td><ScorePill score={opp.flip_score} /></td>
-
-                        <td className="gp" style={{ color: 'var(--green)' }}>{formatGP(opp.buy_price)}</td>
-                        <td className="gp" style={{ color: 'var(--cyan)' }}>{formatGP(opp.sell_price)}</td>
-
-                        <td className="gp" style={{ color: margin > 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>
-                          {margin > 0 ? '+' : ''}{margin.toFixed(1)}%
-                        </td>
-
-                        <td className="gp" style={{ color: profit > 0 ? 'var(--green)' : 'var(--text-secondary)', fontWeight: 600 }}>
-                          {profit > 0 ? '+' : ''}{formatGP(profit)}
-                        </td>
-
-                        <td className="gp" style={{ color: (opp.roi_pct ?? 0) > 0 ? 'var(--green)' : 'var(--text-secondary)' }}>
-                          {opp.roi_pct != null ? `${opp.roi_pct.toFixed(1)}%` : '—'}
-                        </td>
-
-                        <td className="gp text-muted">{formatVol(opp.volume_score ?? opp.volume)}</td>
+                          {opp.win_rate != null && (
+                            <div className="text-muted" style={{ fontSize: 10 }}>
+                              {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+                    <td>
+                      <span className={`badge ${scoreColor(opp.flip_score)}`}>
+                        {opp.flip_score?.toFixed(0)}
+                      </span>
+                    </td>
+                    <td className="gp text-green">{formatGP(opp.buy_price)}</td>
+                    <td className="gp text-cyan">{formatGP(opp.sell_price)}</td>
+                    <td className="gp">{opp.margin_pct?.toFixed(1)}%</td>
+                    <td className="gp text-green">+{formatGP(opp.potential_profit)}</td>
+                    <td className="gp">{opp.roi_pct?.toFixed(1) || '—'}%</td>
+                    <td className="gp">{opp.volume || 0}</td>
+                    <td><span className={`badge ${t.cls}`} title={t.label}>{t.icon}</span></td>
+                    <td>
+                      {opp.ml_confidence != null ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <div style={{ width: 36, height: 5, borderRadius: 3, background: 'var(--bg-secondary)' }}>
+                            <div style={{
+                              height: '100%', borderRadius: 3,
+                              width: `${Math.min(100, (opp.ml_confidence || 0) * 100)}%`,
+                              background: opp.ml_confidence > 0.7 ? 'var(--green)' : opp.ml_confidence > 0.5 ? 'var(--yellow)' : 'var(--red)',
+                            }} />
+                          </div>
+                          <span className="text-muted" style={{ fontSize: 10 }}>{((opp.ml_confidence || 0) * 100).toFixed(0)}%</span>
+                        </div>
+                      ) : <span className="text-muted">—</span>}
+                    </td>
+                    <td>
+                      <button
+                        className="btn"
+                        style={{ padding: '4px 8px', fontSize: 11 }}
+                        onClick={e => { e.stopPropagation(); nav(`/item/${opp.item_id}`); }}
+                        title="View full analysis"
+                      >
+                        <ArrowUpRight size={12} />
+                      </button>
+                    </td>
 
                         <td>
-                          <span style={{ color: t.color, fontWeight: 700, fontSize: 12 }} title={t.label}>
-                            {t.icon}
-                          </span>
-                        </td>
-
-                        <td>
-                          <span style={{
-                            display: 'inline-block', padding: '2px 6px', borderRadius: 4,
-                            background: cb.bg, color: cb.color,
-                            fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
-                          }}>
-                            {cb.label}
-                          </span>
-                        </td>
-
-                        <td>
-                          <button
-                            className="btn"
-                            style={{ padding: '3px 7px', fontSize: 11 }}
-                            onClick={e => { e.stopPropagation(); nav(`/item/${opp.item_id}`); }}
-                            title="View full analysis"
-                          >
-                            <ArrowUpRight size={12} />
-                          </button>
+                          {freeSlots > 0 ? (
+                            <button
+                              className="btn"
+                              disabled={acceptingId === opp.item_id}
+                              onClick={e => { e.stopPropagation(); acceptOpportunity(opp); }}
+                              style={{ fontSize: 11 }}
+                            >
+                              <Check size={12} /> Accept
+                            </button>
+                          ) : (
+                            <div>
+                              <button
+                                className="btn"
+                                disabled={acceptingId === opp.item_id}
+                                onClick={e => { e.stopPropagation(); setReplaceForItem(replaceForItem === opp.item_id ? null : opp.item_id); }}
+                                style={{ fontSize: 11 }}
+                              >
+                                Replace slot
+                              </button>
+                              {replaceForItem === opp.item_id && (
+                                <select
+                                  onClick={e => e.stopPropagation()}
+                                  onChange={(e) => e.target.value && acceptOpportunity(opp, e.target.value)}
+                                  defaultValue=""
+                                  style={{ marginTop: 6, width: '100%', fontSize: 11 }}
+                                >
+                                  <option value="" disabled>Select trade to replace</option>
+                                  {activeTrades.map(t => (
+                                    <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                          )}
                         </td>
                       </tr>,
-                      isX && <ExpandedDetail key={`detail-${opp.item_id ?? i}`} opp={opp} />,
-                    ];
-                  })
-              }
+                  isExpanded && <ExpandedDetail key={`detail-${opp.item_id ?? i}`} opp={opp} />,
+                ];
+              })}
             </tbody>
           </table>
         )}
       </div>
+      )}
     </div>
   );
 }

@@ -736,15 +736,13 @@ class AlertMonitor:
         v2 improvements over the original:
           - All thresholds are env-configurable (DUMP_V2_* vars)
           - Item names resolved via Wiki mapping (never shows "Item XXXXX")
-          - Rich Discord embed with price chart, trade sizing, confidence tier
-          - Webhook routed via DISCORD_WEBHOOK_DUMPS env var
-          - Per-item cooldown via DUMP_V2_COOLDOWN_MINUTES
+          - Writes top dump candidates to Redis (dumps:top)
+          - Slot-aware acceptance handles downstream notifications
 
         Does NOT rely on MongoDB snapshots — uses the in-memory _price_cache (latest,
         updated every 10s) and _5m_cache (5m averages + volumes, updated every 60s).
         """
         from backend.alerts.item_name_resolver import resolve_item_name
-        from backend.alerts.dump_notifier import DumpAlertV2, DumpAlertNotifierV2
         # generate_opportunity_chart is imported lazily inside the chart try/except
         # so that a missing matplotlib install never prevents alerts from firing.
 
@@ -760,11 +758,10 @@ class AlertMonitor:
         MIN_SELL_RATIO   = config.DUMP_V2_MIN_SELL_RATIO      # 0.80 default
         MIN_PROFIT       = config.DUMP_V2_MIN_PROFIT_PER_ITEM # 2_000 GP default
         MIN_TOTAL_PROFIT = config.DUMP_V2_MIN_TOTAL_PROFIT    # 150_000 GP default
-        COOLDOWN_MIN     = config.DUMP_V2_COOLDOWN_MINUTES    # 60 min default
         POSITION_CAP     = config.DUMP_V2_POSITION_CAP_PCT    # 0.10 default
         CAPITAL          = config.DEFAULT_CAPITAL_GP           # 50_000_000 default
 
-        dump_webhook_url = self._get_dump_alert_webhook_sync(db)
+        dump_candidates: List[dict] = []
 
         for item_id_str, instant in _price_cache.items():
             try:
@@ -803,16 +800,7 @@ class AlertMonitor:
                 if price_drop_pct < MIN_DROP_PCT:
                     continue
 
-                # Both dump signals confirmed — check cooldown before heavier work
                 item_id = int(item_id_str)
-                recent_alert = db.alerts.find_one({
-                    "item_id":    item_id,
-                    "alert_type": "dump",
-                    "timestamp":  {"$gte": now - timedelta(minutes=COOLDOWN_MIN)},
-                })
-                if recent_alert:
-                    logger.info("DUMP_SUPPRESSED cooldown id=%s", item_id)
-                    continue
 
                 # Resolve item name — NEVER show "Item XXXXX" if mapping has a real name
                 item_row  = get_item(db, item_id)
@@ -846,138 +834,35 @@ class AlertMonitor:
                 else:
                     confidence = "LOW"
 
-                # Build DumpAlertV2 (name is already resolved)
-                alert_v2 = DumpAlertV2(
-                    item_id=item_id,
-                    item_name=resolved_name,
-                    current_price=int(instant_sell),
-                    reference_price=int(avg_sell),
-                    drop_pct=round(price_drop_pct, 1),
-                    drop_amount=int(avg_sell - instant_sell),
-                    sold_5m=sell_vol,
-                    bought_5m=buy_vol,
-                    sell_ratio=round(sell_ratio, 3),
-                    profit_per_item_net=profit_per_item,
-                    predicted_recovery=int(avg_sell),
-                    confidence=confidence,
-                    qty_to_buy=qty,
-                    max_invest_gp=max_invest_gp,
-                    estimated_total_profit=estimated_total_profit,
-                    chart_path=None,
-                    timestamp=now,
-                )
-
-                # Chart generation — best-effort; never crashes the alert.
-                # Imported lazily so that a missing matplotlib install never
-                # prevents alerts from firing (chart just won't be attached).
-                chart_tmp_path = None
-                try:
-                    from backend.discord_notifier import generate_opportunity_chart
-                    chart_bytes = generate_opportunity_chart(
-                        item_name=resolved_name,
-                        item_id=item_id,
-                        buy_price=int(instant_sell),
-                        sell_price=int(avg_sell),
-                        score=min(100.0, price_drop_pct * sell_ratio * 10),
-                        trend="FALLING",
-                        hours=6,
-                    )
-                    if chart_bytes:
-                        tf = tempfile.NamedTemporaryFile(
-                            suffix=f"_dump_{item_id}.png", delete=False
-                        )
-                        tf.write(chart_bytes)
-                        tf.close()
-                        chart_tmp_path = tf.name
-                        alert_v2.chart_path = chart_tmp_path
-                        logger.info("DUMP_CHART_OK path=%s", chart_tmp_path)
-                except Exception as chart_exc:
-                    logger.warning("DUMP_CHART_FAIL %s", chart_exc)
-
-                # Send to Discord via DumpAlertNotifierV2
-                if dump_webhook_url:
-                    logger.info("DUMP_WEBHOOK target=%s", dump_webhook_url[:35])
-                    DumpAlertNotifierV2(dump_webhook_url).send(alert_v2)
-
-                # Persist to DB (drives cooldown checks for future cycles)
-                severity = round(min(10.0, price_drop_pct * sell_ratio * 3), 1)
-                db_alert = Alert(
-                    item_id=item_id,
-                    item_name=resolved_name,
-                    alert_type="dump",
-                    message=(
-                        f"{resolved_name}: {price_drop_pct:.1f}% below 5m avg "
-                        f"({int(instant_sell):,} vs avg {int(avg_sell):,} GP) — "
-                        f"{sell_vol:,} sold vs {buy_vol:,} bought "
-                        f"({sell_ratio:.0%} sell ratio) — "
-                        f"~{profit_per_item:+,} GP/item recovery potential"
-                    ),
-                    data={
-                        "dump_type":       "volume_dump",
-                        "instant_sell":    int(instant_sell),
-                        "instant_buy":     int(instant_buy) if instant_buy else None,
-                        "avg_sell":        int(avg_sell),
-                        "avg_buy":         int(avg_buy) if avg_buy else None,
-                        "price_drop_pct":  round(price_drop_pct, 1),
-                        "sell_volume":     sell_vol,
-                        "buy_volume":      buy_vol,
-                        "sell_ratio":      round(sell_ratio, 2),
-                        "profit_per_item": profit_per_item,
-                        "severity":        severity,
-                        "confidence":      confidence,
-                    },
-                )
-                insert_alert(db, db_alert)
-                logger.info(
-                    "Dump alert [%s]: %s — %.1f%% drop, %d sold vs %d bought",
-                    confidence, resolved_name, price_drop_pct, sell_vol, buy_vol,
-                )
-
-                # Clean up temp chart file
-                if chart_tmp_path:
-                    try:
-                        os.unlink(chart_tmp_path)
-                    except Exception:
-                        pass
+                stars = 3 if confidence == "HIGH" else 2 if confidence == "MEDIUM" else 1
+                dump_candidates.append({
+                    "item_id": item_id,
+                    "name": resolved_name,
+                    "dump_price": int(instant_sell),
+                    "ref_avg": int(avg_sell),
+                    "drop_pct": round(price_drop_pct, 1),
+                    "sell_ratio": round(sell_ratio, 3),
+                    "volume_5m": int(total_vol),
+                    "est_profit": int(estimated_total_profit),
+                    "confidence": confidence,
+                    "stars": stars,
+                    "buy_price": int(instant_sell),
+                    "sell_price": int(avg_sell),
+                    "potential_profit": int(profit_per_item),
+                })
 
             except Exception as e:
                 logger.debug("Dump check error for item %s: %s", item_id_str, e)
 
-    def _get_dump_alert_webhook_sync(self, db) -> Optional[str]:
-        """Return dedicated dump-alert webhook URL.
-
-        Priority order:
-          1. DISCORD_WEBHOOK_DUMPS env var  (explicit dump channel)
-          2. dump_alert_webhook_url DB setting
-          3. General discord_webhook DB setting (fallback only)
-        """
-        # 1. Env var — highest priority, set this in Railway for the dump channel
-        env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
-        if env_url:
-            logger.info("NOTIFIER=dump WEBHOOK=DISCORD_WEBHOOK_DUMPS")
-            return env_url
-
-        # 2. DB settings
-        try:
-            url = get_setting(db, "dump_alert_webhook_url")
-            if url:
-                logger.info("NOTIFIER=dump WEBHOOK=DB:dump_alert_webhook_url")
-                return str(url).strip()
-
-            wh = get_setting(db, "discord_webhook")
-            if isinstance(wh, dict):
-                if wh.get("enabled", False) and wh.get("url"):
-                    logger.info("NOTIFIER=dump WEBHOOK=DB:discord_webhook")
-                    return str(wh.get("url")).strip()
-
-            url = get_setting(db, "discord_webhook_url")
-            enabled = get_setting(db, "discord_alerts_enabled", False)
-            if url and enabled:
-                logger.info("NOTIFIER=dump WEBHOOK=DB:discord_webhook_url")
-                return str(url).strip()
-        except Exception as e:
-            logger.debug("Dump webhook lookup failed: %s", e)
-        return None
+        dump_candidates.sort(key=lambda d: (d.get("stars", 0), d.get("est_profit", 0)), reverse=True)
+        top_dumps = dump_candidates[:50]
+        redis = get_redis()
+        redis.set(
+            "dumps:top",
+            json.dumps({"generated_at": time.time(), "count": len(top_dumps), "items": top_dumps}),
+            ex=150,
+        )
+        logger.info("DUMPS_CACHE_WRITE count=%d", len(top_dumps))
 
     def _check_opportunity_alerts_sync(self, db):
         """Alert when a very high-score opportunity appears (score 75+). Sync version."""
@@ -1063,6 +948,11 @@ class PositionMonitor:
     LARGE_CHANGE_PCT = 5.0   # % change to send Discord notification
     COOLDOWN_MINUTES = 15    # minimum minutes between alerts for the same item
     SELL_DROP_THRESHOLD = 2.0  # % below listed sell price to trigger sell alert
+    TRADE_GUIDANCE_COOLDOWN_SECONDS = 600
+    BUY_DONT_CHASE_PCT = 1.2
+    BUY_IMPROVE_PCT = 1.0
+    SELL_LOWER_PCT = 1.0
+    SELL_RAISE_PCT = 1.2
 
     def __init__(self):
         # item_id → {last_alerted_price, last_alerted_at, last_rec_sell}
@@ -1077,6 +967,153 @@ class PositionMonitor:
             except Exception as e:
                 logger.error("PositionMonitor: failed to init SmartPricer: %s", e)
         return self._pricer
+
+
+    def _get_strategy_trades(self) -> List[Dict]:
+        db = get_db()
+        try:
+            coll = db._db["strategy_trades"]
+            docs = coll.find({"state": {"$in": ["BUYING", "HOLDING", "SELLING"]}}).sort("updated_at", -1)
+            return list(docs)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _live_prices(item_id: int) -> tuple[Optional[int], Optional[int]]:
+        snap = _price_cache.get(str(item_id)) or {}
+        return snap.get("high"), snap.get("low")
+
+    def _guidance_for_trade(self, trade: Dict) -> Optional[Dict[str, str]]:
+        state = str(trade.get("state") or "")
+        if state not in {"BUYING", "HOLDING", "SELLING"}:
+            return None
+
+        item_id = int(trade.get("item_id") or 0)
+        live_buy, live_sell = self._live_prices(item_id)
+        if not live_buy and not live_sell:
+            return None
+
+        buy_target = float(trade.get("buy_target") or 0)
+        sell_target = float(trade.get("sell_target") or 0)
+        stop_loss_pct = float(trade.get("stop_loss_pct") or 1.8)
+        hold_profit_floor = float(trade.get("profit_floor_gp") or 2000)
+
+        if trade.get("type") == "dump" and buy_target > 0 and live_sell:
+            stop_price = buy_target * (1.0 - stop_loss_pct / 100.0)
+            if live_sell <= stop_price:
+                return {
+                    "rule": "DUMP_STOP_LOSS",
+                    "action": "Exit now",
+                    "reason": f"Dump stop-loss hit ({live_sell:,} <= {int(stop_price):,} GP)",
+                }
+
+        if state == "BUYING" and buy_target > 0 and live_buy:
+            if live_buy > buy_target * (1.0 + self.BUY_DONT_CHASE_PCT / 100.0):
+                return {
+                    "rule": "BUY_DONT_CHASE",
+                    "action": "Don't chase",
+                    "reason": f"Live buy {live_buy:,} is above target {int(buy_target):,}",
+                }
+            if live_buy < buy_target * (1.0 - self.BUY_IMPROVE_PCT / 100.0):
+                return {
+                    "rule": "BUY_IMPROVE",
+                    "action": "Improve buy price",
+                    "reason": f"Live buy {live_buy:,} is below target; improve entry",
+                }
+
+        if state == "SELLING" and sell_target > 0 and live_buy:
+            if live_buy < sell_target * (1.0 - self.SELL_LOWER_PCT / 100.0):
+                return {
+                    "rule": "SELL_LOWER",
+                    "action": "Lower sell",
+                    "reason": f"Market {live_buy:,} is below sell target {int(sell_target):,}",
+                }
+            if live_buy > sell_target * (1.0 + self.SELL_RAISE_PCT / 100.0):
+                return {
+                    "rule": "SELL_RAISE",
+                    "action": "Raise sell",
+                    "reason": f"Market {live_buy:,} is above your sell target",
+                }
+
+        if state == "HOLDING" and buy_target > 0 and live_buy:
+            tax = min(live_buy * 0.01, 5_000_000)
+            profit_per_item = live_buy - buy_target - tax
+            if profit_per_item < hold_profit_floor:
+                return {
+                    "rule": "HOLD_EXIT",
+                    "action": "Exit",
+                    "reason": f"Profit floor breached ({int(profit_per_item):,} < {int(hold_profit_floor):,} GP)",
+                }
+
+        return None
+
+    async def _maybe_send_trade_guidance(self, trade: Dict, guidance: Dict[str, str]) -> None:
+        trade_id = str(trade.get("trade_id") or "")
+        rule = str(guidance.get("rule") or "")
+        if not trade_id or not rule:
+            return
+
+        cooldown_key = f"guidance:{trade_id}:{rule}"
+        redis = get_redis()
+        try:
+            if redis.get(cooldown_key):
+                return
+            redis.set(cooldown_key, "1", ex=self.TRADE_GUIDANCE_COOLDOWN_SECONDS)
+        except Exception:
+            pass
+
+        webhook_url, webhook_source = await self._get_positions_webhook()
+        if not webhook_url:
+            return
+
+        try:
+            import requests as _requests
+
+            item_name = trade.get("name") or trade.get("item_name") or f"Item {trade.get('item_id')}"
+            embed = {
+                "title": f"📍 Trade guidance: {item_name}",
+                "color": 0x06B6D4,
+                "fields": [
+                    {"name": "State", "value": str(trade.get("state")), "inline": True},
+                    {"name": "Action", "value": guidance.get("action", "Review"), "inline": True},
+                    {"name": "Reason", "value": guidance.get("reason", ""), "inline": False},
+                    {"name": "Slot", "value": str(trade.get("slot_index") or "-"), "inline": True},
+                    {"name": "Rule", "value": rule, "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI • Active Trade Guidance"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send trade guidance alert: %s", e)
+
+    async def check_trade_guidance(self) -> None:
+        trades = await asyncio.to_thread(self._get_strategy_trades)
+        if not trades:
+            return
+
+        guidance_updates = []
+        for trade in trades:
+            g = self._guidance_for_trade(trade)
+            if not g:
+                continue
+            trade["next_action"] = g.get("action")
+            trade["next_reason"] = g.get("reason")
+            guidance_updates.append({
+                "trade_id": trade.get("trade_id"),
+                "state": trade.get("state"),
+                "next_action": g.get("action"),
+                "next_reason": g.get("reason"),
+            })
+            await self._maybe_send_trade_guidance(trade, g)
+
+        if guidance_updates:
+            await manager.broadcast_json({
+                "type": "trade_guidance",
+                "timestamp": datetime.utcnow().isoformat(),
+                "items": guidance_updates,
+            })
 
     async def check_positions(self):
         """Main tick: scan open positions and check for price movement."""
@@ -1260,7 +1297,7 @@ class PositionMonitor:
     async def _send_discord_position_alert(self, pos: dict, update: dict, change_pct: float):
         """Send a Discord embed for a large price move on an active position."""
         try:
-            webhook_url = await self._get_sell_alert_webhook()
+            webhook_url, webhook_source = await self._get_positions_webhook()
             if not webhook_url:
                 return
 
@@ -1290,6 +1327,7 @@ class PositionMonitor:
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
             logger.info("Discord position alert sent for %s", pos["item_name"])
         except Exception as e:
@@ -1310,40 +1348,21 @@ class PositionMonitor:
             enriched.append(pos)
         return enriched
 
-    async def _get_sell_alert_webhook(self) -> Optional[str]:
-        """Return the dedicated positions/sell-alert webhook URL.
-
-        Priority order:
-          1. DISCORD_WEBHOOK_POSITIONS env var  (explicit positions channel)
-          2. sell_alert_webhook_url DB setting
-          3. General discord_webhook DB setting (fallback only)
-        """
-        # 1. Env var — highest priority, set in Railway for the positions channel
-        env_url = os.environ.get("DISCORD_WEBHOOK_POSITIONS", "").strip()
-        if env_url:
-            logger.info("NOTIFIER=positions WEBHOOK=DISCORD_WEBHOOK_POSITIONS")
-            return env_url
-
+    async def _get_positions_webhook(self) -> tuple[Optional[str], Optional[str]]:
+        """Return positions webhook URL and source (env|db), without cross-channel fallback."""
         def _sync():
+            env_url = os.environ.get("DISCORD_WEBHOOK_POSITIONS", "").strip()
+            if env_url:
+                return env_url, "env"
+
             db = get_db()
             try:
-                url = get_setting(db, "sell_alert_webhook_url")
-                if url:
-                    logger.info("NOTIFIER=positions WEBHOOK=DB:sell_alert_webhook_url")
-                    return url
-                # Fallback to general webhook if enabled
-                wh = get_setting(db, "discord_webhook")
-                if isinstance(wh, dict):
-                    if wh.get("enabled") and wh.get("url"):
-                        logger.info("NOTIFIER=positions WEBHOOK=DB:discord_webhook")
-                        return wh.get("url")
-                    return None
-                url = get_setting(db, "discord_webhook_url")
-                enabled = get_setting(db, "discord_alerts_enabled", False)
-                if url and enabled:
-                    logger.info("NOTIFIER=positions WEBHOOK=DB:discord_webhook_url")
-                    return url
-                return None
+                # Allow explicit DB keys for positions channel only.
+                for key in ("positions_webhook_url", "sell_alert_webhook_url"):
+                    url = (get_setting(db, key) or "").strip()
+                    if url:
+                        return url, "db"
+                return None, None
             finally:
                 db.close()
         return await asyncio.to_thread(_sync)
@@ -1453,7 +1472,7 @@ class PositionMonitor:
     async def _send_discord_sell_alert(self, alert: dict):
         """Send a Discord embed for a sell offer that has been undercut by the market."""
         try:
-            webhook_url = await self._get_sell_alert_webhook()
+            webhook_url, webhook_source = await self._get_positions_webhook()
             if not webhook_url:
                 return
 
@@ -1473,6 +1492,7 @@ class PositionMonitor:
                 "footer": {"text": "OSRS Flipping AI • Sell Price Watcher"},
                 "timestamp": datetime.utcnow().isoformat(),
             }
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
             logger.info("Discord sell-price alert sent for %s", alert["item_name"])
         except Exception as e:
@@ -1547,6 +1567,7 @@ class PositionMonitor:
             try:
                 await self.check_positions()
                 await self.check_selling_offers()
+                await self.check_trade_guidance()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
 
@@ -1587,6 +1608,52 @@ class FlipCacheWorker:
     CYCLE_SECONDS = 60
 
     @staticmethod
+    def _to_dashboard_opportunity(item: dict) -> dict:
+        """Convert worker scoring metrics to dashboard opportunity schema."""
+        expected_profit = int(item.get("expected_profit") or item.get("net_profit") or 0)
+        volume_5m = int(item.get("volume_5m") or 0)
+        qty_suggested = int(item.get("qty_suggested") or 0)
+        buy_price = int(item.get("recommended_buy") or 0)
+
+        return {
+            "item_id": item.get("item_id"),
+            "name": item.get("item_name"),
+            "buy_price": buy_price,
+            "sell_price": int(item.get("recommended_sell") or 0),
+            "instant_buy": int(item.get("recommended_buy") or 0),
+            "instant_sell": int(item.get("recommended_sell") or 0),
+            "margin": int(item.get("spread") or 0),
+            "margin_pct": float(item.get("spread_pct") or 0),
+            "potential_profit": expected_profit,
+            "roi_pct": float(item.get("roi_pct") or 0),
+            "tax": int(item.get("tax") or 0),
+            "volume": volume_5m,
+            "trend": item.get("trend"),
+            "ml_confidence": float(item.get("confidence") or 0),
+            "flip_score": float(item.get("total_score") or 0),
+            "spread_score": float(item.get("score_spread") or 0),
+            "volume_score": float(item.get("score_volume") or 0),
+            "freshness_score": float(item.get("score_freshness") or 0),
+            "trend_score": float(item.get("score_trend") or 0),
+            "history_score": float(item.get("score_history") or 0),
+            "stability_score": float(item.get("score_stability") or 0),
+            "ml_signal_score": float(item.get("score_ml") or 0),
+            "ml_direction": None,
+            "ml_prediction_confidence": None,
+            "ml_method": "none",
+            "win_rate": item.get("win_rate"),
+            "total_flips": int(item.get("total_flips") or 0),
+            "avg_profit": item.get("avg_profit"),
+            "reason": item.get("reason") or "",
+            "position_sizing": {
+                "kelly": min(0.25, max(0.0, float(item.get("fill_probability") or 0) * 0.25)),
+                "max_investment": int(max(0, qty_suggested * buy_price)),
+                "quantity": qty_suggested,
+                "stop_loss_pct": round(float(item.get("risk_score") or 0) * 1.5, 1),
+            },
+        }
+
+    @staticmethod
     def _persist_top_opportunities(top_opportunities: List[dict]) -> None:
         """Store top-ranked opportunities in Redis (or cache fallback)."""
         redis = get_redis()
@@ -1620,17 +1687,19 @@ class FlipCacheWorker:
                         flips = get_item_flips(db, item_id, days=30)
                         item  = get_item(db, item_id)
                         latest = snaps[-1]
+                        volume_5m = (latest.buy_volume or 0) + (latest.sell_volume or 0)
                         metrics = calculate_flip_metrics({
                             "item_id":    item_id,
                             "item_name":  item.name if item else f"Item {item_id}",
                             "instant_buy":  latest.instant_buy,
                             "instant_sell": latest.instant_sell,
-                            "volume_5m": (latest.buy_volume or 0) + (latest.sell_volume or 0),
+                            "volume_5m": volume_5m,
                             "buy_time":  latest.buy_time,
                             "sell_time": latest.sell_time,
                             "snapshots": snaps,
                             "flip_history": flips,
                         })
+                        metrics["volume_5m"] = int(volume_5m or 0)
                         results.append(metrics)
                     except Exception:
                         continue
@@ -1642,8 +1711,8 @@ class FlipCacheWorker:
             scored = await asyncio.to_thread(_sync)
             _cache.update_cache(scored, cycle_seconds=self.CYCLE_SECONDS)
             top_opportunities = sorted(
-                scored,
-                key=lambda item: float(item.get("total_score", 0) or 0),
+                (self._to_dashboard_opportunity(item) for item in scored),
+                key=lambda item: float(item.get("flip_score", 0) or 0),
                 reverse=True,
             )[:50]
             asyncio.create_task(
@@ -1672,49 +1741,31 @@ class FlipCacheWorker:
 class OpportunityNotifier:
     """Periodically sends a top-5 opportunity digest to Discord.
 
-    Reads the webhook URL and interval from the settings collection.
-    Settings keys:
-        discord_webhook  → { url: "...", enabled: true/false }
-        discord_top5_interval_minutes → int  (default 30)
+    Webhook routing:
+      - DISCORD_WEBHOOK_OPPORTUNITIES env var (preferred)
+      - opportunities_webhook_url / opportunity_webhook_url in DB
+
+    Interval key:
+      - discord_top5_interval_minutes (default 30)
     """
 
     DEFAULT_INTERVAL_MIN = 30  # minutes between digests
     _last_sent: Optional[datetime] = None
 
-    async def _get_webhook_url(self) -> Optional[str]:
-        """Return webhook URL for opportunity digests / top-5 alerts.
-
-        Priority order:
-          1. DISCORD_WEBHOOK_OPPORTUNITIES env var  (explicit opportunities channel)
-          2. discord_webhook DB setting (dict or string)
-          3. discord_webhook_url + discord_alerts_enabled DB settings
-        """
-        # 1. Env var — highest priority, set in Railway for the opportunities channel
-        env_url = os.environ.get("DISCORD_WEBHOOK_OPPORTUNITIES", "").strip()
-        if env_url:
-            logger.info("NOTIFIER=opportunities WEBHOOK=DISCORD_WEBHOOK_OPPORTUNITIES")
-            return env_url
-
+    async def _get_webhook_url(self) -> tuple[Optional[str], Optional[str]]:
+        """Read opportunity webhook URL and source (env|db), no generic fallback."""
         def _sync():
+            env_url = os.environ.get("DISCORD_WEBHOOK_OPPORTUNITIES", "").strip()
+            if env_url:
+                return env_url, "env"
+
             db = get_db()
             try:
-                wh = get_setting(db, "discord_webhook")
-                if not wh:
-                    # Also try the flat key used by settings page
-                    url = get_setting(db, "discord_webhook_url")
-                    enabled = get_setting(db, "discord_alerts_enabled", False)
-                    if url and enabled:
-                        logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook_url")
-                        return url
-                    return None
-                if isinstance(wh, dict):
-                    if not wh.get("enabled", False):
-                        return None
-                    logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook")
-                    return wh.get("url") or None
-                # Plain string
-                logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook")
-                return wh if wh else None
+                for key in ("opportunities_webhook_url", "opportunity_webhook_url"):
+                    url = (get_setting(db, key) or "").strip()
+                    if url:
+                        return url, "db"
+                return None, None
             finally:
                 db.close()
         return await asyncio.to_thread(_sync)
@@ -1776,7 +1827,7 @@ class OpportunityNotifier:
 
     async def maybe_send(self):
         """Check if it's time to send, and send if so."""
-        webhook_url = await self._get_webhook_url()
+        webhook_url, webhook_source = await self._get_webhook_url()
         if not webhook_url:
             return  # webhook not configured or disabled
 
@@ -1796,6 +1847,7 @@ class OpportunityNotifier:
         from backend.discord_notifier import DiscordOpportunityNotifier
         notifier = DiscordOpportunityNotifier(webhook_url)
 
+        logger.info("NOTIFIER=opportunities WEBHOOK_SOURCE=%s", webhook_source or "unknown")
         ok = await asyncio.to_thread(
             notifier.send_top_opportunities, top, max_items=5, include_charts=True
         )
@@ -1818,17 +1870,17 @@ class OpportunityNotifier:
         if self._send_status in ("scanning", "sending"):
             return {"ok": True, "status": self._send_status, "message": "Already in progress"}
 
-        webhook_url = await self._get_webhook_url()
+        webhook_url, webhook_source = await self._get_webhook_url()
         if not webhook_url:
             return {"ok": False, "error": "Discord webhook not configured or disabled"}
 
         # Launch background work
         self._send_status = "scanning"
         self._send_result = None
-        asyncio.create_task(self._do_send_background(webhook_url))
+        asyncio.create_task(self._do_send_background(webhook_url, webhook_source))
         return {"ok": True, "status": "scanning", "message": "Scanning for opportunities…"}
 
-    async def _do_send_background(self, webhook_url: str):
+    async def _do_send_background(self, webhook_url: str, webhook_source: Optional[str]):
         """Heavy lifting: scan → score → chart → Discord. Runs as a task."""
         try:
             top = await self._get_top_opportunities(limit=5)
@@ -1840,6 +1892,7 @@ class OpportunityNotifier:
             self._send_status = "sending"
             from backend.discord_notifier import DiscordOpportunityNotifier
             notifier = DiscordOpportunityNotifier(webhook_url)
+            logger.info("NOTIFIER=opportunities WEBHOOK_SOURCE=%s", webhook_source or "unknown")
             ok = await asyncio.to_thread(
                 notifier.send_top_opportunities, top, max_items=5, include_charts=True
             )
@@ -1929,23 +1982,6 @@ async def _emergency_compact_db():
     await asyncio.to_thread(_sync)
 
 
-async def _seed_sell_alert_webhook():
-    """One-time seed: if sell_alert_webhook_url is unset in DB, write the default."""
-    _SELL_ALERT_DEFAULT = "https://discord.com/api/webhooks/1474337747446796351/EjVW1qDmMl3th8gAQ-ra8idgw3qHVSlQbpt_GqPeZ3bG3-teskzT2NKICLJGdEKsgirJ"
-
-    def _sync():
-        db = get_db()
-        try:
-            existing = get_setting(db, "sell_alert_webhook_url")
-            if not existing:
-                set_setting(db, "sell_alert_webhook_url", _SELL_ALERT_DEFAULT)
-                logger.info("Seeded sell_alert_webhook_url in settings")
-        finally:
-            db.close()
-
-    await asyncio.to_thread(_sync)
-
-
 async def start_background_tasks():
     """Create and start all background asyncio tasks, staggered to avoid
     overloading MongoDB with simultaneous queries."""
@@ -1953,7 +1989,6 @@ async def start_background_tasks():
 
     # Immediately compact the DB to reclaim space before any new writes
     await _emergency_compact_db()
-    await _seed_sell_alert_webhook()
 
     collector = PriceCollector()
     feature_computer = FeatureComputer()

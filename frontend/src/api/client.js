@@ -146,6 +146,28 @@ export const api = {
   getOpportunityDetail(itemId) {
     return fetchJSON(`/opportunities/${itemId}`);
   },
+  getDumps() {
+    return fetchJSON('/dumps');
+  },
+
+  // Trade workflow
+  getActiveTrades() {
+    return fetchJSON('/trades/active');
+  },
+  acceptTrade(payload) {
+    return fetchJSON('/trades/accept', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
+  tradeEvent(tradeId, event, note) {
+    return fetchJSON(`/trades/${encodeURIComponent(tradeId)}/event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, note }),
+    });
+  },
 
   // Predictions
   getPredictions(itemId, horizon) {

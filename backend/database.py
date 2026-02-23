@@ -446,6 +446,7 @@ class Database:
         self.item_features = db["item_features"]
         self.alerts = db["alerts"]
         self.settings = db["settings"]
+        self.strategy_trades = db["strategy_trades"]
 
     def close(self):
         """No-op. Pymongo connection pooling handles cleanup."""
@@ -588,6 +589,15 @@ def init_db():
         )
         _wrapper.flip_history.create_index(
             [("player", ASCENDING), ("sell_time", DESCENDING)],
+            background=True,
+        )
+        _wrapper.strategy_trades.create_index(
+            [("trade_id", ASCENDING)],
+            unique=True,
+            background=True,
+        )
+        _wrapper.strategy_trades.create_index(
+            [("state", ASCENDING), ("slot_index", ASCENDING)],
             background=True,
         )
 

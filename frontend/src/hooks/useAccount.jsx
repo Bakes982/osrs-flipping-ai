@@ -29,6 +29,7 @@ export function AccountProvider({ children }) {
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useAccount() {
   return useContext(AccountContext);
 }

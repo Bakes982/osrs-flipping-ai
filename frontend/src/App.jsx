@@ -8,6 +8,7 @@ import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
 import ItemDetail from './pages/ItemDetail';
 import Portfolio from './pages/Portfolio';
+import ActiveTrades from './pages/ActiveTrades';
 import Performance from './pages/Performance';
 import ModelDashboard from './pages/ModelDashboard';
 import Alerts from './pages/Alerts';
@@ -25,6 +26,7 @@ const NAV_ITEMS = [
   { path: '/opportunities', label: 'Opportunities', icon: TrendingUp },
   { path: '/alerts', label: 'Alerts', icon: Bell },
   { path: '/portfolio', label: 'Portfolio', icon: Briefcase },
+  { path: '/trades', label: 'Active Trades', icon: Briefcase },
   { path: '/performance', label: 'Performance', icon: BarChart3 },
   { path: '/import', label: 'Import', icon: Upload },
   { path: '/models', label: 'ML Models', icon: Brain },
@@ -142,21 +144,24 @@ export default function App() {
             <AccountSelector />
           </div>
           <div className="nav-links">
-            {NAV_ITEMS.map(({ path, label, icon: Icon }) => (
-              <NavLink
-                key={path}
-                to={path}
-                end={path === '/'}
-                className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
-                onClick={() => setMobileMenuOpen(false)}
-              >
-                <Icon size={18} />
-                <span>{label}</span>
-                {path === '/alerts' && alertCount > 0 && (
-                  <span className="alert-badge">{alertCount}</span>
-                )}
-              </NavLink>
-            ))}
+            {NAV_ITEMS.map(({ path, label, icon }) => {
+              const NavIcon = icon;
+              return (
+                <NavLink
+                  key={path}
+                  to={path}
+                  end={path === '/'}
+                  className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+                  onClick={() => setMobileMenuOpen(false)}
+                >
+                  <NavIcon size={18} />
+                  <span>{label}</span>
+                  {path === '/alerts' && alertCount > 0 && (
+                    <span className="alert-badge">{alertCount}</span>
+                  )}
+                </NavLink>
+              );
+            })}
           </div>
           <div className="sidebar-footer">
             {user && (
@@ -184,6 +189,7 @@ export default function App() {
             <Route path="/opportunities" element={<Opportunities prices={livePrices} />} />
             <Route path="/item/:itemId" element={<ItemDetail prices={livePrices} />} />
             <Route path="/portfolio" element={<Portfolio prices={livePrices} />} />
+            <Route path="/trades" element={<ActiveTrades />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/performance" element={<Performance />} />
             <Route path="/import" element={<Import />} />

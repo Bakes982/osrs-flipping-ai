@@ -38,7 +38,8 @@ const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif
 
 /* ── Sub-components ────────────────────────────────────────────────────────── */
 
-function SectionHeader({ icon: Icon, title, count, color = 'var(--cyan)' }) {
+function SectionHeader({ icon, title, count, color = 'var(--cyan)' }) {
+  const SectionIcon = icon;
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14,
@@ -50,7 +51,7 @@ function SectionHeader({ icon: Icon, title, count, color = 'var(--cyan)' }) {
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         border: `1px solid ${color}44`,
       }}>
-        <Icon size={16} color={color} />
+        <SectionIcon size={16} color={color} />
       </div>
       <span style={{ fontWeight: 700, fontSize: 15 }}>{title}</span>
       {count != null && (
@@ -210,7 +211,7 @@ function SellOfferCard({ sell, alertMap, nav }) {
 export default function Portfolio() {
   const nav = useNavigate();
   const [sourceFilter, setSourceFilter] = useState('');
-  const [activeAccount, setActiveAccount] = useState('');
+  const [activeAccount] = useState('');
   const [flashId, setFlashId] = useState(null);
   const [sellAlertMap, setSellAlertMap] = useState({});
   const wsRef = useRef(null);
@@ -233,7 +234,7 @@ export default function Portfolio() {
     120000,
   );
 
-  const positions = posData?.positions || posData || [];
+  const positions = useMemo(() => posData?.positions || posData || [], [posData]);
   const sells = sellData?.sells || [];
   const trades = tradeData?.trades || tradeData || [];
 
@@ -256,6 +257,7 @@ export default function Portfolio() {
     });
     wsRef.current = socket;
     return () => close();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleDismiss = async (tradeId) => {
