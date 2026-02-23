@@ -44,9 +44,42 @@ const FILTERS = [
   { key: 'Low Risk',       icon: Shield,      desc: 'Stability ≥ 60' },
 ];
 
+
+function timeAgo(ts) {
+  if (!ts) return 'Never';
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
+  if (delta < 10) return 'just now';
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  return `${Math.floor(delta / 3600)}h ago`;
+}
+
+function LoadingSkeletonRows({ rows = 8 }) {
+  return (
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th style={{ width: 30 }}>#</th><th>Item</th><th>Score</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {Array.from({ length: rows }).map((_, i) => (
+          <tr key={`skeleton-${i}`}>
+            {Array.from({ length: 12 }).map((__, j) => (
+              <td key={`${i}-${j}`}>
+                <div style={{ height: 10, borderRadius: 6, background: 'var(--bg-secondary)', opacity: 0.8, width: j === 1 ? '90%' : '70%' }} />
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 /* ── Score bar mini-component ────────────────────────────────────────────── */
 
-function ScoreBar({ score, label, max = 100 }) {
+function ScoreBar({ score, max = 100 }) {
   const pct = Math.min(100, (score / max) * 100);
   const color = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--cyan)' : 'var(--red)';
   return (
@@ -167,7 +200,10 @@ export default function Opportunities() {
     [minPrice], 120000,
   );
 
-  const opps = raw?.items || raw || [];
+  const opps = useMemo(() => raw?.items || [], [raw]);
+  const activePrefs = raw?.prefs || {};
+  const activeMode = raw?.profile || 'balanced';
+  const lastUpdated = timeAgo(raw?.generated_at);
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -222,7 +258,7 @@ export default function Opportunities() {
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
             {filtered.length} items · ranked by{' '}
-            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol}
+            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
@@ -230,6 +266,14 @@ export default function Opportunities() {
             <RefreshCw size={14} /> Refresh
           </button>
         </div>
+      </div>
+
+      <div className="filter-bar" style={{ marginBottom: 12 }}>
+        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
+        <span className="pill">Min Price: {formatGP(activePrefs.min_price || 0)}</span>
+        <span className="pill">Min Volume: {(activePrefs.min_volume ?? 0).toLocaleString()}</span>
+        <span className="pill">Min ROI: {(activePrefs.min_roi_pct ?? 0).toFixed(1)}%</span>
+        <span className="pill">Min Profit: {formatGP(activePrefs.min_profit_gp || 0)}</span>
       </div>
 
       {/* Summary Stats */}
@@ -307,7 +351,10 @@ export default function Opportunities() {
       {/* Table */}
       <div className="card" style={{ padding: 0, overflow: 'auto' }}>
         {loading ? (
-          <div className="loading">Scanning market for opportunities...</div>
+          <div>
+            <div className="text-muted" style={{ padding: '10px 14px' }}>Refreshing opportunities…</div>
+            <LoadingSkeletonRows rows={8} />
+          </div>
         ) : error ? (
           <div className="empty" style={{ color: '#ef4444' }}>
             <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
