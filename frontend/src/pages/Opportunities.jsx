@@ -130,6 +130,21 @@ function LoadingSkeletonRows({ rows = 8 }) {
   );
 }
 
+
+function DumpSparkline({ dumpPrice, refAvg }) {
+  const low = Math.min(dumpPrice || 0, refAvg || 0) || 1;
+  const high = Math.max(dumpPrice || 0, refAvg || 0) || 1;
+  const norm = (v) => 28 - ((v - low) / Math.max(1, high - low)) * 20;
+  const y1 = norm(refAvg || low);
+  const y2 = norm(dumpPrice || low);
+  return (
+    <svg width="90" height="30" viewBox="0 0 90 30" aria-hidden>
+      <polyline points={`2,${y1} 45,${(y1 + y2) / 2} 88,${y2}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
+      <circle cx="88" cy={y2} r="2.5" fill="var(--red)" />
+    </svg>
+  );
+}
+
 /* ── Score bar mini-component ────────────────────────────────────────────── */
 
 function ScoreBar({ score, max = 100 }) {
@@ -261,6 +276,7 @@ export default function Opportunities() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
+  const [viewMode, setViewMode] = useState('opportunities');
 
   const { data: raw, loading, error, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
@@ -271,8 +287,13 @@ export default function Opportunities() {
     () => api.getActiveTrades(),
     [], 10000,
   );
+  const { data: dumpsRaw, loading: dumpsLoading, error: dumpsError, reload: reloadDumps } = useApi(
+    () => api.getDumps(),
+    [], 120000,
+  );
 
   const opps = useMemo(() => raw?.items || [], [raw]);
+  const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
   const activePrefs = raw?.prefs || {};
   const activeMode = raw?.profile || 'balanced';
   const lastUpdated = timeAgo(raw?.generated_at);
@@ -282,21 +303,24 @@ export default function Opportunities() {
   const freeSlots = Math.max(0, tradeData?.free_slots ?? (slotsTotal - slotsUsed));
 
 
-  const acceptOpportunity = async (opp, replaceTradeId = null) => {
+  const acceptOpportunity = async (opp, replaceTradeId = null, overrides = {}) => {
     try {
       setAcceptingId(opp.item_id);
       await api.acceptTrade({
         item_id: opp.item_id,
         name: opp.name,
-        buy_target: opp.buy_price || opp.instant_buy || 0,
-        sell_target: opp.sell_price || opp.instant_sell || 0,
+        buy_target: opp.buy_price || opp.instant_buy || opp.dump_price || 0,
+        sell_target: opp.sell_price || opp.instant_sell || opp.ref_avg || 0,
         qty_target: Math.max(1, opp.position_sizing?.quantity || 1),
-        max_invest_gp: Math.max(0, opp.position_sizing?.max_investment || (opp.buy_price || 0)),
+        max_invest_gp: Math.max(0, opp.position_sizing?.max_investment || (opp.buy_price || opp.dump_price || 0)),
         type: (opp.dump_signal || '').toLowerCase() === 'high' ? 'dump' : 'normal',
+        volume_5m: opp.volume_5m || opp.volume,
         replace_trade_id: replaceTradeId,
+        ...overrides,
       });
       setReplaceForItem(null);
       reloadTrades();
+      if (viewMode === "dumps") reloadDumps();
     } catch (e) {
       window.alert(e.message || 'Failed to accept trade');
     } finally {
@@ -389,10 +413,16 @@ export default function Opportunities() {
           >
             {autoRefresh ? '⟳ Live' : '⟳ Paused'}
           </button>
-          <button className="btn" onClick={reload} disabled={loading}>
+          <button className="btn" onClick={() => (viewMode === 'opportunities' ? reload() : reloadDumps())} disabled={loading}>
             <RefreshCw size={14} style={loading ? { animation: 'spin 1s linear infinite' } : {}} /> Refresh
           </button>
         </div>
+      </div>
+
+
+      <div className="filter-bar" style={{ marginBottom: 12 }}>
+        <button className={`pill ${viewMode === 'opportunities' ? 'active' : ''}`} onClick={() => setViewMode('opportunities')}>Opportunities</button>
+        <button className={`pill ${viewMode === 'dumps' ? 'active' : ''}`} onClick={() => setViewMode('dumps')}>Dumps</button>
       </div>
 
       <div className="filter-bar" style={{ marginBottom: 12 }}>
@@ -460,7 +490,55 @@ export default function Opportunities() {
         </div>
       </div>
 
-      {/* ── Table ── */}
+      {viewMode === 'dumps' ? (
+        <div>
+          {dumpsLoading ? (
+            <div className="card" style={{ padding: 16 }}>Loading dump candidates…</div>
+          ) : dumpsError ? (
+            <div className="empty" style={{ color: '#ef4444' }}>{dumpsError.message || 'Failed to load dumps'}</div>
+          ) : dumps.length === 0 ? (
+            <div className="empty">No dump candidates right now.</div>
+          ) : (
+            <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))' }}>
+              {dumps.map((d) => (
+                <div key={d.item_id} className="card" style={{ padding: 14 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontWeight: 700 }}>{d.name}</div>
+                    <span className={`badge ${d.stars >= 3 ? 'badge-red' : d.stars === 2 ? 'badge-yellow' : 'badge-cyan'}`}>{'★'.repeat(d.stars || 1)}</span>
+                  </div>
+                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <DumpSparkline dumpPrice={d.dump_price} refAvg={d.ref_avg} />
+                    <div style={{ fontSize: 12 }}>
+                      <div>Drop: <strong>{d.drop_pct?.toFixed?.(1) ?? d.drop_pct}%</strong></div>
+                      <div>Vol: <strong>{(d.volume_5m || 0).toLocaleString()}</strong></div>
+                      <div>Est profit: <strong>+{formatGP(d.est_profit)}</strong></div>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
+                    {freeSlots > 0 ? (
+                      <button className="btn" onClick={() => acceptOpportunity(d, null, { type: 'dump' })}>
+                        <Check size={12} /> Accept dump
+                      </button>
+                    ) : (
+                      <select
+                        defaultValue=""
+                        onChange={(e) => e.target.value && acceptOpportunity(d, e.target.value, { type: 'dump' })}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="" disabled>Replace slot to accept</option>
+                        {activeTrades.map(t => (
+                          <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+      /* ── Table ── */
       <div className="card" style={{ padding: 0, overflow: 'auto' }}>
         {loading ? (
           <div>
@@ -628,6 +706,7 @@ export default function Opportunities() {
           </table>
         )}
       </div>
+      )}
     </div>
   );
 }

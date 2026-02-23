@@ -146,6 +146,9 @@ export const api = {
   getOpportunityDetail(itemId) {
     return fetchJSON(`/opportunities/${itemId}`);
   },
+  getDumps() {
+    return fetchJSON('/dumps');
+  },
 
   // Trade workflow
   getActiveTrades() {
