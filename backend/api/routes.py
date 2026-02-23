@@ -39,6 +39,7 @@ from backend.api.schemas import (
     StatusResponse,
 )
 from backend.api_key_auth import resolve_api_key_owner
+from backend.cache import get_redis
 from backend.cache_backend import get_cache_backend
 from backend.flips_cache import compute_scored_opportunities
 from backend.metrics import metrics_snapshot, record_cache_access
@@ -599,6 +600,13 @@ async def health_check():
     from backend.tasks import _tasks  # noqa: PLC0415
     last_poll_ts, _cache_age, items_scored_count_last_run, _profile_counts, cache_backend_name = _cache_runtime_summary()
 
+    opp_cached = False
+    try:
+        redis = get_redis()
+        opp_cached = bool(redis.get("opportunities:top"))
+    except Exception:
+        opp_cached = False
+
     metrics = metrics_snapshot()
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
@@ -612,6 +620,7 @@ async def health_check():
         cache_hit_rate=float(metrics["cache_hit_rate"]),
         alert_sent_count=int(metrics["alert_sent_count"]),
         errors_last_hour=int(metrics["errors_last_hour"]),
+        opp_cached=opp_cached,
     )
 
 
