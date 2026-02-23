@@ -45,6 +45,11 @@ DISCORD_REDIRECT_URI = os.environ.get(
     "DISCORD_REDIRECT_URI",
     f"{BACKEND_URL}/api/auth/callback",
 )
+# Webhook routing — one env var per alert type so each can go to its own channel.
+# Leave empty to fall back to the shared discord_webhook DB setting.
+DISCORD_WEBHOOK_DUMPS          = os.environ.get("DISCORD_WEBHOOK_DUMPS",          "")
+DISCORD_WEBHOOK_OPPORTUNITIES  = os.environ.get("DISCORD_WEBHOOK_OPPORTUNITIES",  "")
+DISCORD_WEBHOOK_POSITIONS      = os.environ.get("DISCORD_WEBHOOK_POSITIONS",      "")
 ALLOWED_DISCORD_IDS = {
     s.strip()
     for s in os.environ.get("ALLOWED_DISCORD_IDS", "").split(",")

@@ -954,22 +954,26 @@ class AlertMonitor:
         # 1. Env var — highest priority, set this in Railway for the dump channel
         env_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
         if env_url:
+            logger.info("NOTIFIER=dump WEBHOOK=DISCORD_WEBHOOK_DUMPS")
             return env_url
 
         # 2. DB settings
         try:
             url = get_setting(db, "dump_alert_webhook_url")
             if url:
+                logger.info("NOTIFIER=dump WEBHOOK=DB:dump_alert_webhook_url")
                 return str(url).strip()
 
             wh = get_setting(db, "discord_webhook")
             if isinstance(wh, dict):
                 if wh.get("enabled", False) and wh.get("url"):
+                    logger.info("NOTIFIER=dump WEBHOOK=DB:discord_webhook")
                     return str(wh.get("url")).strip()
 
             url = get_setting(db, "discord_webhook_url")
             enabled = get_setting(db, "discord_alerts_enabled", False)
             if url and enabled:
+                logger.info("NOTIFIER=dump WEBHOOK=DB:discord_webhook_url")
                 return str(url).strip()
         except Exception as e:
             logger.debug("Dump webhook lookup failed: %s", e)
@@ -1307,20 +1311,39 @@ class PositionMonitor:
         return enriched
 
     async def _get_sell_alert_webhook(self) -> Optional[str]:
-        """Return the dedicated sell-alert webhook URL (or general webhook as fallback)."""
+        """Return the dedicated positions/sell-alert webhook URL.
+
+        Priority order:
+          1. DISCORD_WEBHOOK_POSITIONS env var  (explicit positions channel)
+          2. sell_alert_webhook_url DB setting
+          3. General discord_webhook DB setting (fallback only)
+        """
+        # 1. Env var — highest priority, set in Railway for the positions channel
+        env_url = os.environ.get("DISCORD_WEBHOOK_POSITIONS", "").strip()
+        if env_url:
+            logger.info("NOTIFIER=positions WEBHOOK=DISCORD_WEBHOOK_POSITIONS")
+            return env_url
+
         def _sync():
             db = get_db()
             try:
                 url = get_setting(db, "sell_alert_webhook_url")
                 if url:
+                    logger.info("NOTIFIER=positions WEBHOOK=DB:sell_alert_webhook_url")
                     return url
                 # Fallback to general webhook if enabled
                 wh = get_setting(db, "discord_webhook")
                 if isinstance(wh, dict):
-                    return wh.get("url") if wh.get("enabled") else None
+                    if wh.get("enabled") and wh.get("url"):
+                        logger.info("NOTIFIER=positions WEBHOOK=DB:discord_webhook")
+                        return wh.get("url")
+                    return None
                 url = get_setting(db, "discord_webhook_url")
                 enabled = get_setting(db, "discord_alerts_enabled", False)
-                return url if url and enabled else None
+                if url and enabled:
+                    logger.info("NOTIFIER=positions WEBHOOK=DB:discord_webhook_url")
+                    return url
+                return None
             finally:
                 db.close()
         return await asyncio.to_thread(_sync)
@@ -1659,7 +1682,19 @@ class OpportunityNotifier:
     _last_sent: Optional[datetime] = None
 
     async def _get_webhook_url(self) -> Optional[str]:
-        """Read webhook URL from DB settings. Returns None if disabled."""
+        """Return webhook URL for opportunity digests / top-5 alerts.
+
+        Priority order:
+          1. DISCORD_WEBHOOK_OPPORTUNITIES env var  (explicit opportunities channel)
+          2. discord_webhook DB setting (dict or string)
+          3. discord_webhook_url + discord_alerts_enabled DB settings
+        """
+        # 1. Env var — highest priority, set in Railway for the opportunities channel
+        env_url = os.environ.get("DISCORD_WEBHOOK_OPPORTUNITIES", "").strip()
+        if env_url:
+            logger.info("NOTIFIER=opportunities WEBHOOK=DISCORD_WEBHOOK_OPPORTUNITIES")
+            return env_url
+
         def _sync():
             db = get_db()
             try:
@@ -1669,13 +1704,16 @@ class OpportunityNotifier:
                     url = get_setting(db, "discord_webhook_url")
                     enabled = get_setting(db, "discord_alerts_enabled", False)
                     if url and enabled:
+                        logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook_url")
                         return url
                     return None
                 if isinstance(wh, dict):
                     if not wh.get("enabled", False):
                         return None
+                    logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook")
                     return wh.get("url") or None
                 # Plain string
+                logger.info("NOTIFIER=opportunities WEBHOOK=DB:discord_webhook")
                 return wh if wh else None
             finally:
                 db.close()
