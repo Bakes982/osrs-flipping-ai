@@ -1,8 +1,8 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  RefreshCw, Search, TrendingUp, Filter,
-  ArrowUpRight, Zap, Shield, BarChart3, Target, AlertTriangle,
+  RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
+  ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle, Check,
 } from 'lucide-react';
 import { api } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -150,7 +150,7 @@ function ScoreBar({ score, max = 100 }) {
 function ExpandedDetail({ opp }) {
   return (
     <tr>
-      <td colSpan={12} style={{ padding: 0, background: 'rgba(6,182,212,0.03)', borderBottom: '1px solid var(--border)' }}>
+      <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
         <div style={{ padding: '16px 20px', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, fontSize: 12 }}>
 
           {/* Score Breakdown */}
@@ -251,25 +251,58 @@ const FILTERS = [
 
 export default function Opportunities() {
   const nav = useNavigate();
-  const [filter, setFilter]       = useState('All');
-  const [sortCol, setSortCol]     = useState('flip_score');
-  const [sortDir, setSortDir]     = useState('desc');
-  const [search, setSearch]       = useState('');
-  const [minPrice, setMinPrice]   = useState(0);
-  const [profile, setProfile]     = useState('balanced');
-  const [expandedId, setExpandedId]     = useState(null);
-  const [autoRefresh, setAutoRefresh]   = useState(true);
+  const [filter, setFilter] = useState('All');
+  const [sortCol, setSortCol] = useState('flip_score');
+  const [sortDir, setSortDir] = useState('desc');
+  const [search, setSearch] = useState('');
+  const [minPrice, setMinPrice] = useState(0);
+  const [profile, setProfile] = useState('balanced');
+  const [expandedId, setExpandedId] = useState(null);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [replaceForItem, setReplaceForItem] = useState(null);
+  const [acceptingId, setAcceptingId] = useState(null);
 
   const { data: raw, loading, error, reload } = useApi(
     () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
     [minPrice, profile],
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
+  const { data: tradeData, reload: reloadTrades } = useApi(
+    () => api.getActiveTrades(),
+    [], 10000,
+  );
 
   const opps = useMemo(() => raw?.items || [], [raw]);
   const activePrefs = raw?.prefs || {};
   const activeMode = raw?.profile || 'balanced';
   const lastUpdated = timeAgo(raw?.generated_at);
+  const activeTrades = tradeData?.items || [];
+  const slotsUsed = tradeData?.slots_used || 0;
+  const slotsTotal = tradeData?.slots_total || 8;
+  const freeSlots = Math.max(0, tradeData?.free_slots ?? (slotsTotal - slotsUsed));
+
+
+  const acceptOpportunity = async (opp, replaceTradeId = null) => {
+    try {
+      setAcceptingId(opp.item_id);
+      await api.acceptTrade({
+        item_id: opp.item_id,
+        name: opp.name,
+        buy_target: opp.buy_price || opp.instant_buy || 0,
+        sell_target: opp.sell_price || opp.instant_sell || 0,
+        qty_target: Math.max(1, opp.position_sizing?.quantity || 1),
+        max_invest_gp: Math.max(0, opp.position_sizing?.max_investment || (opp.buy_price || 0)),
+        type: (opp.dump_signal || '').toLowerCase() === 'high' ? 'dump' : 'normal',
+        replace_trade_id: replaceTradeId,
+      });
+      setReplaceForItem(null);
+      reloadTrades();
+    } catch (e) {
+      window.alert(e.message || 'Failed to accept trade');
+    } finally {
+      setAcceptingId(null);
+    }
+  };
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -335,7 +368,7 @@ export default function Opportunities() {
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
             {filtered.length} items · ranked by{' '}
-            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated}
+            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated} · slots {slotsUsed}/{slotsTotal}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -459,8 +492,9 @@ export default function Opportunities() {
                 {th('ROI',    'roi_pct')}
                 {th('Vol',    'volume_score')}
                 <th>Trend</th>
-                <th>Conf</th>
-                <th style={{ width: 32 }}></th>
+                <th>AI</th>
+                <th style={{ width: 30 }}></th>
+                <th style={{ width: 180 }}>Trade</th>
               </tr>
             </thead>
             <tbody>
@@ -549,11 +583,47 @@ export default function Opportunities() {
                             <ArrowUpRight size={12} />
                           </button>
                         </td>
+
+                        <td>
+                          {freeSlots > 0 ? (
+                            <button
+                              className="btn"
+                              disabled={acceptingId === opp.item_id}
+                              onClick={e => { e.stopPropagation(); acceptOpportunity(opp); }}
+                              style={{ fontSize: 11 }}
+                            >
+                              <Check size={12} /> Accept
+                            </button>
+                          ) : (
+                            <div>
+                              <button
+                                className="btn"
+                                disabled={acceptingId === opp.item_id}
+                                onClick={e => { e.stopPropagation(); setReplaceForItem(replaceForItem === opp.item_id ? null : opp.item_id); }}
+                                style={{ fontSize: 11 }}
+                              >
+                                Replace slot
+                              </button>
+                              {replaceForItem === opp.item_id && (
+                                <select
+                                  onClick={e => e.stopPropagation()}
+                                  onChange={(e) => e.target.value && acceptOpportunity(opp, e.target.value)}
+                                  defaultValue=""
+                                  style={{ marginTop: 6, width: '100%', fontSize: 11 }}
+                                >
+                                  <option value="" disabled>Select trade to replace</option>
+                                  {activeTrades.map(t => (
+                                    <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                          )}
+                        </td>
                       </tr>,
                       isX && <ExpandedDetail key={`detail-${opp.item_id ?? i}`} opp={opp} />,
                     ];
                   })
-              }
             </tbody>
           </table>
         )}
