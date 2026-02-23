@@ -6,6 +6,7 @@ GET /api/opportunities/{id}  - detailed analysis for a single item
 
 import asyncio
 import json
+import logging
 import sys
 import os
 from datetime import datetime, timezone
@@ -19,13 +20,14 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from backend.cache import get_redis
-from backend.database import get_db, get_price_history, get_item_flips, get_item, get_setting, PriceSnapshot
+from backend.database import get_db, get_price_history, get_item_flips, get_item, PriceSnapshot
 from backend.smart_pricer import SmartPricer
 from backend.flip_scorer import FlipScorer, FlipScore
 from backend.arbitrage_finder import ArbitrageFinder
 from ai_strategist import analyze_single_item
 
 router = APIRouter(prefix="/api/opportunities", tags=["opportunities"])
+logger = logging.getLogger(__name__)
 
 _pricer = SmartPricer()
 _scorer = FlipScorer()
@@ -87,36 +89,71 @@ def _score_to_reason(item: Dict[str, Any]) -> str:
 
 
 def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
+    item_id = int(item.get("item_id") or 0)
     buy_price = int(item.get("recommended_buy") or item.get("buy_price") or 0)
     sell_price = int(item.get("recommended_sell") or item.get("sell_price") or 0)
     volume_5m = int(item.get("volume_5m") or item.get("volume") or 0)
     potential_profit = int(item.get("expected_profit") or item.get("potential_profit") or item.get("net_profit") or 0)
+    confidence = float(item.get("confidence") or item.get("ml_confidence") or 0)
+    if confidence > 1.0:
+        confidence = confidence / 100.0
+
+    score_breakdown = {
+        "spread": float(item.get("score_spread") or item.get("spread_score") or 0),
+        "volume": float(item.get("score_volume") or item.get("volume_score") or 0),
+        "freshness": float(item.get("score_freshness") or item.get("freshness_score") or 0),
+        "trend": float(item.get("score_trend") or item.get("trend_score") or 0),
+        "history": float(item.get("score_history") or item.get("history_score") or 0),
+        "stability": float(item.get("score_stability") or item.get("stability_score") or 0),
+        "ml_signal": float(item.get("score_ml") or item.get("ml_signal_score") or 0),
+    }
+
+    margin_gp = int(
+        item.get("margin_gp")
+        or item.get("spread")
+        or max(0, sell_price - buy_price)
+    )
+    qty_suggested = int(
+        item.get("qty_suggested")
+        or (item.get("position_sizing") or {}).get("quantity")
+        or 0
+    )
+
+    raw_name = item.get("item_name") or item.get("name") or ""
+    name = str(raw_name).strip()
+    if not name or name.isdigit() or name.lower().startswith("item "):
+        name = _fetch_wiki_item_name(item_id) if item_id else "Unknown"
 
     mapped = {
-        "item_id": item.get("item_id"),
-        "name": item.get("item_name") or item.get("name") or "Unknown",
+        # Required normalized fields
+        "item_id": item_id,
+        "name": name,
         "buy_price": buy_price,
         "sell_price": sell_price,
+        "margin_gp": margin_gp,
+        "roi_pct": float(item.get("roi_pct") or 0),
         "instant_buy": int(item.get("instant_buy") or buy_price),
         "instant_sell": int(item.get("instant_sell") or sell_price),
-        "margin": int(item.get("spread") or 0),
+        "margin": margin_gp,
         "margin_pct": float(item.get("spread_pct") or item.get("margin_pct") or 0),
         "potential_profit": potential_profit,
         "expected_profit": potential_profit,
-        "roi_pct": float(item.get("roi_pct") or 0),
         "tax": int(item.get("tax") or 0),
-        "volume": volume_5m,
         "volume_5m": volume_5m,
+        "volume": volume_5m,
         "trend": item.get("trend"),
-        "ml_confidence": float(item.get("confidence") or item.get("ml_confidence") or 0),
+        "confidence": confidence,
+        "ml_confidence": confidence,
         "flip_score": float(item.get("total_score") or item.get("flip_score") or 0),
-        "spread_score": float(item.get("score_spread") or item.get("spread_score") or 0),
-        "volume_score": float(item.get("score_volume") or item.get("volume_score") or 0),
-        "freshness_score": float(item.get("score_freshness") or item.get("freshness_score") or 0),
-        "trend_score": float(item.get("score_trend") or item.get("trend_score") or 0),
-        "history_score": float(item.get("score_history") or item.get("history_score") or 0),
-        "stability_score": float(item.get("score_stability") or item.get("stability_score") or 0),
-        "ml_signal_score": float(item.get("score_ml") or item.get("ml_signal_score") or 0),
+        "score_breakdown": score_breakdown,
+        "spread_score": score_breakdown["spread"],
+        "volume_score": score_breakdown["volume"],
+        "freshness_score": score_breakdown["freshness"],
+        "trend_score": score_breakdown["trend"],
+        "history_score": score_breakdown["history"],
+        "stability_score": score_breakdown["stability"],
+        "ml_signal_score": score_breakdown["ml_signal"],
+        "qty_suggested": qty_suggested,
         "ml_direction": item.get("ml_direction"),
         "ml_prediction_confidence": item.get("ml_prediction_confidence"),
         "ml_method": item.get("ml_method"),
@@ -208,45 +245,37 @@ def _normalize_item(m: dict) -> dict:
 @router.get("")
 async def list_opportunities(
     request: Request,
+    profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
     limit: int = Query(100, ge=1, le=200),
-    min_price: Optional[int] = Query(None, ge=0),
-    min_volume: Optional[int] = Query(None, ge=0),
-    min_roi_pct: Optional[float] = Query(None, ge=0),
-    min_profit_gp: Optional[int] = Query(None, ge=0),
+    min_price: int = Query(0, ge=0),
+    min_volume: int = Query(0, ge=0),
+    min_roi_pct: float = Query(0, ge=0),
+    min_profit_gp: int = Query(0, ge=0),
 ):
-    """Return cached opportunities from worker cache with server-side filtering."""
-
-    def _load_prefs() -> Dict[str, Any]:
-        db = get_db()
-        try:
-            return {
-                "min_price": int(get_setting(db, "min_price", 0) or 0),
-                "min_volume": int(get_setting(db, "min_volume", 1) or 0),
-                "min_roi_pct": float(get_setting(db, "min_roi_pct", 0) or 0),
-                "min_profit_gp": int(get_setting(db, "min_profit", 0) or 0),
-            }
-        finally:
-            db.close()
-
-    prefs = await asyncio.to_thread(_load_prefs)
-
-    requested_profile = request.query_params.get("profile", "balanced")
-    active_profile = requested_profile if requested_profile in {"conservative", "balanced", "aggressive"} else "balanced"
-
-    effective_min_price = int(min_price) if min_price is not None else int(prefs["min_price"])
-    effective_min_volume = int(min_volume) if min_volume is not None else int(prefs["min_volume"])
-    effective_min_roi_pct = float(min_roi_pct) if min_roi_pct is not None else float(prefs["min_roi_pct"])
-    effective_min_profit_gp = int(min_profit_gp) if min_profit_gp is not None else int(prefs["min_profit_gp"])
+    """Return cached opportunities from profile cache with server-side filtering."""
+    active_profile = request.query_params.get("profile", profile) or "balanced"
+    if active_profile not in {"conservative", "balanced", "aggressive"}:
+        active_profile = "balanced"
 
     redis = get_redis()
     key = f"flips:top100:{active_profile}"
     raw = redis.get(key)
+    ttl = -1
+    try:
+        ttl_fn = getattr(redis, "ttl", None)
+        if callable(ttl_fn):
+            ttl_val = ttl_fn(key)
+            ttl = int(ttl_val) if ttl_val is not None else -1
+    except Exception:
+        ttl = -1
 
     if not raw:
+        logger.info("OPP_API_READ key=%s hit=%s count=%d ttl=%s", key, False, 0, ttl)
         return {
             "generated_at": None,
             "count": 0,
             "items": [],
+            "profile": active_profile,
         }
 
     if isinstance(raw, bytes):
@@ -270,13 +299,13 @@ async def list_opportunities(
         roi_pct = float(item.get("roi_pct") or 0)
         profit_gp = int(item.get("expected_profit") or item.get("potential_profit") or 0)
 
-        if buy_price < effective_min_price:
+        if buy_price < min_price:
             continue
-        if volume_5m < effective_min_volume:
+        if volume_5m < min_volume:
             continue
-        if roi_pct < effective_min_roi_pct:
+        if roi_pct < min_roi_pct:
             continue
-        if profit_gp < effective_min_profit_gp:
+        if profit_gp < min_profit_gp:
             continue
 
         filtered_items.append(item)
@@ -288,17 +317,18 @@ async def list_opportunities(
     if generated_at is None and isinstance(parsed, dict):
         generated_at = parsed.get("generated_at")
 
+    logger.info(
+        "OPP_API_READ key=%s hit=%s count=%d ttl=%s",
+        key,
+        True,
+        len(filtered_items),
+        ttl,
+    )
     return {
         "generated_at": generated_at,
         "count": len(filtered_items),
         "items": filtered_items,
         "profile": active_profile,
-        "prefs": {
-            "min_price": effective_min_price,
-            "min_volume": effective_min_volume,
-            "min_roi_pct": effective_min_roi_pct,
-            "min_profit_gp": effective_min_profit_gp,
-        },
     }
 
 

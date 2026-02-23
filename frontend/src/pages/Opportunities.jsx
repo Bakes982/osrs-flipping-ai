@@ -81,7 +81,13 @@ const FILTERS = [
 
 function timeAgo(ts) {
   if (!ts) return 'Never';
-  const delta = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
+  let epoch = Number(ts);
+  if (!Number.isFinite(epoch)) {
+    const parsed = Date.parse(String(ts));
+    if (!Number.isFinite(parsed)) return 'Unknown';
+    epoch = parsed / 1000;
+  }
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
   if (delta < 10) return 'just now';
   if (delta < 60) return `${delta}s ago`;
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
@@ -286,7 +292,10 @@ export default function Opportunities() {
   const [viewMode, setViewMode] = useState('opportunities');
 
   const { data: raw, loading, error, reload } = useApi(
-    () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
+    ({ signal }) => api.getOpportunities(
+      { limit: 200, min_price: minPrice, profile },
+      { signal, timeoutMs: 15000 },
+    ),
     [minPrice, profile],
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
@@ -301,8 +310,8 @@ export default function Opportunities() {
 
   const opps = useMemo(() => raw?.items || [], [raw]);
   const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
-  const activePrefs = raw?.prefs || {};
   const activeMode = raw?.profile || 'balanced';
+  const apiCount = Number(raw?.count || 0);
   const lastUpdated = timeAgo(raw?.generated_at);
   const activeTrades = tradeData?.items || [];
   const slotsUsed = tradeData?.slots_used || 0;
@@ -350,10 +359,10 @@ export default function Opportunities() {
       );
     }
 
-    if (filter === 'High Volume') items = items.filter(o => (o.volume || 0) >= 500);
+    if (filter === 'High Volume') items = items.filter(o => (o.volume_5m || 0) >= 500);
     else if (filter === 'High Value 1M+') items = items.filter(o => (o.buy_price || 0) >= 1_000_000);
     else if (filter === 'High Value 10M+') items = items.filter(o => (o.buy_price || 0) >= 10_000_000);
-    else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume || 1)) - (a.potential_profit * (a.volume || 1)));
+    else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume_5m || 1)) - (a.potential_profit * (a.volume_5m || 1)));
     else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
     items.sort((a, b) => {
@@ -370,7 +379,7 @@ export default function Opportunities() {
     const avgMargin  = filtered.reduce((s, o) => s + (o.margin_pct ?? 0), 0) / filtered.length;
     const avgScore   = filtered.reduce((s, o) => s + (o.flip_score ?? 0), 0) / filtered.length;
     const totalProfit= filtered.reduce((s, o) => s + (o.potential_profit ?? 0), 0);
-    const totalVol   = filtered.reduce((s, o) => s + (o.volume_score ?? o.volume ?? 0), 0);
+    const totalVol   = filtered.reduce((s, o) => s + (o.volume_5m ?? 0), 0);
     const best       = filtered.reduce(
       (b, o) => (o.flip_score ?? 0) > (b.flip_score ?? 0) ? o : b,
       filtered[0],
@@ -395,7 +404,7 @@ export default function Opportunities() {
         <div>
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
-            {filtered.length} items · ranked by{' '}
+            {apiCount} items · ranked by{' '}
             {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated} · slots {slotsUsed}/{slotsTotal}
           </p>
         </div>
@@ -431,10 +440,6 @@ export default function Opportunities() {
 
       <div className="filter-bar" style={{ marginBottom: 12 }}>
         <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
-        <span className="pill">Min Price: {formatGP(activePrefs.min_price || 0)}</span>
-        <span className="pill">Min Volume: {(activePrefs.min_volume ?? 0).toLocaleString()}</span>
-        <span className="pill">Min ROI: {(activePrefs.min_roi_pct ?? 0).toFixed(1)}%</span>
-        <span className="pill">Min Profit: {formatGP(activePrefs.min_profit_gp || 0)}</span>
       </div>
 
       {/* Summary Stats */}
@@ -555,6 +560,11 @@ export default function Opportunities() {
             <strong>Failed to load opportunities</strong><br />
             <small className="text-muted">{error.message || 'Connection error'} — auto-retrying</small>
           </div>
+        ) : apiCount === 0 ? (
+          <div className="empty">
+            <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
+            No opportunities in cache yet.
+          </div>
         ) : filtered.length === 0 ? (
           <div className="empty">
             <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
@@ -569,10 +579,10 @@ export default function Opportunities() {
                 {th('RUNE SCORE', 'flip_score')}
                 {th('Buy', 'buy_price')}
                 {th('Sell', 'sell_price')}
-                {th('Margin', 'margin_pct')}
+                {th('Margin', 'margin_gp')}
                 {th('Profit', 'potential_profit')}
                 {th('ROI',    'roi_pct')}
-                {th('Vol',    'volume_score')}
+                {th('Vol',    'volume_5m')}
                 <th>Trend</th>
                 <th>AI</th>
                 <th style={{ width: 30 }}></th>
@@ -622,22 +632,22 @@ export default function Opportunities() {
                     </td>
                     <td className="gp text-green">{formatGP(opp.buy_price)}</td>
                     <td className="gp text-cyan">{formatGP(opp.sell_price)}</td>
-                    <td className="gp">{opp.margin_pct?.toFixed(1)}%</td>
+                    <td className="gp">{formatGP(opp.margin_gp)}</td>
                     <td className="gp text-green">+{formatGP(opp.potential_profit)}</td>
                     <td className="gp">{opp.roi_pct?.toFixed(1) || '—'}%</td>
-                    <td className="gp">{opp.volume || 0}</td>
+                    <td className="gp">{opp.volume_5m || 0}</td>
                     <td><span className={`badge ${t.cls}`} title={t.label}>{t.icon}</span></td>
                     <td>
-                      {opp.ml_confidence != null ? (
+                      {(opp.confidence ?? opp.ml_confidence) != null ? (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                           <div style={{ width: 36, height: 5, borderRadius: 3, background: 'var(--bg-secondary)' }}>
                             <div style={{
                               height: '100%', borderRadius: 3,
-                              width: `${Math.min(100, (opp.ml_confidence || 0) * 100)}%`,
-                              background: opp.ml_confidence > 0.7 ? 'var(--green)' : opp.ml_confidence > 0.5 ? 'var(--yellow)' : 'var(--red)',
+                              width: `${Math.min(100, ((opp.confidence ?? opp.ml_confidence) || 0) * 100)}%`,
+                              background: ((opp.confidence ?? opp.ml_confidence) || 0) > 0.7 ? 'var(--green)' : ((opp.confidence ?? opp.ml_confidence) || 0) > 0.5 ? 'var(--yellow)' : 'var(--red)',
                             }} />
                           </div>
-                          <span className="text-muted" style={{ fontSize: 10 }}>{((opp.ml_confidence || 0) * 100).toFixed(0)}%</span>
+                          <span className="text-muted" style={{ fontSize: 10 }}>{((((opp.confidence ?? opp.ml_confidence) || 0) * 100)).toFixed(0)}%</span>
                         </div>
                       ) : <span className="text-muted">—</span>}
                     </td>

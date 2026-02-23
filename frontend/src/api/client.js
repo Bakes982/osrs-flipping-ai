@@ -56,9 +56,10 @@ function authHeaders(hasBody = false) {
 async function fetchJSON(path, options = {}, retries = 3) {
   const url = `${API_BASE}${path}`;
   const hasBody = !!options.body;
-  // Merge any externally-provided AbortSignal with our own 30 s timeout signal.
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1000, Number(options.timeoutMs)) : 30_000;
+  // Merge any externally-provided AbortSignal with our timeout signal.
   const timeoutCtrl = new AbortController();
-  const timeoutId   = setTimeout(() => timeoutCtrl.abort(new DOMException('Request timed out', 'TimeoutError')), 30_000);
+  const timeoutId   = setTimeout(() => timeoutCtrl.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
   const externalSignal = options.signal ?? null;
   // Combine: abort if either the external signal or our timeout fires.
   let signal = timeoutCtrl.signal;
@@ -69,7 +70,7 @@ async function fetchJSON(path, options = {}, retries = 3) {
     timeoutCtrl.signal.addEventListener('abort', abort);
     signal = combo.signal;
   }
-  const { signal: _drop, ...restOptions } = options; // don't double-pass signal
+  const { signal: _drop, timeoutMs: _dropTimeout, ...restOptions } = options; // don't double-pass signal
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, {
@@ -106,8 +107,12 @@ async function fetchJSON(path, options = {}, retries = 3) {
         err.url = url;
         throw err;
       }
-      if (res.status === 204) return null;
+      if (res.status === 204) {
+        clearTimeout(timeoutId);
+        return null;
+      }
       const text = await res.text();
+      clearTimeout(timeoutId);
       return text ? JSON.parse(text) : null;
     } catch (err) {
       // Don't retry aborted requests (user navigated away or timeout)
@@ -139,9 +144,9 @@ export const api = {
   },
 
   // Opportunities
-  getOpportunities(params = {}) {
+  getOpportunities(params = {}, requestOptions = {}) {
     const qs = new URLSearchParams(params).toString();
-    return fetchJSON(`/opportunities${qs ? '?' + qs : ''}`);
+    return fetchJSON(`/opportunities${qs ? '?' + qs : ''}`, requestOptions);
   },
   getOpportunityDetail(itemId) {
     return fetchJSON(`/opportunities/${itemId}`);

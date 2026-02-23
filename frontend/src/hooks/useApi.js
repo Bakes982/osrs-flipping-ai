@@ -35,7 +35,7 @@ export function useApi(fetchFn, deps = [], interval = null, label = '') {
       if (!initialLoadDone.current) {
         setLoading(true);
       }
-      const result = await fetchFn();
+      const result = await fetchFn({ signal: ctrl.signal });
       if (mountedRef.current && !ctrl.signal.aborted) {
         setData(result);
         setErrorObj(null);
