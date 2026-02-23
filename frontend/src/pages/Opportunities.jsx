@@ -153,6 +153,17 @@ function ExpandedDetail({ opp }) {
 
 /* ── Main Component ──────────────────────────────────────────────────────── */
 
+function relativeTime(isoStr) {
+  if (!isoStr) return null;
+  try {
+    const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
+    if (diff < 5)   return 'just now';
+    if (diff < 60)  return `${diff}s ago`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    return `${Math.floor(diff / 3600)}h ago`;
+  } catch { return null; }
+}
+
 export default function Opportunities() {
   const nav = useNavigate();
   const [filter, setFilter] = useState('All');
@@ -160,14 +171,16 @@ export default function Opportunities() {
   const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
   const [minPrice, setMinPrice] = useState(0);
+  const [profile, setProfile] = useState('balanced');
   const [expandedId, setExpandedId] = useState(null);
 
   const { data: raw, loading, error, reload } = useApi(
-    () => api.getOpportunities({ limit: 200, min_price: minPrice }),
-    [minPrice], 120000,
+    () => api.getOpportunities({ limit: 200, min_price: minPrice, profile }),
+    [minPrice, profile], 120000,
   );
 
   const opps = raw?.items || raw || [];
+  const lastUpdated = raw?.generated_at ? relativeTime(raw.generated_at) : null;
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -179,7 +192,9 @@ export default function Opportunities() {
 
     if (search) {
       const q = search.toLowerCase();
-      items = items.filter(o => o.name?.toLowerCase().includes(q) || String(o.item_id).includes(q));
+      items = items.filter(o =>
+        (o.name || o.item_name)?.toLowerCase().includes(q) || String(o.item_id).includes(q)
+      );
     }
 
     if (filter === 'High Score') items = items.filter(o => o.flip_score >= 60);
@@ -223,9 +238,22 @@ export default function Opportunities() {
           <p className="page-subtitle">
             {filtered.length} items · ranked by{' '}
             {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol}
+            {lastUpdated && <span className="text-muted"> · updated {lastUpdated}</span>}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <select
+            value={profile}
+            onChange={e => setProfile(e.target.value)}
+            style={{
+              padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)',
+              background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12,
+            }}
+          >
+            <option value="conservative">Conservative</option>
+            <option value="balanced">Balanced</option>
+            <option value="aggressive">Aggressive</option>
+          </select>
           <button className="btn" onClick={reload}>
             <RefreshCw size={14} /> Refresh
           </button>
@@ -353,7 +381,7 @@ export default function Opportunities() {
                           style={{ imageRendering: 'pixelated', flexShrink: 0 }}
                           onError={e => { e.target.style.display = 'none'; }} />
                         <div>
-                          <div style={{ fontWeight: 600, fontSize: 13 }}>{opp.name}</div>
+                          <div style={{ fontWeight: 600, fontSize: 13 }}>{opp.name || opp.item_name}</div>
                           {opp.win_rate != null && (
                             <div className="text-muted" style={{ fontSize: 10 }}>
                               {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR

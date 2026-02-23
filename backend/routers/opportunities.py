@@ -79,26 +79,91 @@ def _fetch_wiki_item_name(item_id: int) -> str:
     return _wiki_name_cache.get(item_id, f"Item {item_id}")
 
 
+def _normalize_item(m: dict) -> dict:
+    """Add frontend-facing aliases onto a raw ``calculate_flip_metrics`` dict.
+
+    The scoring layer uses terse internal names; the Opportunities page expects
+    a stable, human-readable contract.  We add aliases without removing the
+    originals so nothing downstream breaks.
+    """
+    out = dict(m)
+
+    # Primary score
+    out.setdefault("flip_score",      m.get("total_score", 0.0))
+
+    # Display name  (frontend searches on ``name``)
+    out.setdefault("name",            m.get("item_name", f"Item {m.get('item_id', '?')}"))
+
+    # Prices
+    out.setdefault("buy_price",       m.get("recommended_buy", 0))
+    out.setdefault("sell_price",      m.get("recommended_sell", 0))
+
+    # Margin / profit
+    out.setdefault("margin_pct",      m.get("spread_pct", 0.0))
+    out.setdefault("potential_profit",m.get("net_profit",  m.get("margin_after_tax", 0)))
+    # ``margin`` is used in the expanded-row pricing panel
+    out.setdefault("margin",          m.get("gross_profit", 0))
+
+    # Volume — use score_volume (0-100 liquidity score) scaled to a small
+    # integer so the "Total Volume" summary card is meaningful.
+    raw_vol = m.get("score_volume", m.get("liquidity_score", 0.0))
+    out.setdefault("volume", int(raw_vol))
+
+    # ML confidence — backend emits 0-1; frontend renders as 0-100% bar
+    out.setdefault("ml_confidence", m.get("confidence", 0.0))
+
+    # Per-score-component aliases (used in expanded ExpandedDetail panel)
+    out.setdefault("spread_score",    m.get("score_spread",    0.0))
+    out.setdefault("volume_score",    m.get("score_volume",    0.0))
+    out.setdefault("freshness_score", m.get("score_freshness", 0.0))
+    out.setdefault("trend_score",     m.get("score_trend",     0.0))
+    out.setdefault("history_score",   m.get("score_history",   0.0))
+    out.setdefault("stability_score", m.get("score_stability", 0.0))
+    out.setdefault("ml_signal_score", m.get("score_ml",        0.0))
+
+    return out
+
+
 @router.get("")
-async def list_opportunities():
-    """Return latest ranked opportunities from Redis cache."""
-    redis = get_redis()
-    raw = redis.get("opportunities:top")
+async def list_opportunities(
+    profile: str = "balanced",
+    limit: int = 200,
+    min_price: int = 0,
+):
+    """Return latest ranked opportunities from the warm flip-cache.
 
-    if not raw:
-        return {
-            "generated_at": None,
-            "count": 0,
-            "items": [],
-        }
+    Reads from ``flips:top100:{profile}`` (written by the background worker
+    every ~30-90 s) and normalises field names to match the frontend contract.
+    """
+    from backend.cache_backend import get_cache_backend
 
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="ignore")
+    cache = get_cache_backend()
 
-    try:
-        return json.loads(raw)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid cached opportunities payload: {exc}")
+    # ── 1. Load the cached flip list ──────────────────────────────────────
+    payload = cache.get_json(f"flips:top100:{profile}")
+    if not payload:
+        # Fallback: try balanced if the requested profile hasn't warmed yet
+        if profile != "balanced":
+            payload = cache.get_json("flips:top100:balanced")
+        if not payload:
+            return {"generated_at": None, "count": 0, "items": [], "profile": profile}
+
+    items: list = payload.get("flips", []) if isinstance(payload, dict) else []
+    generated_at = payload.get("ts") if isinstance(payload, dict) else None
+
+    # ── 2. Apply optional min_price filter ────────────────────────────────
+    if min_price > 0:
+        items = [m for m in items if m.get("recommended_buy", 0) >= min_price]
+
+    # ── 3. Normalize field names for the frontend ─────────────────────────
+    items = [_normalize_item(m) for m in items[:limit]]
+
+    return {
+        "generated_at": generated_at,
+        "count": len(items),
+        "items": items,
+        "profile": profile,
+    }
 
 
 @router.get("/arbitrage")
