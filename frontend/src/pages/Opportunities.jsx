@@ -17,23 +17,6 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
-function formatVol(n) {
-  if (n == null || n === 0) return '—';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
-  return String(n);
-}
-
-function relativeTime(isoStr) {
-  if (!isoStr) return null;
-  try {
-    const diff = Math.floor((Date.now() - new Date(isoStr).getTime()) / 1000);
-    if (diff < 5)    return 'just now';
-    if (diff < 60)   return `${diff}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    return `${Math.floor(diff / 3600)}h ago`;
-  } catch { return null; }
-}
-
 /* ── Score pill ──────────────────────────────────────────────────────────── */
 
 function scoreColor(score) {
@@ -55,17 +38,6 @@ function ScorePill({ score }) {
       {score != null ? score.toFixed(0) : '—'}
     </span>
   );
-}
-
-/* ── Confidence badge ────────────────────────────────────────────────────── */
-
-function confBadge(conf, score) {
-  const c = (conf ?? 0) > 1 ? (conf ?? 0) / 100 : (conf ?? 0);
-  const isHigh = c > 0.70 || score >= 70;
-  const isMed  = c > 0.50 || score >= 55;
-  if (isHigh) return { label: 'HIGH', color: '#22c55e', bg: 'rgba(34,197,94,0.12)' };
-  if (isMed)  return { label: 'MED',  color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' };
-  return              { label: 'LOW',  color: '#ef4444', bg: 'rgba(239,68,68,0.12)' };
 }
 
 /* ── Trend badge ─────────────────────────────────────────────────────────── */
@@ -719,7 +691,7 @@ export default function Opportunities() {
                       </tr>,
                   isExpanded && <ExpandedDetail key={`detail-${opp.item_id ?? i}`} opp={opp} />,
                 ];
-                  })
+              })}
             </tbody>
           </table>
         )}
