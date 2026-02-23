@@ -225,9 +225,56 @@ async def post_trade_event(trade_id: str, body: TradeEventRequest):
     return await asyncio.to_thread(_sync)
 
 
+
+
+def _next_action_for_trade(doc: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    state = str(doc.get("state") or "")
+    if state not in {"BUYING", "HOLDING", "SELLING"}:
+        return {"next_action": None, "next_reason": None}
+
+    try:
+        from backend.tasks import _price_cache
+        snap = _price_cache.get(str(doc.get("item_id"))) or {}
+    except Exception:
+        snap = {}
+
+    live_buy = snap.get("high")
+    live_sell = snap.get("low")
+    buy_target = float(doc.get("buy_target") or 0)
+    sell_target = float(doc.get("sell_target") or 0)
+
+    if doc.get("type") == "dump" and buy_target > 0 and live_sell:
+        stop_loss_pct = float(doc.get("stop_loss_pct") or 1.8)
+        stop_price = buy_target * (1.0 - stop_loss_pct / 100.0)
+        if live_sell <= stop_price:
+            return {
+                "next_action": "Exit now",
+                "next_reason": f"Stop-loss hit ({live_sell:,} <= {int(stop_price):,} GP)",
+            }
+
+    if state == "BUYING" and buy_target > 0 and live_buy:
+        if live_buy > buy_target * 1.012:
+            return {"next_action": "Don't chase", "next_reason": f"Live buy {live_buy:,} above target"}
+        if live_buy < buy_target * 0.99:
+            return {"next_action": "Improve buy price", "next_reason": f"Live buy {live_buy:,} below target"}
+
+    if state == "SELLING" and sell_target > 0 and live_buy:
+        if live_buy < sell_target * 0.99:
+            return {"next_action": "Lower sell", "next_reason": f"Market {live_buy:,} below sell target"}
+        if live_buy > sell_target * 1.012:
+            return {"next_action": "Raise sell", "next_reason": f"Market {live_buy:,} above sell target"}
+
+    if state == "HOLDING" and buy_target > 0 and live_buy:
+        tax = min(live_buy * 0.01, 5_000_000)
+        if (live_buy - buy_target - tax) < float(doc.get("profit_floor_gp") or 2000):
+            return {"next_action": "Exit", "next_reason": "Margin collapsed below floor"}
+
+    return {"next_action": "Hold", "next_reason": "Within target band"}
+
 def _serialize_trade(doc: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(doc)
     out.pop("_id", None)
+    out.update(_next_action_for_trade(out))
     for key in ("created_at", "updated_at", "last_alert_ts"):
         if out.get(key) and hasattr(out[key], "isoformat"):
             out[key] = out[key].isoformat()

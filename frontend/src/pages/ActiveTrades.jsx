@@ -64,6 +64,8 @@ export default function ActiveTrades() {
                 <div>Sell target: {Number(t.sell_target || 0).toLocaleString()} gp</div>
                 <div>Qty target: {t.qty_target || 0}</div>
                 <div>Last action: {t.last_action || '—'}</div>
+                <div><span className="text-muted">Next action: </span><strong>{t.next_action || 'Review'}</strong></div>
+                <div className="text-muted">{t.next_reason || 'No immediate guidance'}</div>
               </div>
 
               <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>

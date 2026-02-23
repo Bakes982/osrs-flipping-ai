@@ -948,6 +948,11 @@ class PositionMonitor:
     LARGE_CHANGE_PCT = 5.0   # % change to send Discord notification
     COOLDOWN_MINUTES = 15    # minimum minutes between alerts for the same item
     SELL_DROP_THRESHOLD = 2.0  # % below listed sell price to trigger sell alert
+    TRADE_GUIDANCE_COOLDOWN_SECONDS = 600
+    BUY_DONT_CHASE_PCT = 1.2
+    BUY_IMPROVE_PCT = 1.0
+    SELL_LOWER_PCT = 1.0
+    SELL_RAISE_PCT = 1.2
 
     def __init__(self):
         # item_id → {last_alerted_price, last_alerted_at, last_rec_sell}
@@ -962,6 +967,153 @@ class PositionMonitor:
             except Exception as e:
                 logger.error("PositionMonitor: failed to init SmartPricer: %s", e)
         return self._pricer
+
+
+    def _get_strategy_trades(self) -> List[Dict]:
+        db = get_db()
+        try:
+            coll = db._db["strategy_trades"]
+            docs = coll.find({"state": {"$in": ["BUYING", "HOLDING", "SELLING"]}}).sort("updated_at", -1)
+            return list(docs)
+        finally:
+            db.close()
+
+    @staticmethod
+    def _live_prices(item_id: int) -> tuple[Optional[int], Optional[int]]:
+        snap = _price_cache.get(str(item_id)) or {}
+        return snap.get("high"), snap.get("low")
+
+    def _guidance_for_trade(self, trade: Dict) -> Optional[Dict[str, str]]:
+        state = str(trade.get("state") or "")
+        if state not in {"BUYING", "HOLDING", "SELLING"}:
+            return None
+
+        item_id = int(trade.get("item_id") or 0)
+        live_buy, live_sell = self._live_prices(item_id)
+        if not live_buy and not live_sell:
+            return None
+
+        buy_target = float(trade.get("buy_target") or 0)
+        sell_target = float(trade.get("sell_target") or 0)
+        stop_loss_pct = float(trade.get("stop_loss_pct") or 1.8)
+        hold_profit_floor = float(trade.get("profit_floor_gp") or 2000)
+
+        if trade.get("type") == "dump" and buy_target > 0 and live_sell:
+            stop_price = buy_target * (1.0 - stop_loss_pct / 100.0)
+            if live_sell <= stop_price:
+                return {
+                    "rule": "DUMP_STOP_LOSS",
+                    "action": "Exit now",
+                    "reason": f"Dump stop-loss hit ({live_sell:,} <= {int(stop_price):,} GP)",
+                }
+
+        if state == "BUYING" and buy_target > 0 and live_buy:
+            if live_buy > buy_target * (1.0 + self.BUY_DONT_CHASE_PCT / 100.0):
+                return {
+                    "rule": "BUY_DONT_CHASE",
+                    "action": "Don't chase",
+                    "reason": f"Live buy {live_buy:,} is above target {int(buy_target):,}",
+                }
+            if live_buy < buy_target * (1.0 - self.BUY_IMPROVE_PCT / 100.0):
+                return {
+                    "rule": "BUY_IMPROVE",
+                    "action": "Improve buy price",
+                    "reason": f"Live buy {live_buy:,} is below target; improve entry",
+                }
+
+        if state == "SELLING" and sell_target > 0 and live_buy:
+            if live_buy < sell_target * (1.0 - self.SELL_LOWER_PCT / 100.0):
+                return {
+                    "rule": "SELL_LOWER",
+                    "action": "Lower sell",
+                    "reason": f"Market {live_buy:,} is below sell target {int(sell_target):,}",
+                }
+            if live_buy > sell_target * (1.0 + self.SELL_RAISE_PCT / 100.0):
+                return {
+                    "rule": "SELL_RAISE",
+                    "action": "Raise sell",
+                    "reason": f"Market {live_buy:,} is above your sell target",
+                }
+
+        if state == "HOLDING" and buy_target > 0 and live_buy:
+            tax = min(live_buy * 0.01, 5_000_000)
+            profit_per_item = live_buy - buy_target - tax
+            if profit_per_item < hold_profit_floor:
+                return {
+                    "rule": "HOLD_EXIT",
+                    "action": "Exit",
+                    "reason": f"Profit floor breached ({int(profit_per_item):,} < {int(hold_profit_floor):,} GP)",
+                }
+
+        return None
+
+    async def _maybe_send_trade_guidance(self, trade: Dict, guidance: Dict[str, str]) -> None:
+        trade_id = str(trade.get("trade_id") or "")
+        rule = str(guidance.get("rule") or "")
+        if not trade_id or not rule:
+            return
+
+        cooldown_key = f"guidance:{trade_id}:{rule}"
+        redis = get_redis()
+        try:
+            if redis.get(cooldown_key):
+                return
+            redis.set(cooldown_key, "1", ex=self.TRADE_GUIDANCE_COOLDOWN_SECONDS)
+        except Exception:
+            pass
+
+        webhook_url, webhook_source = await self._get_positions_webhook()
+        if not webhook_url:
+            return
+
+        try:
+            import requests as _requests
+
+            item_name = trade.get("name") or trade.get("item_name") or f"Item {trade.get('item_id')}"
+            embed = {
+                "title": f"📍 Trade guidance: {item_name}",
+                "color": 0x06B6D4,
+                "fields": [
+                    {"name": "State", "value": str(trade.get("state")), "inline": True},
+                    {"name": "Action", "value": guidance.get("action", "Review"), "inline": True},
+                    {"name": "Reason", "value": guidance.get("reason", ""), "inline": False},
+                    {"name": "Slot", "value": str(trade.get("slot_index") or "-"), "inline": True},
+                    {"name": "Rule", "value": rule, "inline": True},
+                ],
+                "footer": {"text": "OSRS Flipping AI • Active Trade Guidance"},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            logger.info("NOTIFIER=positions WEBHOOK_SOURCE=%s", webhook_source or "unknown")
+            _requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
+        except Exception as e:
+            logger.error("Failed to send trade guidance alert: %s", e)
+
+    async def check_trade_guidance(self) -> None:
+        trades = await asyncio.to_thread(self._get_strategy_trades)
+        if not trades:
+            return
+
+        guidance_updates = []
+        for trade in trades:
+            g = self._guidance_for_trade(trade)
+            if not g:
+                continue
+            trade["next_action"] = g.get("action")
+            trade["next_reason"] = g.get("reason")
+            guidance_updates.append({
+                "trade_id": trade.get("trade_id"),
+                "state": trade.get("state"),
+                "next_action": g.get("action"),
+                "next_reason": g.get("reason"),
+            })
+            await self._maybe_send_trade_guidance(trade, g)
+
+        if guidance_updates:
+            await manager.broadcast_json({
+                "type": "trade_guidance",
+                "timestamp": datetime.utcnow().isoformat(),
+                "items": guidance_updates,
+            })
 
     async def check_positions(self):
         """Main tick: scan open positions and check for price movement."""
@@ -1415,6 +1567,7 @@ class PositionMonitor:
             try:
                 await self.check_positions()
                 await self.check_selling_offers()
+                await self.check_trade_guidance()
             except Exception as e:
                 logger.error("PositionMonitor tick error: %s", e)
 
