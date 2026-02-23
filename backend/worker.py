@@ -84,21 +84,35 @@ async def _run_worker_session(
 
 
 async def _cache_warm_loop(stop_event: asyncio.Event) -> None:
-    """Warm top-list caches periodically so API endpoints remain cache-only fast."""
+    """Warm top-list caches periodically so API endpoints remain cache-only fast.
+
+    The interval is measured from the *start* of each warm cycle, not the end.
+    If the warm itself takes longer than the interval (e.g. 82 s compute vs 30 s
+    interval) the next cycle fires immediately with no extra sleep, keeping
+    the cache as fresh as possible.
+    """
     interval_seconds = max(5, int(config.FLIPS_CACHE_WARM_INTERVAL_SECONDS))
+    loop = asyncio.get_event_loop()
     while not stop_event.is_set():
+        cycle_start = loop.time()
         try:
             warmed = await warm_flip_caches()
-            logger.info("Cache warm complete: %s", warmed)
+            elapsed = loop.time() - cycle_start
+            logger.info("Cache warm complete in %.1fs: %s", elapsed, warmed)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Cache warm failed")
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-        except asyncio.TimeoutError:
-            continue
+        # Sleep only for the remaining time in the interval window.
+        # If the warm took longer than the interval, fire again immediately.
+        elapsed = loop.time() - cycle_start
+        wait = max(0.0, interval_seconds - elapsed)
+        if wait > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=wait)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def run_worker_forever(

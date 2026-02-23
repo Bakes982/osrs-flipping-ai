@@ -6,6 +6,14 @@ All settings come from environment variables for 12-factor deployment.
 import os
 import secrets
 
+# Load .env from project root (no-op if file absent or python-dotenv not installed)
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    import pathlib as _pathlib
+    _load_dotenv(_pathlib.Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.environ.get(name)
@@ -55,7 +63,7 @@ WORKER_RETRY_INITIAL_SECONDS = float(os.environ.get("WORKER_RETRY_INITIAL_SECOND
 WORKER_RETRY_MAX_SECONDS = float(os.environ.get("WORKER_RETRY_MAX_SECONDS", "60"))
 WORKER_RUN_ONCE = _env_bool("WORKER_RUN_ONCE", False)
 WORKER_RUN_ONCE_SECONDS = float(os.environ.get("WORKER_RUN_ONCE_SECONDS", "0.05"))
-FLIPS_CACHE_TTL_SECONDS = int(os.environ.get("FLIPS_CACHE_TTL_SECONDS", "180"))
+FLIPS_CACHE_TTL_SECONDS = int(os.environ.get("FLIPS_CACHE_TTL_SECONDS", "600"))
 FLIPS_CACHE_WARM_INTERVAL_SECONDS = int(os.environ.get("FLIPS_CACHE_WARM_INTERVAL_SECONDS", "30"))
 FLIPS_FRESH_MAX_PER_MINUTE = int(os.environ.get("FLIPS_FRESH_MAX_PER_MINUTE", "6"))
 ALLOW_ANON = _env_bool("ALLOW_ANON", False)

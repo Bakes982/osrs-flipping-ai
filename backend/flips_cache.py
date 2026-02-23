@@ -5,11 +5,14 @@ Shared flip computation + cache warming helpers.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Sequence
 
 from backend import config
 from backend.cache_backend import get_cache_backend
+
+logger = logging.getLogger(__name__)
 from backend.database import get_db, get_item, get_item_flips, get_price_history, get_tracked_item_ids
 from backend.prediction.scoring import calculate_flip_metrics
 
@@ -123,7 +126,9 @@ def warm_flip_caches_sync(
             top5 = top100[:5]
 
             cache.set_json(f"flips:top5:{profile}", {"ts": cache_ts, "flips": top5}, ttl_seconds=ttl)
+            logger.info("OPP_CACHE_WRITE flips:top5:%s ttl=%ds items=%d", profile, ttl, len(top5))
             cache.set_json(f"flips:top100:{profile}", {"ts": cache_ts, "flips": top100}, ttl_seconds=ttl)
+            logger.info("OPP_CACHE_WRITE flips:top100:%s ttl=%ds items=%d", profile, ttl, len(top100))
             cache.set_json(
                 f"flips:stats:{profile}",
                 {"ts": cache_ts, "count": len(top100), "top_score": (top100[0]["total_score"] if top100 else 0)},
@@ -131,6 +136,7 @@ def warm_flip_caches_sync(
             )
             warmed_counts[profile] = len(top100)
             cache.set("flips:last_updated_ts", cache_ts, ttl_seconds=ttl)
+            logger.info("OPP_CACHE_WRITE flips:last_updated_ts ttl=%ds", ttl)
         except Exception:
             warmed_counts[profile] = 0
             continue
