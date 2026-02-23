@@ -1477,16 +1477,17 @@ class FlipCacheWorker:
         }
 
     @staticmethod
-    def _persist_top_opportunities(top_opportunities: List[dict]) -> None:
+    def _persist_top_opportunities(top_opportunities: List[dict], profile: str = "balanced") -> None:
         """Store top-ranked opportunities in Redis (or cache fallback)."""
         redis = get_redis()
+        key = f"flips:top100:{profile}"
         payload = {
             "generated_at": time.time(),
             "count": len(top_opportunities),
             "items": top_opportunities,
         }
-        redis.set("opportunities:top", json.dumps(payload), ex=90)
-        logger.info("OPP_CACHE_WRITE count=%d", len(top_opportunities))
+        redis.set(key, json.dumps(payload), ex=600)
+        logger.info("OPP_CACHE_WRITE key=%s count=%d", key, len(top_opportunities))
 
     async def run_cycle(self) -> None:
         """Score items and update the flip cache."""
@@ -1539,7 +1540,7 @@ class FlipCacheWorker:
                 reverse=True,
             )[:50]
             asyncio.create_task(
-                asyncio.to_thread(self._persist_top_opportunities, top_opportunities)
+                asyncio.to_thread(self._persist_top_opportunities, top_opportunities, "balanced")
             )
             logger.debug("FlipCacheWorker: updated cache with %d scored items", len(scored))
         except Exception as e:

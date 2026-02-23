@@ -208,7 +208,6 @@ def _normalize_item(m: dict) -> dict:
 @router.get("")
 async def list_opportunities(
     request: Request,
-    profile: Optional[str] = Query(None, pattern="^(conservative|balanced|aggressive)$"),
     limit: int = Query(100, ge=1, le=200),
     min_price: Optional[int] = Query(None, ge=0),
     min_volume: Optional[int] = Query(None, ge=0),
@@ -231,8 +230,8 @@ async def list_opportunities(
 
     prefs = await asyncio.to_thread(_load_prefs)
 
-    user_ctx = getattr(request.state, "user_ctx", None)
-    active_profile = profile or getattr(getattr(user_ctx, "risk_profile", None), "value", None) or "balanced"
+    requested_profile = request.query_params.get("profile", "balanced")
+    active_profile = requested_profile if requested_profile in {"conservative", "balanced", "aggressive"} else "balanced"
 
     effective_min_price = int(min_price) if min_price is not None else int(prefs["min_price"])
     effective_min_volume = int(min_volume) if min_volume is not None else int(prefs["min_volume"])
@@ -240,20 +239,14 @@ async def list_opportunities(
     effective_min_profit_gp = int(min_profit_gp) if min_profit_gp is not None else int(prefs["min_profit_gp"])
 
     redis = get_redis()
-    raw = redis.get(f"flips:top100:{active_profile}")
+    key = f"flips:top100:{active_profile}"
+    raw = redis.get(key)
 
     if not raw:
         return {
             "generated_at": None,
             "count": 0,
             "items": [],
-            "profile": active_profile,
-            "prefs": {
-                "min_price": effective_min_price,
-                "min_volume": effective_min_volume,
-                "min_roi_pct": effective_min_roi_pct,
-                "min_profit_gp": effective_min_profit_gp,
-            },
         }
 
     if isinstance(raw, bytes):

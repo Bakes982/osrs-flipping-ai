@@ -603,7 +603,7 @@ async def health_check():
     opp_cached = False
     try:
         redis = get_redis()
-        opp_cached = bool(redis.get("opportunities:top"))
+        opp_cached = bool(redis.exists("flips:top100:balanced"))
     except Exception:
         opp_cached = False
 

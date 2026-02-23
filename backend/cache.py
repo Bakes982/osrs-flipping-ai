@@ -18,6 +18,7 @@ class _RedisCompatAdapter:
     Supported methods:
       - get(key)
       - set(key, value, ex=seconds)
+      - exists(key)
     """
 
     def __init__(self, cache_backend) -> None:
@@ -29,6 +30,9 @@ class _RedisCompatAdapter:
     def set(self, key: str, value: str, ex: Optional[int] = None) -> None:
         ttl_seconds = int(ex) if ex is not None else None
         self._cache.set(key, value, ttl_seconds=ttl_seconds)
+
+    def exists(self, key: str) -> int:
+        return 1 if self._cache.get(key) is not None else 0
 
 
 def get_redis():
