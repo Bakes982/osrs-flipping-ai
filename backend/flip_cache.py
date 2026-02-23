@@ -434,7 +434,7 @@ def _emit_dump_alert(metrics: dict) -> None:
     Improvements over v1:
       - Resolves item name via resolve_item_name() — always calls the Wiki
         mapping so "Item XXXXX" placeholders in metrics are replaced.
-      - Webhook routing: DISCORD_WEBHOOK_DUMPS first, DISCORD_WEBHOOK_URL fallback.
+      - Webhook routing: DISCORD_WEBHOOK_DUMPS env var (or dump DB setting).
       - Sends a Discord embed with colour-coded severity and trade plan fields.
       - Attaches a 6h price chart image when chart generation succeeds.
     """
@@ -443,11 +443,24 @@ def _emit_dump_alert(metrics: dict) -> None:
     import os
     from datetime import datetime
 
-    # Webhook priority: DISCORD_WEBHOOK_DUMPS (dump-only channel) first
-    webhook_url = (
-        os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
-        or os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    )
+    webhook_source = None
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_DUMPS", "").strip()
+    if webhook_url:
+        webhook_source = "env"
+    else:
+        try:
+            from backend.database import get_db, get_setting
+            db = get_db()
+            try:
+                db_url = (get_setting(db, "dump_alert_webhook_url") or "").strip()
+                if db_url:
+                    webhook_url = db_url
+                    webhook_source = "db"
+            finally:
+                db.close()
+        except Exception:
+            webhook_url = ""
+            webhook_source = None
 
     item_id = metrics.get("item_id")
 
@@ -468,12 +481,10 @@ def _emit_dump_alert(metrics: dict) -> None:
     )
 
     if not webhook_url:
-        logger.warning(
-            "Set DISCORD_WEBHOOK_DUMPS (or DISCORD_WEBHOOK_URL) to receive dump alerts"
-        )
+        logger.warning("Set DISCORD_WEBHOOK_DUMPS to receive dump alerts")
         return
 
-    logger.info("DUMP_WEBHOOK target=%s", webhook_url[:35])
+    logger.info("NOTIFIER=dump WEBHOOK_SOURCE=%s", webhook_source or "unknown")
 
     signal = (metrics.get("dump_signal") or "HIGH").upper()
     buy    = int(metrics.get("recommended_buy") or 0)
