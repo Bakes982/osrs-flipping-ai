@@ -86,7 +86,49 @@ def _score_to_reason(item: Dict[str, Any]) -> str:
     if not bullets:
         bullets.append("Balanced score across spread, volume, and risk")
 
-    return "\n".join(f"• {b}" for b in bullets[:2])
+    return "\n".join(f"* {b}" for b in bullets[:2])
+
+
+def _safe_positive_int(value: Any, default: int = 0) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        return int(default)
+    return out if out > 0 else int(default)
+
+
+def _extract_ge_limit_4h(item: Dict[str, Any]) -> int:
+    return _safe_positive_int(
+        item.get("ge_limit_4h")
+        or item.get("item_limit")
+        or item.get("buy_limit")
+        or (item.get("position_sizing") or {}).get("item_limit"),
+        default=0,
+    )
+
+
+def _load_ge_limits_4h(item_ids: List[int]) -> Dict[int, int]:
+    unique_ids = sorted({int(item_id) for item_id in item_ids if int(item_id) > 0})
+    if not unique_ids:
+        return {}
+
+    db = get_db()
+    try:
+        docs = db.items.find(
+            {"_id": {"$in": unique_ids}},
+            {"_id": 1, "buy_limit": 1},
+        )
+        limits: Dict[int, int] = {}
+        for doc in docs:
+            item_id = _safe_positive_int(doc.get("_id"), 0)
+            buy_limit = _safe_positive_int(doc.get("buy_limit"), 0)
+            if item_id > 0 and buy_limit > 0:
+                limits[item_id] = buy_limit
+        return limits
+    except Exception:
+        return {}
+    finally:
+        db.close()
 
 
 def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,11 +156,18 @@ def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
         or item.get("spread")
         or max(0, sell_price - buy_price)
     )
-    qty_suggested = int(
+    qty_raw = int(
         item.get("qty_suggested")
         or (item.get("position_sizing") or {}).get("quantity")
         or 0
     )
+    ge_limit_4h = _extract_ge_limit_4h(item)
+    qty_suggested = qty_raw
+    if ge_limit_4h > 0:
+        qty_suggested = min(qty_suggested, ge_limit_4h)
+
+    if margin_gp > 0 and qty_suggested > 0:
+        potential_profit = margin_gp * qty_suggested
 
     raw_name = item.get("item_name") or item.get("name") or ""
     name = str(raw_name).strip()
@@ -154,6 +203,8 @@ def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
         "history_score": score_breakdown["history"],
         "stability_score": score_breakdown["stability"],
         "ml_signal_score": score_breakdown["ml_signal"],
+        "ge_limit_4h": ge_limit_4h,
+        "qty_raw": qty_raw,
         "qty_suggested": qty_suggested,
         "ml_direction": item.get("ml_direction"),
         "ml_prediction_confidence": item.get("ml_prediction_confidence"),
@@ -433,6 +484,19 @@ async def list_opportunities(
 
     mapped_items = [_map_cached_flip(item) for item in source_items if isinstance(item, dict)]
 
+    missing_limit_ids = [
+        int(item.get("item_id") or 0)
+        for item in mapped_items
+        if int(item.get("item_id") or 0) > 0 and int(item.get("ge_limit_4h") or 0) <= 0
+    ]
+    if missing_limit_ids:
+        ge_limits = _load_ge_limits_4h(missing_limit_ids)
+        if ge_limits:
+            for item in mapped_items:
+                item_id = int(item.get("item_id") or 0)
+                if item_id > 0 and int(item.get("ge_limit_4h") or 0) <= 0:
+                    item["ge_limit_4h"] = int(ge_limits.get(item_id) or 0)
+
     before_count = len(mapped_items)
     value_threshold = 0
     if effective_value_mode == "1m":
@@ -462,9 +526,28 @@ async def list_opportunities(
         volume_5m = int(item.get("volume_5m") or item.get("volume") or 0)
         roi_pct = float(item.get("roi_pct") or 0)
         margin_gp = int(item.get("margin_gp") or item.get("margin") or item.get("net_profit") or 0)
-        qty_suggested = int(item.get("qty_suggested") or 0)
+        ge_limit_4h = _safe_positive_int(item.get("ge_limit_4h"), 0)
+        qty_raw = int(item.get("qty_raw") or item.get("qty_suggested") or 0)
+        qty_suggested = max(0, qty_raw)
+        if ge_limit_4h > 0 and qty_suggested > ge_limit_4h:
+            qty_suggested = ge_limit_4h
+            logger.info(
+                "OPP_QTY_CAP item_id=%s raw=%d limit=%d final=%d",
+                int(item.get("item_id") or 0),
+                qty_raw,
+                ge_limit_4h,
+                qty_suggested,
+            )
+        item["ge_limit_4h"] = ge_limit_4h
+        item["qty_raw"] = qty_raw
+        item["qty_suggested"] = qty_suggested
         existing_potential_profit = int(item.get("expected_profit") or item.get("potential_profit") or 0)
-        potential_profit_gp = max(existing_potential_profit, int(margin_gp * max(0, qty_suggested)))
+        if margin_gp > 0:
+            potential_profit_gp = int(margin_gp * qty_suggested)
+        elif qty_raw > 0 and qty_suggested > 0 and existing_potential_profit > 0:
+            potential_profit_gp = int(existing_potential_profit * (qty_suggested / max(1, qty_raw)))
+        else:
+            potential_profit_gp = max(0, existing_potential_profit)
         item["potential_profit"] = potential_profit_gp
         item["expected_profit"] = potential_profit_gp
         profit_gp = potential_profit_gp

@@ -78,6 +78,11 @@ def _cached_payload() -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _stub_ge_limit_lookup(monkeypatch):
+    monkeypatch.setattr(opportunities, "_load_ge_limits_4h", lambda _item_ids: {})
+
+
 @pytest.mark.asyncio
 async def test_value_mode_1m_filters_on_buy_or_sell(monkeypatch, caplog):
     monkeypatch.setattr(opportunities, "get_redis", lambda: _FakeRedis(_cached_payload()))
@@ -179,3 +184,88 @@ async def test_score_mode_margin_hunter_reranks_for_margin(monkeypatch):
     assert ids[0] != 100
     assert result["score_mode"] == "margin_hunter"
     assert "margin_hunter_score" in result["items"][0]
+
+
+@pytest.mark.asyncio
+async def test_ge_limit_caps_qty_and_profit(monkeypatch):
+    payload = {
+        "generated_at": 1_700_000_000,
+        "items": [
+            {
+                "item_id": 314,
+                "name": "Feather-like item",
+                "buy_price": 5,
+                "sell_price": 8,
+                "margin_gp": 3,
+                "qty_suggested": 100_000,
+                "item_limit": 30_000,
+                "potential_profit": 300_000,
+                "volume_5m": 10_000,
+                "roi_pct": 10.0,
+                "flip_score": 50,
+            },
+        ],
+    }
+    monkeypatch.setattr(opportunities, "get_redis", lambda: _FakeRedis(payload))
+    req = _request("/api/opportunities", "profile=balanced&value_mode=all")
+    result = await opportunities.list_opportunities(
+        req,
+        profile="balanced",
+        limit=100,
+        value_mode="all",
+        min_price=0,
+        min_price_gp=0,
+        min_volume=0,
+        min_roi_pct=0,
+        min_profit_gp=0,
+        min_profit_per_item_gp=0,
+        min_total_profit_gp=0,
+        ignore_low_value=False,
+    )
+    item = result["items"][0]
+    assert item["ge_limit_4h"] == 30_000
+    assert item["qty_raw"] == 100_000
+    assert item["qty_suggested"] == 30_000
+    assert item["potential_profit"] == 90_000
+    assert item["expected_profit"] == 90_000
+
+
+@pytest.mark.asyncio
+async def test_ge_limit_missing_keeps_qty(monkeypatch):
+    payload = {
+        "generated_at": 1_700_000_000,
+        "items": [
+            {
+                "item_id": 999,
+                "name": "No limit item",
+                "buy_price": 1_000,
+                "sell_price": 1_250,
+                "margin_gp": 250,
+                "qty_suggested": 120,
+                "potential_profit": 30_000,
+                "volume_5m": 1_000,
+                "roi_pct": 5.0,
+                "flip_score": 40,
+            },
+        ],
+    }
+    monkeypatch.setattr(opportunities, "get_redis", lambda: _FakeRedis(payload))
+    req = _request("/api/opportunities", "profile=balanced&value_mode=all")
+    result = await opportunities.list_opportunities(
+        req,
+        profile="balanced",
+        limit=100,
+        value_mode="all",
+        min_price=0,
+        min_price_gp=0,
+        min_volume=0,
+        min_roi_pct=0,
+        min_profit_gp=0,
+        min_profit_per_item_gp=0,
+        min_total_profit_gp=0,
+        ignore_low_value=False,
+    )
+    item = result["items"][0]
+    assert item["ge_limit_4h"] == 0
+    assert item["qty_suggested"] == 120
+    assert item["potential_profit"] == 30_000

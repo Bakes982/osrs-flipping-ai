@@ -18,6 +18,14 @@ function formatGP(n) {
   return n.toLocaleString();
 }
 
+function formatQty(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return '0';
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}m`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return v.toLocaleString();
+}
+
 /* ── Score pill ──────────────────────────────────────────────────────────── */
 
 function scoreColor(score) {
@@ -186,6 +194,11 @@ function ScoreBar({ score, max = 100 }) {
 /* ── Expanded Row Detail ─────────────────────────────────────────────────── */
 
 function ExpandedDetail({ opp }) {
+  const geLimit4h = Number(opp.ge_limit_4h || 0);
+  const qtyRaw = Number(opp.qty_raw ?? opp.qty_suggested ?? 0);
+  const qtySuggested = Number(opp.qty_suggested || 0);
+  const geCapped = geLimit4h > 0 && qtyRaw > qtySuggested;
+
   return (
     <tr>
       <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
@@ -254,7 +267,12 @@ function ExpandedDetail({ opp }) {
                 </>
               ) : opp.qty_suggested > 0 ? (
                 <>
-                  <div><span className="text-muted">Qty Suggested: </span>{opp.qty_suggested?.toLocaleString()}</div>
+                  <div>
+                    <span className="text-muted">Qty Suggested: </span>
+                    {qtySuggested.toLocaleString()}
+                    {geCapped ? ' (GE cap)' : ''}
+                  </div>
+                  <div><span className="text-muted">GE Limit: </span>{geLimit4h > 0 ? `${geLimit4h.toLocaleString()} / 4h` : '—'}</div>
                   <div><span className="text-muted">Est Profit: </span><span className="text-green">+{formatGP(opp.expected_profit)}</span></div>
                 </>
               ) : <div className="text-muted">No sizing data</div>}
@@ -748,6 +766,17 @@ export default function Opportunities() {
                           {opp.win_rate != null && (
                             <div className="text-muted" style={{ fontSize: 10 }}>
                               {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR
+                            </div>
+                          )}
+                          {Number(opp.qty_suggested || 0) > 0 && (
+                            <div
+                              className="text-muted"
+                              style={{ fontSize: 10 }}
+                              title={Number(opp.ge_limit_4h || 0) > 0 ? `GE limit: ${Number(opp.ge_limit_4h).toLocaleString()} / 4h` : 'No GE limit data'}
+                            >
+                              Qty {formatQty(opp.qty_suggested)}
+                              {(Number(opp.ge_limit_4h || 0) > 0 && Number(opp.qty_raw ?? opp.qty_suggested ?? 0) > Number(opp.qty_suggested || 0)) ? ' (GE cap)' : ''}
+                              {Number(opp.ge_limit_4h || 0) > 0 ? ` · GE limit ${formatQty(opp.ge_limit_4h)} / 4h` : ''}
                             </div>
                           )}
                         </div>
