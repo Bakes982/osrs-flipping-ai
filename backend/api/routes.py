@@ -650,14 +650,18 @@ async def runtime_status():
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-
 def register_routes(app: FastAPI) -> None:
     """Mount all routers onto ``app``.
 
     Call this once from ``backend.app`` after creating the FastAPI instance.
     """
     # Existing routers (retain their own prefixes)
-    from backend.routers import opportunities, portfolio, analysis, settings, alerts, trades, dumps, debug, items
+    from backend.routers import opportunities, portfolio, analysis, settings, alerts, trades, dumps, items
+
+    try:
+        from backend.routers import debug
+    except ImportError:
+        debug = None
     from backend.routers import blocklist as blocklist_router
     from backend.routers import user_profile
     from backend.routers import backtest as backtest_router   # PR12
@@ -669,7 +673,8 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(alerts.router)
     app.include_router(trades.router)
     app.include_router(dumps.router)
-    app.include_router(debug.router, prefix="/api")
+    if debug is not None:
+        app.include_router(debug.router, prefix="/api")
     app.include_router(items.router, prefix="/api")
     app.include_router(blocklist_router.router)
     app.include_router(user_profile.router)
