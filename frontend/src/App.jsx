@@ -1,12 +1,12 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, NavLink, useNavigate } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import {
   LayoutDashboard, TrendingUp, Briefcase, BarChart3,
-  Brain, Settings, LogOut, Bell, Upload, Users, ShieldOff,
+  Brain, Settings, LogOut, Bell, Upload, Users, ShieldOff, Search,
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Opportunities from './pages/Opportunities';
-import ItemDetail from './pages/ItemDetail';
+import Item from './pages/Item';
 import Portfolio from './pages/Portfolio';
 import ActiveTrades from './pages/ActiveTrades';
 import Performance from './pages/Performance';
@@ -49,6 +49,90 @@ function AccountSelector() {
           <option key={a} value={a}>{a}</option>
         ))}
       </select>
+    </div>
+  );
+}
+
+function SidebarItemSearch({ onNavigate }) {
+  const navigate = useNavigate();
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const term = query.trim();
+    if (!term) {
+      setResults([]);
+      setOpen(false);
+      setLoading(false);
+      return undefined;
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(async () => {
+      setLoading(true);
+      try {
+        const payload = await api.searchItems(term, 20, {
+          signal: ctrl.signal,
+          timeoutMs: 10_000,
+        });
+        setResults(Array.isArray(payload) ? payload : (payload?.items || []));
+        setOpen(true);
+      } catch (err) {
+        if (err?.name !== 'AbortError') {
+          setResults([]);
+          setOpen(true);
+        }
+      } finally {
+        setLoading(false);
+      }
+    }, 250);
+
+    return () => {
+      clearTimeout(timer);
+      ctrl.abort();
+    };
+  }, [query]);
+
+  const selectItem = (itemId) => {
+    setQuery('');
+    setResults([]);
+    setOpen(false);
+    navigate(`/item/${itemId}`);
+    if (onNavigate) onNavigate();
+  };
+
+  return (
+    <div className="sidebar-item-search" onBlur={() => setTimeout(() => setOpen(false), 120)}>
+      <Search size={13} className="sidebar-item-search-icon" />
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onFocus={() => query.trim() && setOpen(true)}
+        placeholder="Search item or ID..."
+      />
+      {open && (
+        <div className="sidebar-item-search-results">
+          {loading ? (
+            <div className="sidebar-item-search-empty">Searching...</div>
+          ) : results.length === 0 ? (
+            <div className="sidebar-item-search-empty">No items found</div>
+          ) : (
+            results.map((item) => (
+              <button
+                key={item.item_id}
+                className="sidebar-item-search-result"
+                onClick={() => selectItem(item.item_id)}
+                type="button"
+              >
+                <span>{item.name}</span>
+                <small>#{item.item_id}</small>
+              </button>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -141,6 +225,7 @@ export default function App() {
               <span className={`dot ${wsConnected ? 'online' : 'offline'}`} />
               {wsConnected ? 'Live' : 'Connecting...'}
             </div>
+            <SidebarItemSearch onNavigate={() => setMobileMenuOpen(false)} />
             <AccountSelector />
           </div>
           <div className="nav-links">
@@ -187,7 +272,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard prices={livePrices} />} />
             <Route path="/opportunities" element={<Opportunities prices={livePrices} />} />
-            <Route path="/item/:itemId" element={<ItemDetail prices={livePrices} />} />
+            <Route path="/item/:itemId" element={<Item prices={livePrices} />} />
             <Route path="/portfolio" element={<Portfolio prices={livePrices} />} />
             <Route path="/trades" element={<ActiveTrades />} />
             <Route path="/alerts" element={<Alerts />} />

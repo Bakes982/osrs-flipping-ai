@@ -251,11 +251,32 @@ async def list_opportunities(
     min_volume: int = Query(0, ge=0),
     min_roi_pct: float = Query(0, ge=0),
     min_profit_gp: int = Query(0, ge=0),
+    min_price_gp: int = Query(0, ge=0),
+    min_profit_per_item_gp: int = Query(0, ge=0),
+    min_total_profit_gp: int = Query(0, ge=0),
+    value_mode: str = Query("all", pattern="^(all|1m|10m)$"),
+    ignore_low_value: bool = Query(False),
 ):
     """Return cached opportunities from profile cache with server-side filtering."""
     active_profile = request.query_params.get("profile", profile) or "balanced"
     if active_profile not in {"conservative", "balanced", "aggressive"}:
         active_profile = "balanced"
+
+    effective_value_mode = (request.query_params.get("value_mode") or value_mode or "all").strip().lower()
+    if effective_value_mode not in {"all", "1m", "10m"}:
+        effective_value_mode = "all"
+
+    effective_min_price = max(int(min_price or 0), int(min_price_gp or 0))
+    if ignore_low_value and effective_min_price == 0:
+        effective_min_price = 50_000
+
+    effective_min_ppi = int(min_profit_per_item_gp or 0)
+    filters_applied = {
+        "value_mode": effective_value_mode,
+        "min_price_gp": effective_min_price,
+        "min_profit_per_item_gp": effective_min_ppi,
+        "min_total_profit_gp": int(min_total_profit_gp or 0),
+    }
 
     redis = get_redis()
     key = f"flips:top100:{active_profile}"
@@ -276,6 +297,8 @@ async def list_opportunities(
             "count": 0,
             "items": [],
             "profile": active_profile,
+            "value_mode": effective_value_mode,
+            "filters_applied": filters_applied,
         }
 
     if isinstance(raw, bytes):
@@ -292,20 +315,53 @@ async def list_opportunities(
 
     mapped_items = [_map_cached_flip(item) for item in source_items if isinstance(item, dict)]
 
-    filtered_items: List[Dict[str, Any]] = []
+    before_count = len(mapped_items)
+    value_threshold = 0
+    if effective_value_mode == "1m":
+        value_threshold = 1_000_000
+    elif effective_value_mode == "10m":
+        value_threshold = 10_000_000
+
+    value_filtered_items: List[Dict[str, Any]] = []
     for item in mapped_items:
+        buy_price = int(item.get("buy_price") or item.get("recommended_buy") or 0)
+        sell_price = int(item.get("sell_price") or item.get("recommended_sell") or 0)
+        if value_threshold > 0 and max(buy_price, sell_price) < value_threshold:
+            continue
+        value_filtered_items.append(item)
+
+    logger.info(
+        "OPP_VALUE_FILTER profile=%s value_mode=%s before=%d after=%d",
+        active_profile,
+        effective_value_mode,
+        before_count,
+        len(value_filtered_items),
+    )
+
+    filtered_items: List[Dict[str, Any]] = []
+    for item in value_filtered_items:
         buy_price = int(item.get("buy_price") or item.get("recommended_buy") or 0)
         volume_5m = int(item.get("volume_5m") or item.get("volume") or 0)
         roi_pct = float(item.get("roi_pct") or 0)
-        profit_gp = int(item.get("expected_profit") or item.get("potential_profit") or 0)
+        margin_gp = int(item.get("margin_gp") or item.get("margin") or item.get("net_profit") or 0)
+        qty_suggested = int(item.get("qty_suggested") or 0)
+        existing_potential_profit = int(item.get("expected_profit") or item.get("potential_profit") or 0)
+        potential_profit_gp = max(existing_potential_profit, int(margin_gp * max(0, qty_suggested)))
+        item["potential_profit"] = potential_profit_gp
+        item["expected_profit"] = potential_profit_gp
+        profit_gp = potential_profit_gp
 
-        if buy_price < min_price:
+        if buy_price < effective_min_price:
             continue
         if volume_5m < min_volume:
             continue
         if roi_pct < min_roi_pct:
             continue
         if profit_gp < min_profit_gp:
+            continue
+        if margin_gp < effective_min_ppi:
+            continue
+        if potential_profit_gp < min_total_profit_gp:
             continue
 
         filtered_items.append(item)
@@ -324,11 +380,23 @@ async def list_opportunities(
         len(filtered_items),
         ttl,
     )
+    logger.info(
+        "OPP_API_FILTER profile=%s before=%d after=%d min_price=%d min_ppi=%d min_total=%d value_mode=%s",
+        active_profile,
+        len(value_filtered_items),
+        len(filtered_items),
+        effective_min_price,
+        effective_min_ppi,
+        int(min_total_profit_gp or 0),
+        effective_value_mode,
+    )
     return {
         "generated_at": generated_at,
         "count": len(filtered_items),
         "items": filtered_items,
         "profile": active_profile,
+        "value_mode": effective_value_mode,
+        "filters_applied": filters_applied,
     }
 
 

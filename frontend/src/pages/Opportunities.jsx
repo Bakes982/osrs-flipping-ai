@@ -4,8 +4,9 @@ import {
   RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
   ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle, Check,
 } from 'lucide-react';
-import { api } from '../api/client';
+import { api, API_BASE } from '../api/client';
 import { useApi } from '../hooks/useApi';
+import MarketSearchPanel from '../components/MarketSearchPanel';
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -285,18 +286,38 @@ export default function Opportunities() {
   const [search, setSearch] = useState('');
   const [minPrice, setMinPrice] = useState(0);
   const [profile, setProfile] = useState('balanced');
+  const [valueMode, setValueMode] = useState('all');
+  const [minProfitPerItemGp, setMinProfitPerItemGp] = useState(0);
   const [expandedId, setExpandedId] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
   const [viewMode, setViewMode] = useState('opportunities');
-
+  const debugEnabled = import.meta.env.DEV || new URLSearchParams(window.location.search).get('debug') === '1';
+  const opportunitiesParams = useMemo(
+    () => ({
+      limit: 200,
+      profile,
+      min_price_gp: minPrice,
+      min_volume: 0,
+      min_roi_pct: 0,
+      min_profit_gp: 0,
+      min_total_profit_gp: 0,
+      value_mode: valueMode,
+      min_profit_per_item_gp: minProfitPerItemGp,
+    }),
+    [minPrice, profile, valueMode, minProfitPerItemGp],
+  );
+  const opportunitiesRequestUrl = useMemo(() => {
+    const qs = new URLSearchParams(opportunitiesParams).toString();
+    return `${API_BASE}/opportunities${qs ? `?${qs}` : ''}`;
+  }, [opportunitiesParams]);
   const { data: raw, loading, error, reload } = useApi(
     ({ signal }) => api.getOpportunities(
-      { limit: 200, min_price: minPrice, profile },
+      opportunitiesParams,
       { signal, timeoutMs: 15000 },
     ),
-    [minPrice, profile],
+    [opportunitiesParams],
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
   const { data: tradeData, reload: reloadTrades } = useApi(
@@ -308,10 +329,23 @@ export default function Opportunities() {
     [], 120000,
   );
 
+  const firstOpportunityExample = useMemo(() => {
+    const first = raw?.items?.[0];
+    if (!first) return null;
+    return {
+      name: first.name,
+      buy_price: first.buy_price,
+      sell_price: first.sell_price,
+      volume_5m: first.volume_5m,
+      flip_score: first.flip_score,
+    };
+  }, [raw]);
+
   const opps = useMemo(() => raw?.items || [], [raw]);
   const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
   const activeMode = raw?.profile || 'balanced';
   const apiCount = Number(raw?.count || 0);
+  const filtersApplied = raw?.filters_applied || null;
   const lastUpdated = timeAgo(raw?.generated_at);
   const activeTrades = tradeData?.items || [];
   const slotsUsed = tradeData?.slots_used || 0;
@@ -360,8 +394,6 @@ export default function Opportunities() {
     }
 
     if (filter === 'High Volume') items = items.filter(o => (o.volume_5m || 0) >= 500);
-    else if (filter === 'High Value 1M+') items = items.filter(o => (o.buy_price || 0) >= 1_000_000);
-    else if (filter === 'High Value 10M+') items = items.filter(o => (o.buy_price || 0) >= 10_000_000);
     else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume_5m || 1)) - (a.potential_profit * (a.volume_5m || 1)));
     else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
@@ -399,7 +431,27 @@ export default function Opportunities() {
 
   return (
     <div>
+      {debugEnabled && (
+        <div className="card" style={{ marginBottom: 12, border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.08)' }}>
+          <div style={{ padding: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, lineHeight: 1.5 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6, color: '#f59e0b' }}>Debug banner (temporary)</div>
+            <div><strong>apiBaseUrl:</strong> {API_BASE}</div>
+            <div><strong>opportunitiesRequestUrl:</strong> {opportunitiesRequestUrl}</div>
+            <div>
+              <strong>response:</strong>{' '}
+              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}
+            </div>
+            <div>
+              <strong>firstItem:</strong>{' '}
+              {firstOpportunityExample ? JSON.stringify(firstOpportunityExample) : '—'}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Header ── */}
+      <MarketSearchPanel />
+
       <div className="page-header">
         <div>
           <h2 className="page-title">Opportunities</h2>
@@ -411,7 +463,10 @@ export default function Opportunities() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <select
             value={profile}
-            onChange={e => setProfile(e.target.value)}
+            onChange={e => {
+              const next = e.target.value;
+              setProfile(next);
+            }}
             style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
           >
             <option value="conservative">Conservative</option>
@@ -442,6 +497,36 @@ export default function Opportunities() {
         <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
       </div>
 
+      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {['all', '1m', '10m'].map((mode) => (
+          <button
+            key={mode}
+            className={`pill ${valueMode === mode ? 'active' : ''}`}
+            onClick={() => setValueMode(mode)}
+          >
+            Value: {mode}
+          </button>
+        ))}
+      </div>
+
+      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <span className="text-muted" style={{ fontSize: 12, alignSelf: 'center' }}>Min profit/item:</span>
+        {[
+          { label: 'Off', gp: 0 },
+          { label: '100gp+', gp: 100 },
+          { label: '500gp+', gp: 500 },
+          { label: '2k+', gp: 2000 },
+        ].map(({ label, gp }) => (
+          <button
+            key={gp}
+            className={`pill ${minProfitPerItemGp === gp ? 'active' : ''}`}
+            onClick={() => setMinProfitPerItemGp(gp)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       {/* Summary Stats */}
       {summaryStats && (
         <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginBottom: 20 }}>
@@ -467,7 +552,12 @@ export default function Opportunities() {
           <button
             key={f.key}
             className={`pill ${filter === f.key ? 'active' : ''}`}
-            onClick={() => setFilter(f.key)}
+            onClick={() => {
+              setFilter(f.key);
+              if (f.key === 'High Value 1M+') setValueMode('1m');
+              else if (f.key === 'High Value 10M+') setValueMode('10m');
+              else setValueMode('all');
+            }}
             title={f.desc}
           >
             {f.icon && <f.icon size={11} style={{ marginRight: 3, verticalAlign: 'middle' }} />}
@@ -563,7 +653,14 @@ export default function Opportunities() {
         ) : apiCount === 0 ? (
           <div className="empty">
             <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
-            No opportunities in cache yet.
+            {filtersApplied && (
+              filtersApplied.value_mode !== 'all'
+              || Number(filtersApplied.min_profit_per_item_gp || 0) > 0
+              || Number(filtersApplied.min_total_profit_gp || 0) > 0
+              || Number(filtersApplied.min_price_gp || 0) > 0
+            )
+              ? `No items in ${filtersApplied.value_mode || 'this mode'} right now — try all or adjust filters.`
+              : 'No opportunities in cache yet.'}
           </div>
         ) : filtered.length === 0 ? (
           <div className="empty">
@@ -710,3 +807,6 @@ export default function Opportunities() {
     </div>
   );
 }
+
+
+
