@@ -129,3 +129,53 @@ async def test_value_mode_10m_filters_on_max_buy_sell(monkeypatch):
     ids = [row["item_id"] for row in result["items"]]
     assert ids == [300]
     assert result["value_mode"] == "10m"
+
+
+@pytest.mark.asyncio
+async def test_score_mode_balanced_keeps_flip_score_order(monkeypatch):
+    monkeypatch.setattr(opportunities, "get_redis", lambda: _FakeRedis(_cached_payload()))
+    req = _request("/api/opportunities", "profile=balanced&value_mode=all&score_mode=balanced")
+    result = await opportunities.list_opportunities(
+        req,
+        profile="balanced",
+        score_mode="balanced",
+        limit=100,
+        value_mode="all",
+        min_price=0,
+        min_price_gp=0,
+        min_volume=0,
+        min_roi_pct=0,
+        min_profit_gp=0,
+        min_profit_per_item_gp=0,
+        min_total_profit_gp=0,
+        ignore_low_value=False,
+    )
+    ids = [row["item_id"] for row in result["items"]]
+    assert ids[0] == 100  # highest flip_score from cache payload
+    assert result["score_mode"] == "balanced"
+
+
+@pytest.mark.asyncio
+async def test_score_mode_margin_hunter_reranks_for_margin(monkeypatch):
+    monkeypatch.setattr(opportunities, "get_redis", lambda: _FakeRedis(_cached_payload()))
+    req = _request("/api/opportunities", "profile=balanced&value_mode=all&score_mode=margin_hunter")
+    result = await opportunities.list_opportunities(
+        req,
+        profile="balanced",
+        score_mode="margin_hunter",
+        limit=100,
+        value_mode="all",
+        min_price=0,
+        min_price_gp=0,
+        min_volume=0,
+        min_roi_pct=0,
+        min_profit_gp=0,
+        min_profit_per_item_gp=0,
+        min_total_profit_gp=0,
+        ignore_low_value=False,
+    )
+    ids = [row["item_id"] for row in result["items"]]
+    assert ids[0] in {200, 300}
+    assert ids[0] != 100
+    assert result["score_mode"] == "margin_hunter"
+    assert "margin_hunter_score" in result["items"][0]

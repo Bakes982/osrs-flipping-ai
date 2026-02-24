@@ -286,6 +286,7 @@ export default function Opportunities() {
   const [search, setSearch] = useState('');
   const [minPrice, setMinPrice] = useState(0);
   const [profile, setProfile] = useState('balanced');
+  const [scoreMode, setScoreMode] = useState('balanced');
   const [valueMode, setValueMode] = useState('all');
   const [minProfitPerItemGp, setMinProfitPerItemGp] = useState(0);
   const [expandedId, setExpandedId] = useState(null);
@@ -298,6 +299,7 @@ export default function Opportunities() {
     () => ({
       limit: 200,
       profile,
+      score_mode: scoreMode,
       min_price_gp: minPrice,
       min_volume: 0,
       min_roi_pct: 0,
@@ -306,7 +308,7 @@ export default function Opportunities() {
       value_mode: valueMode,
       min_profit_per_item_gp: minProfitPerItemGp,
     }),
-    [minPrice, profile, valueMode, minProfitPerItemGp],
+    [minPrice, profile, scoreMode, valueMode, minProfitPerItemGp],
   );
   const opportunitiesRequestUrl = useMemo(() => {
     const qs = new URLSearchParams(opportunitiesParams).toString();
@@ -344,6 +346,7 @@ export default function Opportunities() {
   const opps = useMemo(() => raw?.items || [], [raw]);
   const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
   const activeMode = raw?.profile || 'balanced';
+  const activeScoreMode = raw?.score_mode || scoreMode;
   const apiCount = Number(raw?.count || 0);
   const filtersApplied = raw?.filters_applied || null;
   const lastUpdated = timeAgo(raw?.generated_at);
@@ -397,27 +400,33 @@ export default function Opportunities() {
     else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume_5m || 1)) - (a.potential_profit * (a.volume_5m || 1)));
     else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
+    const sortKey = (activeScoreMode === 'margin_hunter' && sortCol === 'flip_score')
+      ? 'margin_hunter_score'
+      : sortCol;
     items.sort((a, b) => {
-      const av = a[sortCol] ?? 0;
-      const bv = b[sortCol] ?? 0;
+      const av = a[sortKey] ?? 0;
+      const bv = b[sortKey] ?? 0;
       return sortDir === 'asc' ? av - bv : bv - av;
     });
 
     return items;
-  }, [opps, filter, sortCol, sortDir, search]);
+  }, [opps, filter, sortCol, sortDir, search, activeScoreMode]);
 
   const summaryStats = useMemo(() => {
     if (!filtered.length) return null;
     const avgMargin  = filtered.reduce((s, o) => s + (o.margin_pct ?? 0), 0) / filtered.length;
-    const avgScore   = filtered.reduce((s, o) => s + (o.flip_score ?? 0), 0) / filtered.length;
+    const avgScore   = filtered.reduce((s, o) => s + ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0), 0) / filtered.length;
     const totalProfit= filtered.reduce((s, o) => s + (o.potential_profit ?? 0), 0);
     const totalVol   = filtered.reduce((s, o) => s + (o.volume_5m ?? 0), 0);
     const best       = filtered.reduce(
-      (b, o) => (o.flip_score ?? 0) > (b.flip_score ?? 0) ? o : b,
+      (b, o) => (
+        ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0)
+        > ((activeScoreMode === 'margin_hunter' ? b.margin_hunter_score : b.flip_score) ?? 0)
+      ) ? o : b,
       filtered[0],
     );
     return { avgMargin, avgScore, totalProfit, totalVol, best };
-  }, [filtered]);
+  }, [filtered, activeScoreMode]);
 
   const th = (label, col) => (
     <th
@@ -439,7 +448,7 @@ export default function Opportunities() {
             <div><strong>opportunitiesRequestUrl:</strong> {opportunitiesRequestUrl}</div>
             <div>
               <strong>response:</strong>{' '}
-              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}
+              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}, score_mode={raw?.score_mode ?? '—'}
             </div>
             <div>
               <strong>firstItem:</strong>{' '}
@@ -473,6 +482,14 @@ export default function Opportunities() {
             <option value="balanced">Balanced</option>
             <option value="aggressive">Aggressive</option>
           </select>
+          <select
+            value={scoreMode}
+            onChange={e => setScoreMode(e.target.value)}
+            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
+          >
+            <option value="balanced">Balanced</option>
+            <option value="margin_hunter">Margin Hunter</option>
+          </select>
           <button
             className={`pill ${autoRefresh ? 'active' : ''}`}
             onClick={() => setAutoRefresh(v => !v)}
@@ -495,6 +512,9 @@ export default function Opportunities() {
 
       <div className="filter-bar" style={{ marginBottom: 12 }}>
         <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
+        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>
+          Score: {activeScoreMode === 'margin_hunter' ? 'Margin Hunter' : 'Balanced'}
+        </span>
       </div>
 
       <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
@@ -535,7 +555,18 @@ export default function Opportunities() {
             { title: 'Avg Score',         value: loading ? '…' : (summaryStats?.avgScore.toFixed(0) + '/100'),color: null },
             { title: 'Avg Margin',        value: loading ? '…' : (summaryStats?.avgMargin.toFixed(1) + '%'),  color: (summaryStats?.avgMargin ?? 0) > 0 ? 'var(--green)' : null },
             { title: 'Total Liq Score',   value: loading ? '…' : summaryStats?.totalVol.toFixed(0),           color: null },
-            { title: 'Best Opportunity',  value: loading ? '…' : (summaryStats?.best?.name || summaryStats?.best?.item_name), sub: summaryStats?.best ? `score ${summaryStats.best.flip_score?.toFixed(0)}` : null, color: 'var(--green)' },
+            {
+              title: 'Best Opportunity',
+              value: loading ? '…' : (summaryStats?.best?.name || summaryStats?.best?.item_name),
+              sub: summaryStats?.best
+                ? `score ${(
+                  activeScoreMode === 'margin_hunter'
+                    ? summaryStats.best.margin_hunter_score
+                    : summaryStats.best.flip_score
+                )?.toFixed(0)}`
+                : null,
+              color: 'var(--green)',
+            },
           ].map(({ title, value, sub, color }) => (
             <div key={title} className="card" style={{ padding: '14px 16px' }}>
               <div className="card-title">{title}</div>
@@ -673,7 +704,7 @@ export default function Opportunities() {
               <tr>
                 <th style={{ width: 30 }}>#</th>
                 <th>Item</th>
-                {th('RUNE SCORE', 'flip_score')}
+                {th(activeScoreMode === 'margin_hunter' ? 'MARGIN SCORE' : 'RUNE SCORE', 'flip_score')}
                 {th('Buy', 'buy_price')}
                 {th('Sell', 'sell_price')}
                 {th('Margin', 'margin_gp')}
@@ -723,8 +754,8 @@ export default function Opportunities() {
                       </div>
                     </td>
                     <td>
-                      <span className={`badge ${scoreColor(opp.flip_score)}`}>
-                        {opp.flip_score?.toFixed(0)}
+                      <span className={`badge ${scoreColor(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)}`}>
+                        {(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)?.toFixed(0)}
                       </span>
                     </td>
                     <td className="gp text-green">{formatGP(opp.buy_price)}</td>
@@ -807,6 +838,3 @@ export default function Opportunities() {
     </div>
   );
 }
-
-
-

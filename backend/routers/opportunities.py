@@ -7,6 +7,7 @@ GET /api/opportunities/{id}  - detailed analysis for a single item
 import asyncio
 import json
 import logging
+import math
 import sys
 import os
 from datetime import datetime, timezone
@@ -242,10 +243,109 @@ def _normalize_item(m: dict) -> dict:
     return out
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _to_confidence_01(value: Any) -> float:
+    try:
+        conf = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if conf > 1.0:
+        conf = conf / 100.0
+    return _clamp01(conf)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _trend_quality(item: Dict[str, Any]) -> float:
+    trend_score = float(item.get("trend_score") or 0.0)
+    trend_norm = _clamp01(trend_score / 100.0)
+    trend_txt = str(item.get("trend") or "").upper()
+    trend_dir = 0.0
+    if trend_txt == "STRONG_UP":
+        trend_dir = 1.0
+    elif trend_txt == "UP":
+        trend_dir = 0.5
+    elif trend_txt == "DOWN":
+        trend_dir = -0.5
+    elif trend_txt == "STRONG_DOWN":
+        trend_dir = -1.0
+    # Blend scored trend and categorical direction.
+    return max(-1.0, min(1.0, trend_norm * 0.6 + trend_dir * 0.4))
+
+
+def _margin_hunter_score(item: Dict[str, Any], value_mode: str) -> float:
+    buy_price = int(item.get("buy_price") or 0)
+    sell_price = int(item.get("sell_price") or 0)
+    unit_price = max(buy_price, sell_price)
+    margin_gp = max(0, int(item.get("margin_gp") or item.get("margin") or 0))
+    potential_profit = max(0, int(item.get("potential_profit") or item.get("expected_profit") or margin_gp))
+    qty_suggested = max(1, int(item.get("qty_suggested") or 1))
+    capped_qty = min(qty_suggested, 60)
+    capped_potential = min(potential_profit, margin_gp * capped_qty)
+    volume_5m = max(0, int(item.get("volume_5m") or item.get("volume") or 0))
+    confidence = _to_confidence_01(item.get("confidence") if item.get("confidence") is not None else item.get("ml_confidence"))
+    stability = _clamp01(float(item.get("stability_score") or item.get("score_stability") or 0.0) / 100.0)
+    trend_q = _trend_quality(item)
+
+    # Log-scaled components so large numbers matter without exploding.
+    margin_norm = _clamp01(math.log10(margin_gp + 1) / 5.0)
+    profit_norm = _clamp01(math.log10(capped_potential + 1) / 6.0)
+    unit_norm = _clamp01((math.log10(unit_price + 1) - 5.0) / 3.0)  # 100k -> 0, 100m -> 1
+    volume_norm = _clamp01(math.log10(volume_5m + 1) / 4.0)
+
+    score = (
+        margin_norm * 36.0
+        + profit_norm * 22.0
+        + unit_norm * 14.0
+        + volume_norm * 10.0
+        + confidence * 9.0
+        + stability * 7.0
+        + max(0.0, trend_q) * 6.0
+    )
+
+    # Value-mode relevance bonus.
+    if value_mode == "1m" and unit_price >= 1_000_000:
+        score += 4.0
+    if value_mode == "10m" and unit_price >= 10_000_000:
+        score += 6.0
+
+    # Penalties.
+    if unit_price < 100_000 and margin_gp < 2_000:
+        score -= 18.0
+    if confidence < 0.45:
+        score -= 9.0
+    if stability < 0.35:
+        score -= 8.0
+    if volume_5m < 20:
+        score -= 12.0
+    elif volume_5m < 60:
+        score -= 5.0
+    if trend_q < -0.2:
+        score -= 6.0 if unit_price < 1_000_000 else 10.0
+
+    return round(max(0.0, score), 3)
+
+
 @router.get("")
 async def list_opportunities(
     request: Request,
     profile: str = Query("balanced", pattern="^(conservative|balanced|aggressive)$"),
+    score_mode: str = Query("balanced", pattern="^(balanced|margin_hunter)$"),
     limit: int = Query(100, ge=1, le=200),
     min_price: int = Query(0, ge=0),
     min_volume: int = Query(0, ge=0),
@@ -261,21 +361,38 @@ async def list_opportunities(
     active_profile = request.query_params.get("profile", profile) or "balanced"
     if active_profile not in {"conservative", "balanced", "aggressive"}:
         active_profile = "balanced"
+    raw_score_mode = request.query_params.get("score_mode")
+    if raw_score_mode is None:
+        raw_score_mode = score_mode if isinstance(score_mode, str) else "balanced"
+    effective_score_mode = str(raw_score_mode or "balanced").strip().lower()
+    if effective_score_mode not in {"balanced", "margin_hunter"}:
+        effective_score_mode = "balanced"
 
-    effective_value_mode = (request.query_params.get("value_mode") or value_mode or "all").strip().lower()
+    raw_value_mode = request.query_params.get("value_mode")
+    if raw_value_mode is None:
+        raw_value_mode = value_mode if isinstance(value_mode, str) else "all"
+    effective_value_mode = str(raw_value_mode or "all").strip().lower()
     if effective_value_mode not in {"all", "1m", "10m"}:
         effective_value_mode = "all"
 
-    effective_min_price = max(int(min_price or 0), int(min_price_gp or 0))
+    min_price_value = _as_int(min_price, 0)
+    min_price_gp_value = _as_int(min_price_gp, 0)
+    min_volume_value = _as_int(min_volume, 0)
+    min_profit_gp_value = _as_int(min_profit_gp, 0)
+    min_profit_per_item_value = _as_int(min_profit_per_item_gp, 0)
+    min_total_profit_value = _as_int(min_total_profit_gp, 0)
+    min_roi_pct_value = _as_float(min_roi_pct, 0.0)
+
+    effective_min_price = max(min_price_value, min_price_gp_value)
     if ignore_low_value and effective_min_price == 0:
         effective_min_price = 50_000
 
-    effective_min_ppi = int(min_profit_per_item_gp or 0)
+    effective_min_ppi = min_profit_per_item_value
     filters_applied = {
         "value_mode": effective_value_mode,
         "min_price_gp": effective_min_price,
         "min_profit_per_item_gp": effective_min_ppi,
-        "min_total_profit_gp": int(min_total_profit_gp or 0),
+        "min_total_profit_gp": min_total_profit_value,
     }
 
     redis = get_redis()
@@ -298,6 +415,7 @@ async def list_opportunities(
             "items": [],
             "profile": active_profile,
             "value_mode": effective_value_mode,
+            "score_mode": effective_score_mode,
             "filters_applied": filters_applied,
         }
 
@@ -353,20 +471,32 @@ async def list_opportunities(
 
         if buy_price < effective_min_price:
             continue
-        if volume_5m < min_volume:
+        if volume_5m < min_volume_value:
             continue
-        if roi_pct < min_roi_pct:
+        if roi_pct < min_roi_pct_value:
             continue
-        if profit_gp < min_profit_gp:
+        if profit_gp < min_profit_gp_value:
             continue
         if margin_gp < effective_min_ppi:
             continue
-        if potential_profit_gp < min_total_profit_gp:
+        if potential_profit_gp < min_total_profit_value:
             continue
 
         filtered_items.append(item)
 
-    filtered_items.sort(key=lambda x: float(x.get("flip_score") or 0), reverse=True)
+    if effective_score_mode == "margin_hunter":
+        for item in filtered_items:
+            item["margin_hunter_score"] = _margin_hunter_score(item, effective_value_mode)
+        filtered_items.sort(
+            key=lambda x: (
+                float(x.get("margin_hunter_score") or 0.0),
+                int(x.get("margin_gp") or 0),
+                int(x.get("potential_profit") or 0),
+            ),
+            reverse=True,
+        )
+    else:
+        filtered_items.sort(key=lambda x: float(x.get("flip_score") or 0), reverse=True)
     filtered_items = filtered_items[:limit]
 
     generated_at = _parse_generated_at(parsed.get("ts") if isinstance(parsed, dict) else None)
@@ -387,8 +517,14 @@ async def list_opportunities(
         len(filtered_items),
         effective_min_price,
         effective_min_ppi,
-        int(min_total_profit_gp or 0),
+        min_total_profit_value,
         effective_value_mode,
+    )
+    logger.info(
+        "OPP_SCORE_MODE profile=%s score_mode=%s returned=%d",
+        active_profile,
+        effective_score_mode,
+        len(filtered_items),
     )
     return {
         "generated_at": generated_at,
@@ -396,6 +532,7 @@ async def list_opportunities(
         "items": filtered_items,
         "profile": active_profile,
         "value_mode": effective_value_mode,
+        "score_mode": effective_score_mode,
         "filters_applied": filters_applied,
     }
 

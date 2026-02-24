@@ -148,6 +148,7 @@ export const api = {
     const allowed = [
       'limit',
       'profile',
+      'score_mode',
       'min_price',
       'min_price_gp',
       'min_profit_per_item_gp',
