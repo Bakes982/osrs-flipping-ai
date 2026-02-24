@@ -222,7 +222,7 @@ async def list_opportunities(
         try:
             return {
                 "min_price": int(get_setting(db, "min_price", 0) or 0),
-                "min_volume": int(get_setting(db, "min_volume", 1) or 0),
+                "min_volume": int(get_setting(db, "min_volume", 0) or 0),
                 "min_roi_pct": float(get_setting(db, "min_roi_pct", 0) or 0),
                 "min_profit_gp": int(get_setting(db, "min_profit", 0) or 0),
             }
