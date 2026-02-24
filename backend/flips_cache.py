@@ -15,6 +15,7 @@ from backend.cache_backend import get_cache_backend
 logger = logging.getLogger(__name__)
 from backend.database import get_db, get_item, get_item_flips, get_price_history, get_tracked_item_ids
 from backend.prediction.scoring import calculate_flip_metrics
+from backend.alerts.item_name_resolver import resolve_item_limit
 
 # Live in-memory caches populated by PriceCollector every 10s/60s.
 # Imported here so the margin scan can see ALL ~6000 OSRS items without
@@ -72,8 +73,13 @@ def _live_margin_scan(
                 if item_id in exclude_item_ids:
                     continue
 
-                high = int(instant.get("high") or 0)
-                low = int(instant.get("low") or 0)
+                avg = _5m_cache.get(item_id_str, {})
+
+                # Use /latest instant prices; fall back to 5m averages for
+                # expensive items that trade infrequently (may have low=0 or high=0
+                # in the latest poll even though they're perfectly tradeable).
+                high = int(instant.get("high") or avg.get("avgHighPrice") or 0)
+                low  = int(instant.get("low")  or avg.get("avgLowPrice")  or 0)
                 if high <= 0 or low <= 0:
                     continue
                 if high < low:
@@ -84,12 +90,15 @@ def _live_margin_scan(
                 if margin < min_margin_gp:
                     continue
 
-                avg = _5m_cache.get(item_id_str, {})
                 vol = int((avg.get("highPriceVolume") or 0) + (avg.get("lowPriceVolume") or 0))
 
                 meta = item_meta.get(item_id, {})
                 name = meta.get("name") or f"Item {item_id}"
-                buy_limit = int(meta.get("buy_limit") or 100)
+                # Prefer Wiki buy limit (accurate), then DB value, then safe 125 default.
+                # 125 is a conservative guess — most tradeable items have limit ≥ 125.
+                wiki_limit = resolve_item_limit(item_id)
+                db_limit = int(meta.get("buy_limit") or 0)
+                buy_limit = wiki_limit or db_limit or 125
 
                 roi_pct = round(margin / max(low, 1) * 100.0, 2)
                 # Conservative qty for expected-profit calc (10 M capital budget)

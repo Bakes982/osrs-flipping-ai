@@ -124,6 +124,7 @@ def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
         "total_flips": int(item.get("total_flips") or 0),
         "avg_profit": item.get("avg_profit"),
         "position_sizing": item.get("position_sizing") or {},
+        "qty_suggested": int(item.get("qty_suggested") or 0),
     }
     mapped["reason"] = _score_to_reason(item | mapped)
     return mapped

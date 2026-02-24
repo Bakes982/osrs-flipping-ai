@@ -332,7 +332,7 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         risk_level = "HIGH"
 
     user_capital = int(item_data.get("user_capital") or 10_000_000)
-    item_limit = int(item_data.get("item_limit") or item_data.get("buy_limit") or 100_000)
+    item_limit = int(item_data.get("item_limit") or item_data.get("buy_limit") or 10_000)
     qty_cap = int(user_capital // max(buy_now, 1))
     qty_suggested = min(max(qty_cap, 0), max(item_limit, 1))
     qty_suggested = int(math.floor(qty_suggested * (0.5 + 0.5 * liquidity_score)))
