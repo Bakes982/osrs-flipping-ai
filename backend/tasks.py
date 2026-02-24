@@ -169,7 +169,21 @@ class PriceCollector:
                         items_with_volume.append((item_id_str, instant, avg, vol))
 
                 items_with_volume.sort(key=lambda x: x[3], reverse=True)
-                items_with_volume = items_with_volume[:100]  # was 200; top-100 covers all meaningful flip targets
+                # Keep top 100 by volume for high-frequency cheap flips
+                _by_vol = items_with_volume[:100]
+                # Also preserve top 50 high-value items (≥1M GP) so expensive
+                # items like Bowfa/Scythe are never excluded just for low volume.
+                _high_val = sorted(
+                    [x for x in items_with_volume if (x[1].get("high") or 0) >= 1_000_000],
+                    key=lambda x: x[1].get("high", 0) or 0,
+                    reverse=True,
+                )[:50]
+                _seen = {x[0] for x in _by_vol}
+                for _x in _high_val:
+                    if _x[0] not in _seen:
+                        _by_vol.append(_x)
+                        _seen.add(_x[0])
+                items_with_volume = _by_vol
 
                 snapshots_list = []
                 for item_id_str, instant, avg, vol in items_with_volume:
