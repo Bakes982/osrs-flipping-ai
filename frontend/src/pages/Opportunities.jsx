@@ -318,6 +318,7 @@ export default function Opportunities() {
       limit: 200,
       profile,
       score_mode: scoreMode,
+      min_price: minPrice,
       min_price_gp: minPrice,
       min_volume: 0,
       min_roi_pct: 0,
