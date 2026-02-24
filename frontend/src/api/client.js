@@ -145,7 +145,27 @@ export const api = {
 
   // Opportunities
   getOpportunities(params = {}, requestOptions = {}) {
-    const qs = new URLSearchParams(params).toString();
+    const allowed = [
+      'limit',
+      'profile',
+      'score_mode',
+      'min_price',
+      'min_price_gp',
+      'min_profit_per_item_gp',
+      'min_total_profit_gp',
+      'value_mode',
+      'min_volume',
+      'min_roi_pct',
+      'min_profit_gp',
+    ];
+    const query = new URLSearchParams();
+    for (const key of allowed) {
+      const value = params[key];
+      if (value !== undefined && value !== null && value !== '') {
+        query.set(key, String(value));
+      }
+    }
+    const qs = query.toString();
     return fetchJSON(`/opportunities${qs ? '?' + qs : ''}`, requestOptions);
   },
   getOpportunityDetail(itemId) {
@@ -183,6 +203,18 @@ export const api = {
   // Price History (GE timeseries from Wiki API)
   getPriceHistory(itemId, timestep = '1h') {
     return fetchJSON(`/prices/${itemId}/history?timestep=${timestep}`);
+  },
+  searchItems(q, limit = 20, requestOptions = {}) {
+    const qs = new URLSearchParams({ q: String(q ?? ''), limit: String(limit) }).toString();
+    return fetchJSON(`/items/search?${qs}`, requestOptions);
+  },
+  getItemGraph(itemId, range = '24h', requestOptions = {}) {
+    const qs = new URLSearchParams({ range: String(range || '24h') }).toString();
+    return fetchJSON(`/items/${itemId}/graph?${qs}`, requestOptions);
+  },
+  getItem(itemId, range = '15d', requestOptions = {}) {
+    const qs = new URLSearchParams({ range: String(range || '15d') }).toString();
+    return fetchJSON(`/items/${itemId}?${qs}`, requestOptions);
   },
 
   // Portfolio

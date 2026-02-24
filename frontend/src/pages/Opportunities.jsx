@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { api, API_BASE } from '../api/client';
 import { useApi } from '../hooks/useApi';
+import MarketSearchPanel from '../components/MarketSearchPanel';
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
@@ -15,6 +16,14 @@ function formatGP(n) {
   if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return n.toLocaleString();
+}
+
+function formatQty(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return '0';
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}m`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return v.toLocaleString();
 }
 
 /* ── Score pill ──────────────────────────────────────────────────────────── */
@@ -185,6 +194,11 @@ function ScoreBar({ score, max = 100 }) {
 /* ── Expanded Row Detail ─────────────────────────────────────────────────── */
 
 function ExpandedDetail({ opp }) {
+  const geLimit4h = Number(opp.ge_limit_4h || 0);
+  const qtyRaw = Number(opp.qty_raw ?? opp.qty_suggested ?? 0);
+  const qtySuggested = Number(opp.qty_suggested || 0);
+  const geCapped = geLimit4h > 0 && qtyRaw > qtySuggested;
+
   return (
     <tr>
       <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
@@ -253,7 +267,12 @@ function ExpandedDetail({ opp }) {
                 </>
               ) : opp.qty_suggested > 0 ? (
                 <>
-                  <div><span className="text-muted">Qty Suggested: </span>{opp.qty_suggested?.toLocaleString()}</div>
+                  <div>
+                    <span className="text-muted">Qty Suggested: </span>
+                    {qtySuggested.toLocaleString()}
+                    {geCapped ? ' (GE cap)' : ''}
+                  </div>
+                  <div><span className="text-muted">GE Limit: </span>{geLimit4h > 0 ? `${geLimit4h.toLocaleString()} / 4h` : '—'}</div>
                   <div><span className="text-muted">Est Profit: </span><span className="text-green">+{formatGP(opp.expected_profit)}</span></div>
                 </>
               ) : <div className="text-muted">No sizing data</div>}
@@ -285,6 +304,9 @@ export default function Opportunities() {
   const [search, setSearch] = useState('');
   const [minPrice, setMinPrice] = useState(0);
   const [profile, setProfile] = useState('balanced');
+  const [scoreMode, setScoreMode] = useState('balanced');
+  const [valueMode, setValueMode] = useState('all');
+  const [minProfitPerItemGp, setMinProfitPerItemGp] = useState(0);
   const [expandedId, setExpandedId] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
@@ -292,8 +314,20 @@ export default function Opportunities() {
   const [viewMode, setViewMode] = useState('opportunities');
   const debugEnabled = import.meta.env.DEV || new URLSearchParams(window.location.search).get('debug') === '1';
   const opportunitiesParams = useMemo(
-    () => ({ limit: 200, min_price: minPrice, profile }),
-    [minPrice, profile],
+    () => ({
+      limit: 200,
+      profile,
+      score_mode: scoreMode,
+      min_price: minPrice,
+      min_price_gp: minPrice,
+      min_volume: 0,
+      min_roi_pct: 0,
+      min_profit_gp: 0,
+      min_total_profit_gp: 0,
+      value_mode: valueMode,
+      min_profit_per_item_gp: minProfitPerItemGp,
+    }),
+    [minPrice, profile, scoreMode, valueMode, minProfitPerItemGp],
   );
   const opportunitiesRequestUrl = useMemo(() => {
     const qs = new URLSearchParams(opportunitiesParams).toString();
@@ -331,7 +365,9 @@ export default function Opportunities() {
   const opps = useMemo(() => raw?.items || [], [raw]);
   const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
   const activeMode = raw?.profile || 'balanced';
+  const activeScoreMode = raw?.score_mode || scoreMode;
   const apiCount = Number(raw?.count || 0);
+  const filtersApplied = raw?.filters_applied || null;
   const lastUpdated = timeAgo(raw?.generated_at);
   const activeTrades = tradeData?.items || [];
   const slotsUsed = tradeData?.slots_used || 0;
@@ -380,32 +416,36 @@ export default function Opportunities() {
     }
 
     if (filter === 'High Volume') items = items.filter(o => (o.volume_5m || 0) >= 500);
-    else if (filter === 'High Value 1M+') items = items.filter(o => (o.buy_price || 0) >= 1_000_000);
-    else if (filter === 'High Value 10M+') items = items.filter(o => (o.buy_price || 0) >= 10_000_000);
     else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume_5m || 1)) - (a.potential_profit * (a.volume_5m || 1)));
     else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
 
+    const sortKey = (activeScoreMode === 'margin_hunter' && sortCol === 'flip_score')
+      ? 'margin_hunter_score'
+      : sortCol;
     items.sort((a, b) => {
-      const av = a[sortCol] ?? 0;
-      const bv = b[sortCol] ?? 0;
+      const av = a[sortKey] ?? 0;
+      const bv = b[sortKey] ?? 0;
       return sortDir === 'asc' ? av - bv : bv - av;
     });
 
     return items;
-  }, [opps, filter, sortCol, sortDir, search]);
+  }, [opps, filter, sortCol, sortDir, search, activeScoreMode]);
 
   const summaryStats = useMemo(() => {
     if (!filtered.length) return null;
     const avgMargin  = filtered.reduce((s, o) => s + (o.margin_pct ?? 0), 0) / filtered.length;
-    const avgScore   = filtered.reduce((s, o) => s + (o.flip_score ?? 0), 0) / filtered.length;
+    const avgScore   = filtered.reduce((s, o) => s + ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0), 0) / filtered.length;
     const totalProfit= filtered.reduce((s, o) => s + (o.potential_profit ?? 0), 0);
     const totalVol   = filtered.reduce((s, o) => s + (o.volume_5m ?? 0), 0);
     const best       = filtered.reduce(
-      (b, o) => (o.flip_score ?? 0) > (b.flip_score ?? 0) ? o : b,
+      (b, o) => (
+        ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0)
+        > ((activeScoreMode === 'margin_hunter' ? b.margin_hunter_score : b.flip_score) ?? 0)
+      ) ? o : b,
       filtered[0],
     );
     return { avgMargin, avgScore, totalProfit, totalVol, best };
-  }, [filtered]);
+  }, [filtered, activeScoreMode]);
 
   const th = (label, col) => (
     <th
@@ -427,7 +467,7 @@ export default function Opportunities() {
             <div><strong>opportunitiesRequestUrl:</strong> {opportunitiesRequestUrl}</div>
             <div>
               <strong>response:</strong>{' '}
-              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}
+              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}, score_mode={raw?.score_mode ?? '—'}
             </div>
             <div>
               <strong>firstItem:</strong>{' '}
@@ -438,6 +478,8 @@ export default function Opportunities() {
       )}
 
       {/* ── Header ── */}
+      <MarketSearchPanel />
+
       <div className="page-header">
         <div>
           <h2 className="page-title">Opportunities</h2>
@@ -449,12 +491,23 @@ export default function Opportunities() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <select
             value={profile}
-            onChange={e => setProfile(e.target.value)}
+            onChange={e => {
+              const next = e.target.value;
+              setProfile(next);
+            }}
             style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
           >
             <option value="conservative">Conservative</option>
             <option value="balanced">Balanced</option>
             <option value="aggressive">Aggressive</option>
+          </select>
+          <select
+            value={scoreMode}
+            onChange={e => setScoreMode(e.target.value)}
+            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
+          >
+            <option value="balanced">Balanced</option>
+            <option value="margin_hunter">Margin Hunter</option>
           </select>
           <button
             className={`pill ${autoRefresh ? 'active' : ''}`}
@@ -478,6 +531,39 @@ export default function Opportunities() {
 
       <div className="filter-bar" style={{ marginBottom: 12 }}>
         <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
+        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>
+          Score: {activeScoreMode === 'margin_hunter' ? 'Margin Hunter' : 'Balanced'}
+        </span>
+      </div>
+
+      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {['all', '1m', '10m'].map((mode) => (
+          <button
+            key={mode}
+            className={`pill ${valueMode === mode ? 'active' : ''}`}
+            onClick={() => setValueMode(mode)}
+          >
+            Value: {mode}
+          </button>
+        ))}
+      </div>
+
+      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        <span className="text-muted" style={{ fontSize: 12, alignSelf: 'center' }}>Min profit/item:</span>
+        {[
+          { label: 'Off', gp: 0 },
+          { label: '100gp+', gp: 100 },
+          { label: '500gp+', gp: 500 },
+          { label: '2k+', gp: 2000 },
+        ].map(({ label, gp }) => (
+          <button
+            key={gp}
+            className={`pill ${minProfitPerItemGp === gp ? 'active' : ''}`}
+            onClick={() => setMinProfitPerItemGp(gp)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {/* Summary Stats */}
@@ -488,7 +574,18 @@ export default function Opportunities() {
             { title: 'Avg Score',         value: loading ? '…' : (summaryStats?.avgScore.toFixed(0) + '/100'),color: null },
             { title: 'Avg Margin',        value: loading ? '…' : (summaryStats?.avgMargin.toFixed(1) + '%'),  color: (summaryStats?.avgMargin ?? 0) > 0 ? 'var(--green)' : null },
             { title: 'Total Liq Score',   value: loading ? '…' : summaryStats?.totalVol.toFixed(0),           color: null },
-            { title: 'Best Opportunity',  value: loading ? '…' : (summaryStats?.best?.name || summaryStats?.best?.item_name), sub: summaryStats?.best ? `score ${summaryStats.best.flip_score?.toFixed(0)}` : null, color: 'var(--green)' },
+            {
+              title: 'Best Opportunity',
+              value: loading ? '…' : (summaryStats?.best?.name || summaryStats?.best?.item_name),
+              sub: summaryStats?.best
+                ? `score ${(
+                  activeScoreMode === 'margin_hunter'
+                    ? summaryStats.best.margin_hunter_score
+                    : summaryStats.best.flip_score
+                )?.toFixed(0)}`
+                : null,
+              color: 'var(--green)',
+            },
           ].map(({ title, value, sub, color }) => (
             <div key={title} className="card" style={{ padding: '14px 16px' }}>
               <div className="card-title">{title}</div>
@@ -505,7 +602,12 @@ export default function Opportunities() {
           <button
             key={f.key}
             className={`pill ${filter === f.key ? 'active' : ''}`}
-            onClick={() => setFilter(f.key)}
+            onClick={() => {
+              setFilter(f.key);
+              if (f.key === 'High Value 1M+') setValueMode('1m');
+              else if (f.key === 'High Value 10M+') setValueMode('10m');
+              else setValueMode('all');
+            }}
             title={f.desc}
           >
             {f.icon && <f.icon size={11} style={{ marginRight: 3, verticalAlign: 'middle' }} />}
@@ -601,7 +703,14 @@ export default function Opportunities() {
         ) : apiCount === 0 ? (
           <div className="empty">
             <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
-            No opportunities in cache yet.
+            {filtersApplied && (
+              filtersApplied.value_mode !== 'all'
+              || Number(filtersApplied.min_profit_per_item_gp || 0) > 0
+              || Number(filtersApplied.min_total_profit_gp || 0) > 0
+              || Number(filtersApplied.min_price_gp || 0) > 0
+            )
+              ? `No items in ${filtersApplied.value_mode || 'this mode'} right now — try all or adjust filters.`
+              : 'No opportunities in cache yet.'}
           </div>
         ) : filtered.length === 0 ? (
           <div className="empty">
@@ -614,7 +723,7 @@ export default function Opportunities() {
               <tr>
                 <th style={{ width: 30 }}>#</th>
                 <th>Item</th>
-                {th('RUNE SCORE', 'flip_score')}
+                {th(activeScoreMode === 'margin_hunter' ? 'MARGIN SCORE' : 'RUNE SCORE', 'flip_score')}
                 {th('Buy', 'buy_price')}
                 {th('Sell', 'sell_price')}
                 {th('Margin', 'margin_gp')}
@@ -660,12 +769,23 @@ export default function Opportunities() {
                               {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR
                             </div>
                           )}
+                          {Number(opp.qty_suggested || 0) > 0 && (
+                            <div
+                              className="text-muted"
+                              style={{ fontSize: 10 }}
+                              title={Number(opp.ge_limit_4h || 0) > 0 ? `GE limit: ${Number(opp.ge_limit_4h).toLocaleString()} / 4h` : 'No GE limit data'}
+                            >
+                              Qty {formatQty(opp.qty_suggested)}
+                              {(Number(opp.ge_limit_4h || 0) > 0 && Number(opp.qty_raw ?? opp.qty_suggested ?? 0) > Number(opp.qty_suggested || 0)) ? ' (GE cap)' : ''}
+                              {Number(opp.ge_limit_4h || 0) > 0 ? ` · GE limit ${formatQty(opp.ge_limit_4h)} / 4h` : ''}
+                            </div>
+                          )}
                         </div>
                       </div>
                     </td>
                     <td>
-                      <span className={`badge ${scoreColor(opp.flip_score)}`}>
-                        {opp.flip_score?.toFixed(0)}
+                      <span className={`badge ${scoreColor(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)}`}>
+                        {(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)?.toFixed(0)}
                       </span>
                     </td>
                     <td className="gp text-green">{formatGP(opp.buy_price)}</td>
