@@ -4,7 +4,7 @@ import {
   RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
   ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle, Check,
 } from 'lucide-react';
-import { api } from '../api/client';
+import { api, API_BASE } from '../api/client';
 import { useApi } from '../hooks/useApi';
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -290,13 +290,21 @@ export default function Opportunities() {
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
   const [viewMode, setViewMode] = useState('opportunities');
-
+  const debugEnabled = import.meta.env.DEV || new URLSearchParams(window.location.search).get('debug') === '1';
+  const opportunitiesParams = useMemo(
+    () => ({ limit: 200, min_price: minPrice, profile }),
+    [minPrice, profile],
+  );
+  const opportunitiesRequestUrl = useMemo(() => {
+    const qs = new URLSearchParams(opportunitiesParams).toString();
+    return `${API_BASE}/opportunities${qs ? `?${qs}` : ''}`;
+  }, [opportunitiesParams]);
   const { data: raw, loading, error, reload } = useApi(
     ({ signal }) => api.getOpportunities(
-      { limit: 200, min_price: minPrice, profile },
+      opportunitiesParams,
       { signal, timeoutMs: 15000 },
     ),
-    [minPrice, profile],
+    [opportunitiesParams],
     autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
   );
   const { data: tradeData, reload: reloadTrades } = useApi(
@@ -307,6 +315,18 @@ export default function Opportunities() {
     () => api.getDumps(),
     [], 120000,
   );
+
+  const firstOpportunityExample = useMemo(() => {
+    const first = raw?.items?.[0];
+    if (!first) return null;
+    return {
+      name: first.name,
+      buy_price: first.buy_price,
+      sell_price: first.sell_price,
+      volume_5m: first.volume_5m,
+      flip_score: first.flip_score,
+    };
+  }, [raw]);
 
   const opps = useMemo(() => raw?.items || [], [raw]);
   const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
@@ -399,6 +419,24 @@ export default function Opportunities() {
 
   return (
     <div>
+      {debugEnabled && (
+        <div className="card" style={{ marginBottom: 12, border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.08)' }}>
+          <div style={{ padding: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, lineHeight: 1.5 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6, color: '#f59e0b' }}>Debug banner (temporary)</div>
+            <div><strong>apiBaseUrl:</strong> {API_BASE}</div>
+            <div><strong>opportunitiesRequestUrl:</strong> {opportunitiesRequestUrl}</div>
+            <div>
+              <strong>response:</strong>{' '}
+              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}
+            </div>
+            <div>
+              <strong>firstItem:</strong>{' '}
+              {firstOpportunityExample ? JSON.stringify(firstOpportunityExample) : '—'}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Header ── */}
       <div className="page-header">
         <div>
