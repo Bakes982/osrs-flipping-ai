@@ -1,6 +1,6 @@
 // API base URL: VITE_API_URL must be set for production (Vercel env vars).
 // Dev server (port 5173) falls back to localhost backend.
-const API_BASE = import.meta.env.VITE_API_URL
+export const API_BASE = import.meta.env.VITE_API_URL
   || (window.location.port === '5173'
     ? 'http://localhost:8001/api'
     : 'https://osrs-flipping-ai-backend-production.up.railway.app/api');
@@ -351,5 +351,3 @@ export function createPriceSocket(onMessage, onStatusChange) {
   };
 }
 
-// Export the base URL for use elsewhere
-export { API_BASE };
