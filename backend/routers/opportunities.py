@@ -13,8 +13,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-import httpx
-
 # Ensure project root is on sys.path so we can import top-level modules
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
@@ -208,124 +206,8 @@ def _normalize_item(m: dict) -> dict:
     return out
 
 
-_WIKI_BASE = "https://prices.runescape.wiki/api/v1/osrs"
-_WIKI_HEADERS = {"User-Agent": "osrs-flipping-ai/2.0 (https://github.com/Bakes982/osrs-flipping-ai)"}
-
-
-async def _direct_wiki_scan(min_margin_gp: int = 100) -> List[Dict[str, Any]]:
-    """Fetch live prices directly from the OSRS Wiki and compute margins.
-
-    Used as a fallback when the Redis cache is empty or the background worker
-    has not yet run.  Requires no MongoDB, no worker, no Redis — just the
-    public Wiki prices API.  Results are sorted by expected GP profit so the
-    best flips appear first.
-    """
-    try:
-        async with httpx.AsyncClient(headers=_WIKI_HEADERS, timeout=15.0) as client:
-            latest_r, vol_r, mapping_r = await asyncio.gather(
-                client.get(f"{_WIKI_BASE}/latest"),
-                client.get(f"{_WIKI_BASE}/5m"),
-                client.get(f"{_WIKI_BASE}/mapping"),
-                return_exceptions=True,
-            )
-    except Exception:
-        return []
-
-    if isinstance(latest_r, Exception) or latest_r.status_code != 200:
-        return []
-
-    try:
-        latest: Dict = latest_r.json().get("data", {})
-    except Exception:
-        return []
-
-    try:
-        vol_data: Dict = vol_r.json().get("data", {}) if not isinstance(vol_r, Exception) else {}
-    except Exception:
-        vol_data = {}
-
-    mapping: Dict[int, dict] = {}
-    try:
-        for entry in (mapping_r.json() if not isinstance(mapping_r, Exception) else []):
-            if "id" in entry:
-                mapping[int(entry["id"])] = entry
-    except Exception:
-        pass
-
-    results: List[Dict[str, Any]] = []
-    for item_id_str, instant in latest.items():
-        try:
-            item_id = int(item_id_str)
-            avg = vol_data.get(item_id_str, {})
-
-            # Use instant prices; fall back to 5m averages for slow-moving items.
-            high = int(instant.get("high") or avg.get("avgHighPrice") or 0)
-            low  = int(instant.get("low")  or avg.get("avgLowPrice")  or 0)
-            if high <= 0 or low <= 0:
-                continue
-            if high < low:
-                high, low = low, high
-
-            tax    = min(int(high * 0.01), 5_000_000)
-            margin = high - low - tax
-            if margin < min_margin_gp:
-                continue
-
-            vol       = int((avg.get("highPriceVolume") or 0) + (avg.get("lowPriceVolume") or 0))
-            meta      = mapping.get(item_id, {})
-            name      = meta.get("name") or f"Item {item_id}"
-            buy_limit = int(meta.get("limit") or 0) or 125
-
-            roi_pct         = round(margin / max(low, 1) * 100.0, 2)
-            qty             = min(buy_limit, max(1, int(10_000_000 // max(low, 1))))
-            expected_profit = margin * qty
-
-            gp_score  = min(1.0, expected_profit / 5_000_000.0)
-            roi_score = min(1.0, roi_pct / 5.0)
-            vol_score = min(1.0, vol / 100.0) if vol > 0 else 0.0
-            flip_score = round((0.55 * gp_score + 0.30 * roi_score + 0.15 * vol_score) * 65.0)
-
-            reason_lines = [f"• {roi_pct:.1f}% margin after tax"]
-            if vol > 0:
-                reason_lines.append(f"• {vol:,} traded in last 5m")
-
-            results.append({
-                "item_id":        item_id,
-                "name":           name,
-                "buy_price":      low,
-                "sell_price":     high,
-                "instant_buy":    high,
-                "instant_sell":   low,
-                "margin":         margin,
-                "margin_pct":     roi_pct,
-                "roi_pct":        roi_pct,
-                "tax":            tax,
-                "expected_profit":   expected_profit,
-                "potential_profit":  expected_profit,
-                "volume":    vol,
-                "volume_5m": vol,
-                "flip_score":     float(flip_score),
-                "qty_suggested":  qty,
-                "trend":          None,
-                "ml_confidence":  0.4,
-                "spread_score":   0.0,
-                "volume_score":   0.0,
-                "freshness_score":0.0,
-                "trend_score":    0.0,
-                "history_score":  0.0,
-                "stability_score":0.0,
-                "ml_signal_score":0.0,
-                "win_rate":       None,
-                "total_flips":    0,
-                "avg_profit":     None,
-                "position_sizing":{},
-                "reason":         "\n".join(reason_lines),
-            })
-        except Exception:
-            continue
-
-    results.sort(key=lambda x: x.get("flip_score", 0.0), reverse=True)
-    return results
+import logging as _log
+_opp_logger = _log.getLogger(__name__)
 
 
 @router.get("")
@@ -363,89 +245,75 @@ async def list_opportunities(
     effective_min_profit_gp = int(min_profit_gp) if min_profit_gp is not None else int(prefs["min_profit_gp"])
 
     redis = get_redis()
-    raw = redis.get(f"flips:top100:{active_profile}")
+    cache_key = f"flips:top100:{active_profile}"
+    raw = redis.get(cache_key)
 
-    # --- Try the Redis cache first ---
+    _empty_response = {
+        "generated_at": None,
+        "count": 0,
+        "items": [],
+        "profile": active_profile,
+        "prefs": {
+            "min_price": effective_min_price,
+            "min_volume": effective_min_volume,
+            "min_roi_pct": effective_min_roi_pct,
+            "min_profit_gp": effective_min_profit_gp,
+        },
+    }
+
+    if not raw:
+        _opp_logger.info(
+            "OPP_CACHE_MISS profile=%s min_price=%s min_volume=%s min_roi_pct=%s",
+            active_profile, effective_min_price, effective_min_volume, effective_min_roi_pct,
+        )
+        return _empty_response
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return _empty_response
+
+    source_items = parsed.get("flips") if isinstance(parsed, dict) else None
+    if not isinstance(source_items, list):
+        source_items = parsed.get("items") if isinstance(parsed, dict) else []
+
     filtered_items: List[Dict[str, Any]] = []
-    generated_at: Any = None
+    for item in source_items:
+        if not isinstance(item, dict):
+            continue
+        mapped = _map_cached_flip(item)
+        buy_price = int(mapped.get("buy_price") or 0)
+        volume_5m = int(mapped.get("volume_5m") or mapped.get("volume") or 0)
+        roi_pct   = float(mapped.get("roi_pct") or 0)
+        profit_gp = int(mapped.get("expected_profit") or mapped.get("potential_profit") or 0)
 
-    if raw:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            parsed = {}
+        if buy_price < effective_min_price:
+            continue
+        if volume_5m < effective_min_volume:
+            continue
+        if roi_pct < effective_min_roi_pct:
+            continue
+        if profit_gp < effective_min_profit_gp:
+            continue
+        filtered_items.append(mapped)
 
-        source_items = parsed.get("flips") if isinstance(parsed, dict) else None
-        if not isinstance(source_items, list):
-            source_items = parsed.get("items") if isinstance(parsed, dict) else []
-
-        for item in source_items:
-            if not isinstance(item, dict):
-                continue
-            mapped = _map_cached_flip(item)
-            buy_price = int(mapped.get("buy_price") or 0)
-            volume_5m = int(mapped.get("volume_5m") or mapped.get("volume") or 0)
-            roi_pct   = float(mapped.get("roi_pct") or 0)
-            profit_gp = int(mapped.get("expected_profit") or mapped.get("potential_profit") or 0)
-
-            if buy_price < effective_min_price:
-                continue
-            if volume_5m < effective_min_volume:
-                continue
-            if roi_pct < effective_min_roi_pct:
-                continue
-            if profit_gp < effective_min_profit_gp:
-                continue
-            filtered_items.append(mapped)
-
-        generated_at = _parse_generated_at(parsed.get("ts") if isinstance(parsed, dict) else None)
-        if generated_at is None and isinstance(parsed, dict):
-            generated_at = parsed.get("generated_at")
-
-    # --- Fallback: direct live scan from Wiki prices API ---
-    # Triggered when: (a) Redis cache is empty, OR (b) all cached items were
-    # filtered out by the user's settings.  This guarantees the page always
-    # shows real data as long as the Wiki prices API is reachable — no
-    # dependency on the background worker or on MongoDB.
     if not filtered_items:
-        try:
-            wiki_items = await _direct_wiki_scan(min_margin_gp=100)
-            now_ts = datetime.now(timezone.utc).isoformat()
-            for item in wiki_items:
-                buy_price = int(item.get("buy_price") or 0)
-                roi_pct   = float(item.get("roi_pct") or 0)
-                profit_gp = int(item.get("expected_profit") or 0)
-
-                if buy_price < effective_min_price:
-                    continue
-                # NOTE: volume filter intentionally skipped for live-scan items.
-                # Expensive infrequently-traded items may have 0 volume in the
-                # 5m window yet still have a genuine real-time margin.
-                if roi_pct < effective_min_roi_pct:
-                    continue
-                if profit_gp < effective_min_profit_gp:
-                    continue
-                filtered_items.append(item)
-
-            # Cache the live-scan results for 60 s so rapid re-requests are
-            # served from Redis rather than hitting the Wiki API every time.
-            if filtered_items:
-                generated_at = datetime.now(timezone.utc).timestamp()
-                try:
-                    redis.setex(
-                        f"flips:top100:{active_profile}",
-                        60,
-                        json.dumps({"ts": now_ts, "flips": filtered_items}),
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _opp_logger.info(
+            "OPP_CACHE_MISS profile=%s min_price=%s min_volume=%s min_roi_pct=%s (cache had %d items, all filtered)",
+            active_profile, effective_min_price, effective_min_volume, effective_min_roi_pct,
+            len(source_items),
+        )
+        return _empty_response
 
     filtered_items.sort(key=lambda x: float(x.get("flip_score") or 0), reverse=True)
     filtered_items = filtered_items[:limit]
+
+    generated_at = _parse_generated_at(parsed.get("ts") if isinstance(parsed, dict) else None)
+    if generated_at is None and isinstance(parsed, dict):
+        generated_at = parsed.get("generated_at")
 
     return {
         "generated_at": generated_at,
