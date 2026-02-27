@@ -43,6 +43,11 @@ class TradeEventRequest(BaseModel):
     note: Optional[str] = None
 
 
+class AdjustOffersRequest(BaseModel):
+    buy_target: int = Field(ge=0)
+    sell_target: int = Field(ge=0)
+
+
 def _trades_collection(db):
     return db._db["strategy_trades"]
 
@@ -224,6 +229,29 @@ async def post_trade_event(trade_id: str, body: TradeEventRequest):
 
     return await asyncio.to_thread(_sync)
 
+
+@router.patch("/{trade_id}/offers")
+async def adjust_trade_offers(trade_id: str, body: AdjustOffersRequest):
+    """Update buy_target / sell_target on an active trade (adjust offers)."""
+    def _sync() -> Dict[str, Any]:
+        db = get_db()
+        try:
+            coll = _trades_collection(db)
+            result = coll.update_one(
+                {"trade_id": trade_id, "state": {"$in": list(ACTIVE_STATES)}},
+                {"$set": {
+                    "buy_target": body.buy_target,
+                    "sell_target": body.sell_target,
+                    "updated_at": _now(),
+                }},
+            )
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="Active trade not found")
+            return {"ok": True}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_sync)
 
 
 
