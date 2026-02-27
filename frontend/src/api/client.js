@@ -193,6 +193,12 @@ export const api = {
       body: JSON.stringify({ event, note }),
     });
   },
+  adjustTradeOffers(tradeId, { buyTarget, sellTarget }) {
+    return fetchJSON(`/trades/${encodeURIComponent(tradeId)}/offers`, {
+      method: 'PATCH',
+      body: JSON.stringify({ buy_target: buyTarget, sell_target: sellTarget }),
+    });
+  },
 
   // Predictions
   getPredictions(itemId, horizon) {

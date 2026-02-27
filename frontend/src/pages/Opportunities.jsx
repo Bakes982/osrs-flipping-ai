@@ -2,8 +2,8 @@ import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   RefreshCw, Search, TrendingUp, TrendingDown, Minus, Shield,
-  BarChart3, Zap, Check, AlertTriangle, Sword, FlaskConical,
-  Pickaxe, ShoppingBag, Trophy, Filter,
+  BarChart3, Check, AlertTriangle, Sword, FlaskConical,
+  Pickaxe, ShoppingBag, Trophy, Filter, Wallet, Edit2, X,
 } from 'lucide-react';
 import { api, API_BASE } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -43,6 +43,17 @@ function timeAgo(ts) {
 }
 
 const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
+
+function parseGP(str) {
+  if (!str) return 0;
+  const s = String(str).replace(/,/g, '').trim().toLowerCase();
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return 0;
+  if (s.endsWith('b')) return Math.round(n * 1e9);
+  if (s.endsWith('m')) return Math.round(n * 1e6);
+  if (s.endsWith('k')) return Math.round(n * 1e3);
+  return Math.round(n);
+}
 
 /* ── Item category classifier ────────────────────────────────────────────── */
 
@@ -514,6 +525,125 @@ function SkeletonCard() {
   );
 }
 
+/* ── Active Trades / Adjust Offers Panel ─────────────────────────────────── */
+
+function ActiveTradesPanel({ trades, onAdjust, onReload }) {
+  const [adjustingId, setAdjustingId] = useState(null);
+  const [buyDraft, setBuyDraft]       = useState('');
+  const [sellDraft, setSellDraft]     = useState('');
+  const [saving, setSaving]           = useState(false);
+
+  if (!trades || trades.length === 0) return null;
+
+  const STATE_COLOR = {
+    BUY_PENDING: '#f59e0b', BUYING: '#06b6d4',
+    HOLDING: '#a78bfa', SELLING: '#22c55e',
+  };
+
+  const openAdjust = (t) => {
+    setAdjustingId(t.trade_id);
+    setBuyDraft(String(t.buy_target || ''));
+    setSellDraft(String(t.sell_target || ''));
+  };
+
+  const saveAdjust = async (tradeId) => {
+    setSaving(true);
+    try {
+      await onAdjust(tradeId, { buyTarget: parseGP(buyDraft), sellTarget: parseGP(sellDraft) });
+      setAdjustingId(null);
+      onReload();
+    } catch (e) {
+      window.alert(e.message || 'Failed to adjust offers');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{
+      background: 'var(--bg-secondary)', border: '1px solid var(--border)',
+      borderRadius: 12, padding: '12px 14px', marginBottom: 16,
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: 'var(--text-muted)', marginBottom: 10 }}>
+        Active Slots ({trades.length})
+      </div>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+        {trades.map(t => {
+          const isAdj = adjustingId === t.trade_id;
+          const sc = STATE_COLOR[t.state] || '#6b7280';
+          return (
+            <div key={t.trade_id} style={{
+              background: 'rgba(0,0,0,0.18)', border: `1px solid ${isAdj ? sc : 'var(--border)'}`,
+              borderRadius: 10, padding: '10px 12px', minWidth: 200, flex: '1 1 200px', maxWidth: 280,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <img src={IMG(t.item_id)} alt="" width={26} height={26}
+                  style={{ imageRendering: 'pixelated', borderRadius: 4, background: 'rgba(0,0,0,0.3)', flexShrink: 0 }}
+                  onError={e => { e.target.style.display = 'none'; }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.name}</div>
+                  <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 4, background: `${sc}20`, color: sc }}>
+                    {t.state}
+                  </span>
+                </div>
+                {!isAdj ? (
+                  <button onClick={() => openAdjust(t)} title="Adjust offers" style={{
+                    padding: '4px 6px', borderRadius: 6, border: '1px solid var(--border)',
+                    background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    <Edit2 size={11} />
+                  </button>
+                ) : (
+                  <button onClick={() => setAdjustingId(null)} style={{
+                    padding: '4px 6px', borderRadius: 6, border: '1px solid var(--border)',
+                    background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
+
+              {!isAdj ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  <div>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 2 }}>BUY</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#4ade80' }}>{formatGP(t.buy_target)}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 2 }}>SELL</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#38bdf8' }}>{formatGP(t.sell_target)}</div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                    <div>
+                      <div style={{ fontSize: 9, color: '#4ade80', marginBottom: 3, fontWeight: 700 }}>BUY</div>
+                      <input value={buyDraft} onChange={e => setBuyDraft(e.target.value)}
+                        style={{ width: '100%', padding: '4px 6px', borderRadius: 5, border: '1px solid #4ade8055', background: 'rgba(0,0,0,0.3)', color: '#4ade80', fontSize: 12, fontWeight: 700, boxSizing: 'border-box' }} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 9, color: '#38bdf8', marginBottom: 3, fontWeight: 700 }}>SELL</div>
+                      <input value={sellDraft} onChange={e => setSellDraft(e.target.value)}
+                        style={{ width: '100%', padding: '4px 6px', borderRadius: 5, border: '1px solid #38bdf855', background: 'rgba(0,0,0,0.3)', color: '#38bdf8', fontSize: 12, fontWeight: 700, boxSizing: 'border-box' }} />
+                    </div>
+                  </div>
+                  <button disabled={saving} onClick={() => saveAdjust(t.trade_id)} style={{
+                    padding: '5px 0', borderRadius: 6, border: '1px solid rgba(34,197,94,0.4)',
+                    background: 'rgba(34,197,94,0.12)', color: '#22c55e', fontSize: 11, fontWeight: 700, cursor: 'pointer',
+                  }}>
+                    {saving ? 'Saving…' : 'Save offers'}
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ── Main Component ──────────────────────────────────────────────────────── */
 
 export default function Opportunities() {
@@ -529,6 +659,8 @@ export default function Opportunities() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
+  const [coinBalanceRaw, setCoinBalanceRaw] = useState('');
+  const coinBalance = parseGP(coinBalanceRaw);
 
   const debugEnabled = import.meta.env.DEV || new URLSearchParams(window.location.search).get('debug') === '1';
 
@@ -613,6 +745,13 @@ export default function Opportunities() {
       items = items.filter(o => (o.name || o.item_name)?.toLowerCase().includes(q) || String(o.item_id).includes(q));
     }
 
+    if (coinBalance > 0) {
+      items = items.filter(o => {
+        const cost = (o.buy_price || 0) * Math.max(1, o.qty_suggested || 1);
+        return cost <= coinBalance;
+      });
+    }
+
     if (category !== 'all') {
       items = items.filter(o => classifyItem(o) === category);
     }
@@ -626,7 +765,7 @@ export default function Opportunities() {
     });
 
     return items;
-  }, [opps, category, search, sortCol, sortDir, activeScoreMode]);
+  }, [opps, category, search, coinBalance, sortCol, sortDir, activeScoreMode]);
 
   /* ── Summary stats ── */
   const summaryStats = useMemo(() => {
@@ -735,9 +874,32 @@ export default function Opportunities() {
         </div>
       </div>
 
+      {/* ── Active trades / adjust offers ── */}
+      <ActiveTradesPanel
+        trades={activeTrades}
+        onAdjust={(tradeId, offers) => api.adjustTradeOffers(tradeId, offers)}
+        onReload={reloadTrades}
+      />
+
       {/* ── Sub-filters (non-dumps) ── */}
       {category !== 'dumps' && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+          {/* Coin balance filter */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 8, border: '1px solid var(--border)', background: coinBalance > 0 ? 'rgba(34,197,94,0.06)' : 'transparent' }}>
+            <Wallet size={12} color={coinBalance > 0 ? '#22c55e' : 'var(--text-muted)'} />
+            <input
+              type="text"
+              placeholder="Your GP (e.g. 50M)"
+              value={coinBalanceRaw}
+              onChange={e => setCoinBalanceRaw(e.target.value)}
+              style={{ width: 120, border: 'none', background: 'transparent', color: coinBalance > 0 ? '#22c55e' : 'var(--text-primary)', fontSize: 11, outline: 'none' }}
+            />
+            {coinBalance > 0 && (
+              <button onClick={() => setCoinBalanceRaw('')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 0 }}>
+                <X size={10} />
+              </button>
+            )}
+          </div>
           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Value:</span>
           {['all', '1m', '10m'].map(m => (
             <button key={m} className={`pill ${valueMode === m ? 'active' : ''}`}
@@ -774,7 +936,7 @@ export default function Opportunities() {
           display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
           gap: 10, marginBottom: 16,
         }}>
-          {category !== 'dumps' ? [
+          {(category !== 'dumps' ? [
             { label: 'Showing',     value: summaryStats.count },
             { label: 'Avg Score',   value: `${summaryStats.avgScore?.toFixed(0)}/100` },
             { label: 'Avg Margin',  value: `${summaryStats.avgMargin?.toFixed(1)}%`, color: (summaryStats.avgMargin ?? 0) > 0 ? '#22c55e' : undefined },
@@ -783,7 +945,7 @@ export default function Opportunities() {
             { label: 'Dumps',        value: summaryStats.count },
             { label: 'Total Est',    value: `+${formatGP(summaryStats.totalProfit)}`, color: '#22c55e' },
             { label: 'Top Dump',     value: summaryStats.best?.name, sub: summaryStats.best?.sub, color: '#ef4444' },
-          ].map(({ label, value, sub, color }) => (
+          ]).map(({ label, value, sub, color }) => (
             <div key={label} className="card" style={{ padding: '12px 14px' }}>
               <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: 'var(--text-muted)', marginBottom: 4 }}>{label}</div>
               <div style={{ fontSize: sub ? 13 : 18, fontWeight: 700, color: color || 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value ?? '—'}</div>
