@@ -213,6 +213,7 @@ def _map_cached_flip(item: Dict[str, Any]) -> Dict[str, Any]:
         "total_flips": int(item.get("total_flips") or 0),
         "avg_profit": item.get("avg_profit"),
         "position_sizing": item.get("position_sizing") or {},
+        "qty_suggested": int(item.get("qty_suggested") or 0),
     }
     mapped["reason"] = _score_to_reason(item | mapped)
     return mapped
@@ -392,6 +393,10 @@ def _margin_hunter_score(item: Dict[str, Any], value_mode: str) -> float:
     return round(max(0.0, score), 3)
 
 
+# Module logger (used by the list endpoint for cache-miss diagnostics).
+_opp_logger = logger
+
+
 @router.get("")
 async def list_opportunities(
     request: Request,
@@ -458,25 +463,31 @@ async def list_opportunities(
     except Exception:
         ttl = -1
 
+    _empty_response = {
+        "generated_at": None,
+        "count": 0,
+        "items": [],
+        "profile": active_profile,
+        "value_mode": effective_value_mode,
+        "score_mode": effective_score_mode,
+        "filters_applied": filters_applied,
+    }
+
     if not raw:
+        _opp_logger.info(
+            "OPP_CACHE_MISS profile=%s value_mode=%s score_mode=%s",
+            active_profile, effective_value_mode, effective_score_mode,
+        )
         logger.info("OPP_API_READ key=%s hit=%s count=%d ttl=%s", key, False, 0, ttl)
-        return {
-            "generated_at": None,
-            "count": 0,
-            "items": [],
-            "profile": active_profile,
-            "value_mode": effective_value_mode,
-            "score_mode": effective_score_mode,
-            "filters_applied": filters_applied,
-        }
+        return _empty_response
 
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="ignore")
 
     try:
         parsed = json.loads(raw)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid cached opportunities payload: {exc}")
+    except Exception:
+        return _empty_response
 
     source_items = parsed.get("flips") if isinstance(parsed, dict) else None
     if not isinstance(source_items, list):
@@ -564,8 +575,15 @@ async def list_opportunities(
             continue
         if potential_profit_gp < min_total_profit_value:
             continue
-
         filtered_items.append(item)
+
+    if not filtered_items:
+        _opp_logger.info(
+            "OPP_CACHE_MISS profile=%s min_price=%s min_volume=%s min_roi_pct=%s (cache had %d items, all filtered)",
+            active_profile, effective_min_price, effective_min_volume, effective_min_roi_pct,
+            len(source_items),
+        )
+        return _empty_response
 
     if effective_score_mode == "margin_hunter":
         for item in filtered_items:

@@ -48,6 +48,7 @@ _TTL_SECONDS: int = 6 * 3600  # 6 hours
 # ---------------------------------------------------------------------------
 
 _mapping_cache: Optional[dict[int, str]] = None
+_limit_cache: Optional[dict[int, int]] = None
 _mapping_cache_ts: Optional[float] = None
 
 logger = logging.getLogger(__name__)
@@ -57,23 +58,30 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_mapping() -> dict[int, str]:
-    """Download the full item mapping from the OSRS Wiki and return {id: name}."""
+def _fetch_mapping() -> tuple[dict[int, str], dict[int, int]]:
+    """Download the full item mapping from the OSRS Wiki.
+
+    Returns (name_map, limit_map) where limit_map is {id: ge_buy_limit}.
+    """
     resp = requests.get(_MAPPING_URL, headers=_HEADERS, timeout=10)
     resp.raise_for_status()
     entries = resp.json()  # list of dicts
-    result: dict[int, str] = {}
+    names: dict[int, str] = {}
+    limits: dict[int, int] = {}
     for entry in entries:
         try:
-            result[int(entry["id"])] = str(entry["name"])
+            item_id = int(entry["id"])
+            names[item_id] = str(entry["name"])
+            if entry.get("limit"):
+                limits[item_id] = int(entry["limit"])
         except (KeyError, ValueError, TypeError):
             continue
-    return result
+    return names, limits
 
 
 def _ensure_cache_fresh() -> dict[int, str]:
     """Return the in-memory name mapping, refreshing it when stale or absent."""
-    global _mapping_cache, _mapping_cache_ts
+    global _mapping_cache, _limit_cache, _mapping_cache_ts
     now = time.time()
     needs_refresh = (
         _mapping_cache is None
@@ -82,17 +90,20 @@ def _ensure_cache_fresh() -> dict[int, str]:
     )
     if needs_refresh:
         try:
-            new_cache = _fetch_mapping()
-            _mapping_cache = new_cache
+            new_names, new_limits = _fetch_mapping()
+            _mapping_cache = new_names
+            _limit_cache = new_limits
             _mapping_cache_ts = now
             logger.info(
-                "item_name_resolver: mapping refreshed (%d items)", len(_mapping_cache)
+                "item_name_resolver: mapping refreshed (%d items, %d limits)",
+                len(_mapping_cache), len(_limit_cache),
             )
         except Exception as exc:
             logger.warning("item_name_resolver: mapping fetch failed: %s", exc)
             if _mapping_cache is None:
-                # First-ever fetch failed — use empty dict so the module stays usable
+                # First-ever fetch failed — use empty dicts so the module stays usable
                 _mapping_cache = {}
+                _limit_cache = {}
             # Do NOT update _mapping_cache_ts so the next call will retry
     return _mapping_cache  # type: ignore[return-value]
 
@@ -133,10 +144,23 @@ def resolve_item_name(item_id: int, fallback: Optional[str] = None) -> str:
     return f"Item {item_id}"
 
 
+def resolve_item_limit(item_id: int) -> Optional[int]:
+    """Return the GE 4-hour buy limit for *item_id*, or None if unknown.
+
+    Sourced from the same OSRS Wiki /mapping endpoint as resolve_item_name,
+    so it costs no extra network requests after the first call.
+    """
+    _ensure_cache_fresh()
+    if _limit_cache is None:
+        return None
+    return _limit_cache.get(int(item_id))
+
+
 def invalidate_cache() -> None:
     """Force the next call to re-fetch the mapping (useful in tests)."""
-    global _mapping_cache, _mapping_cache_ts
+    global _mapping_cache, _limit_cache, _mapping_cache_ts
     _mapping_cache = None
+    _limit_cache = None
     _mapping_cache_ts = None
 
 
