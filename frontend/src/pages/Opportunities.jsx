@@ -1,8 +1,9 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  RefreshCw, Search, TrendingUp, TrendingDown, Minus, Filter,
-  ArrowUpRight, Info, Zap, Shield, BarChart3, Target, AlertTriangle, Check,
+  RefreshCw, Search, TrendingUp, TrendingDown, Minus, Shield,
+  BarChart3, Zap, Check, AlertTriangle, Sword, FlaskConical,
+  Pickaxe, ShoppingBag, Trophy, Filter,
 } from 'lucide-react';
 import { api, API_BASE } from '../api/client';
 import { useApi } from '../hooks/useApi';
@@ -26,68 +27,6 @@ function formatQty(n) {
   return v.toLocaleString();
 }
 
-/* ── Score pill ──────────────────────────────────────────────────────────── */
-
-function scoreColor(score) {
-  if (score >= 70) return { bg: 'rgba(34,197,94,0.15)',  color: '#22c55e', border: 'rgba(34,197,94,0.3)' };
-  if (score >= 55) return { bg: 'rgba(6,182,212,0.15)',  color: '#06b6d4', border: 'rgba(6,182,212,0.3)' };
-  if (score >= 40) return { bg: 'rgba(245,158,11,0.15)', color: '#f59e0b', border: 'rgba(245,158,11,0.3)' };
-  return              { bg: 'rgba(239,68,68,0.15)',   color: '#ef4444', border: 'rgba(239,68,68,0.3)' };
-}
-
-function ScorePill({ score }) {
-  const { bg, color, border } = scoreColor(score ?? 0);
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-      minWidth: 38, padding: '2px 7px', borderRadius: 99,
-      background: bg, color, border: `1px solid ${border}`,
-      fontWeight: 700, fontSize: 13,
-    }}>
-      {score != null ? score.toFixed(0) : '—'}
-    </span>
-  );
-}
-
-/* ── Trend badge ─────────────────────────────────────────────────────────── */
-
-function trendBadge(trend) {
-  if (!trend) return { icon: '─',  color: '#06b6d4', label: 'Neutral' };
-  if (trend === 'STRONG_UP')   return { icon: '▲▲', color: '#22c55e', label: 'Strong Up' };
-  if (trend === 'UP')          return { icon: '▲',  color: '#22c55e', label: 'Up' };
-  if (trend === 'DOWN')        return { icon: '▼',  color: '#ef4444', label: 'Down' };
-  if (trend === 'STRONG_DOWN') return { icon: '▼▼', color: '#ef4444', label: 'Strong Down' };
-  return { icon: '─', color: '#06b6d4', label: 'Neutral' };
-}
-
-/* ── Small inline chip ───────────────────────────────────────────────────── */
-
-function Chip({ label, color }) {
-  return (
-    <span style={{
-      fontSize: 9, fontWeight: 700, letterSpacing: 0.3, textTransform: 'uppercase',
-      padding: '1px 5px', borderRadius: 4,
-      background: `${color}18`, color, border: `1px solid ${color}40`,
-    }}>
-      {label}
-    </span>
-  );
-}
-
-const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
-
-const FILTERS = [
-  { key: 'All', icon: null, desc: 'All items' },
-  { key: 'High Volume', icon: BarChart3, desc: 'Volume ≥ 500' },
-  { key: 'High Value 1M+', icon: TrendingUp, desc: 'Buy price ≥ 1M' },
-  { key: 'High Value 10M+', icon: TrendingUp, desc: 'Buy price ≥ 10M' },
-  { key: 'Low Risk', icon: Shield, desc: 'Stable / calm setups' },
-  { key: 'Best EV', icon: Zap, desc: 'Best expected value (profit × volume)' },
-];
-
-/* ── Skeleton loader row ─────────────────────────────────────────────────── */
-
-
 function timeAgo(ts) {
   if (!ts) return 'Never';
   let epoch = Number(ts);
@@ -103,223 +42,503 @@ function timeAgo(ts) {
   return `${Math.floor(delta / 3600)}h ago`;
 }
 
-function LoadingSkeletonRows({ rows = 8 }) {
+const IMG = (id) => `https://secure.runescape.com/m=itemdb_oldschool/obj_big.gif?id=${id}`;
+
+/* ── Item category classifier ────────────────────────────────────────────── */
+
+function classifyItem(opp) {
+  const name = (opp.name || opp.item_name || '').toLowerCase();
+
+  const SUPPLY = ['potion', 'brew', 'restore', 'shark', 'anglerfish', 'manta ray',
+    'karambwan', 'anti-', 'antivenin', 'antipoison', 'stamina', 'prayer', 'overload',
+    'divine', 'super combat', 'super attack', 'super strength', 'super defence',
+    'ranging potion', 'magic potion', 'super energy', 'agility potion',
+    'bastion potion', 'battlemage potion', 'dark crab', 'tuna potato', 'lobster',
+    'pizza', 'cake', 'pie', 'cooked', 'monkfish', 'swordfish', 'wine of'];
+  if (SUPPLY.some(k => name.includes(k))) return 'supplies';
+
+  const SKILLING = [' ore', ' bar', ' log', ' seed', ' herb', 'essence', 'feather',
+    'leather', 'dragon hide', 'd-hide', 'green hide', 'blue hide', 'red hide', 'black hide',
+    'raw ', 'grimy ', 'clean ', 'coal', 'flax', 'bowstring', 'wool', 'uncut ', 'cut ',
+    'sapphire', 'emerald', 'ruby', 'diamond', 'dragonstone', 'onyx', 'amethyst',
+    'cannonball', 'dart tip', 'arrowhead', 'arrow shaft', 'tooth half', 'loop half',
+    'fish', 'bone', 'ashes', 'dust', 'powder', 'planks', 'plank', 'lime', 'sand',
+    'bucket of', 'jar of', 'vial of', 'vial', 'knife', 'chisel', 'needle', 'thread'];
+  if (SKILLING.some(k => name.includes(k))) return 'skilling';
+
+  const PVP = ["vesta's", "statius'", "morrigan's", "zuriel's", 'corrupt dragon',
+    "craw's", "viggora's", "thammaron's", 'volatile orb', 'accursed sceptre',
+    'ancient godsword', 'forgotten brew', 'ancient cloak', 'ancient coif',
+    'ancient d\'hide'];
+  if (PVP.some(k => name.includes(k))) return 'pvp';
+
+  const PVM = ['torva', 'bandos', 'armadyl', 'justiciar', 'inquisitor', 'scythe',
+    'lance', 'twisted bow', 'blowpipe', 'sang', 'shadow', 'tumeken', 'osmumten',
+    'masori', 'ancestral', 'dharok', 'guthan', 'karil', 'torag', 'verac', 'ahrim',
+    'barrows', 'zenyte', 'torture', 'anguish', 'occult', 'berserker ring',
+    'archers ring', 'seers ring', 'tyrannical ring', 'treasonous ring',
+    'serpentine', 'pegasian', 'eternal', 'primordial', 'crystal helm',
+    'crystal body', 'crystal legs', 'bowfa', 'toxic blowpipe', 'toxic staff',
+    'slayer helmet', 'black mask', 'imbued', 'void knight', 'fighter torso',
+    'fire cape', 'infernal cape', 'avernic', 'dragon warhammer', 'elder maul',
+    'kodai', 'lightbearer', 'ultor', 'magus ring', 'bellator', 'venator',
+    'sanguinesti', 'elysian', 'spectral', 'arcane', 'ward', 'rapier', 'fang',
+    'partisan', 'vitur', 'noxious', 'blood fury', 'amulet of fury', 'brimstone',
+    'rune pouch', 'jar ', 'clue', 'heart of ', 'crystal key', "ava's",
+    "pegasian crystal", "eternal crystal", "primordial crystal"];
+  if (PVM.some(k => name.includes(k))) return 'pvm';
+
+  return 'merch';
+}
+
+/* ── Score colour ────────────────────────────────────────────────────────── */
+
+function scoreColor(score) {
+  if (score >= 70) return '#22c55e';
+  if (score >= 55) return '#06b6d4';
+  if (score >= 40) return '#f59e0b';
+  return '#ef4444';
+}
+
+function scoreRing(score) {
+  const pct  = Math.min(100, Math.max(0, score ?? 0));
+  const c    = scoreColor(pct);
+  const r    = 18;
+  const circ = 2 * Math.PI * r;
+  const dash = (pct / 100) * circ;
+  return { pct, c, r, circ, dash };
+}
+
+function ScoreRing({ score }) {
+  const { pct, c, r, circ, dash } = scoreRing(score);
   return (
-    <table className="data-table">
-      <thead>
-        <tr>
-          <th style={{ width: 30 }}>#</th><th>Item</th><th>RUNE SCORE</th><th>Buy</th><th>Sell</th><th>Margin</th><th>Profit</th><th>ROI</th><th>Vol</th><th>Trend</th><th>AI</th><th style={{ width: 30 }}></th>
-        </tr>
-      </thead>
-      <tbody>
-        {Array.from({ length: rows }).map((_, i) => (
-          <tr key={`skeleton-${i}`}>
-            {Array.from({ length: 12 }).map((__, j) => (
-              <td key={`${i}-${j}`}>
-                <div style={{ height: 10, borderRadius: 6, background: 'var(--bg-secondary)', opacity: 0.8, width: j === 1 ? '90%' : '70%' }} />
-              </td>
-            ))}
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-
-function DumpSparkline({ dumpPrice, refAvg }) {
-  const low = Math.min(dumpPrice || 0, refAvg || 0) || 1;
-  const high = Math.max(dumpPrice || 0, refAvg || 0) || 1;
-  const norm = (v) => 28 - ((v - low) / Math.max(1, high - low)) * 20;
-  const y1 = norm(refAvg || low);
-  const y2 = norm(dumpPrice || low);
-  return (
-    <svg width="90" height="30" viewBox="0 0 90 30" aria-hidden>
-      <polyline points={`2,${y1} 45,${(y1 + y2) / 2} 88,${y2}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
-      <circle cx="88" cy={y2} r="2.5" fill="var(--red)" />
-    </svg>
-  );
-}
-
-
-function riskBadge(opp) {
-  const safety = Number(opp.stability_score || 0);
-  const score = Number(opp.flip_score || 0);
-  if (safety >= 70 && score >= 60) return { label: 'CALM', cls: 'badge-cyan' };
-  if (score >= 65) return { label: 'HOT', cls: 'badge-green' };
-  return { label: 'SPIKY', cls: 'badge-yellow' };
-}
-
-function scoreChips(opp) {
-  return [
-    `VOLUME ${Math.round(Number(opp.volume_score || 0))}`,
-    `MARGIN ${Math.round(Number(opp.spread_score || 0))}`,
-    `SAFETY ${Math.round(Number(opp.stability_score || 0))}`,
-    `SPEED ${Math.round(Number(opp.freshness_score || 0))}`,
-  ];
-}
-
-function MiniSparkline({ buyPrice, sellPrice }) {
-  const a = Number(buyPrice || 0);
-  const b = Number(sellPrice || 0);
-  const low = Math.min(a || 1, b || 1);
-  const high = Math.max(a || 1, b || 1);
-  const n = (v) => 22 - ((v - low) / Math.max(1, high - low)) * 14;
-  const y1 = n(a || low);
-  const y2 = n((a + b) / 2 || low);
-  const y3 = n(b || low);
-  return (
-    <svg width="68" height="24" viewBox="0 0 68 24" aria-hidden>
-      <polyline points={`2,${y1} 34,${y2} 66,${y3}`} fill="none" stroke="var(--cyan)" strokeWidth="2" />
-      <circle cx="66" cy={y3} r="2" fill="var(--green)" />
-    </svg>
-  );
-}
-
-/* ── Score bar mini-component ────────────────────────────────────────────── */
-
-function ScoreBar({ score, max = 100 }) {
-  const pct = Math.min(100, (score / max) * 100);
-  const color = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--cyan)' : 'var(--red)';
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 80 }}>
-      <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'var(--bg-secondary)' }}>
-        <div style={{ height: '100%', borderRadius: 2, width: `${pct}%`, background: color, transition: 'width 0.3s' }} />
-      </div>
-      <span style={{ fontSize: 10, color: 'var(--text-secondary)', width: 24, textAlign: 'right' }}>{pct.toFixed(0)}</span>
+    <div style={{ position: 'relative', width: 44, height: 44, flexShrink: 0 }}>
+      <svg width="44" height="44" viewBox="0 0 44 44">
+        <circle cx="22" cy="22" r={r} fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth="3.5" />
+        <circle cx="22" cy="22" r={r} fill="none" stroke={c} strokeWidth="3.5"
+          strokeDasharray={`${dash} ${circ}`}
+          strokeLinecap="round"
+          transform="rotate(-90 22 22)" />
+      </svg>
+      <span style={{
+        position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 11, fontWeight: 700, color: c,
+      }}>
+        {pct.toFixed(0)}
+      </span>
     </div>
   );
 }
 
-/* ── Expanded Row Detail ─────────────────────────────────────────────────── */
+/* ── Mini score bars ─────────────────────────────────────────────────────── */
 
-function ExpandedDetail({ opp }) {
-  const geLimit4h = Number(opp.ge_limit_4h || 0);
-  const qtyRaw = Number(opp.qty_raw ?? opp.qty_suggested ?? 0);
-  const qtySuggested = Number(opp.qty_suggested || 0);
-  const geCapped = geLimit4h > 0 && qtyRaw > qtySuggested;
-
+function MiniBar({ value, max = 100, color }) {
+  const pct = Math.min(100, Math.max(0, ((value || 0) / max) * 100));
   return (
-    <tr>
-      <td colSpan={13} style={{ padding: 0, background: 'rgba(6,182,212,0.03)' }}>
-        <div style={{ padding: '16px 20px', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 20, fontSize: 12 }}>
-
-          {/* RUNE SCORE Breakdown */}
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 10, color: 'var(--cyan)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              RUNE SCORE Breakdown
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {[
-                ['Spread',    opp.spread_score],
-                ['Volume',    opp.volume_score],
-                ['Freshness', opp.freshness_score],
-                ['Trend',     opp.trend_score],
-                ['History',   opp.history_score],
-                ['Stability', opp.stability_score],
-              ].map(([label, val]) => (
-                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span className="text-muted">{label}</span>
-                  <ScoreBar score={val || 0} />
-                </div>
-              ))}
-              {opp.ml_direction && (
-                <div style={{ marginTop: 6, padding: '6px 10px', background: 'rgba(34,197,94,0.06)', borderRadius: 6 }}>
-                  AI predicts{' '}
-                  <strong style={{ color: opp.ml_direction === 'up' ? '#22c55e' : opp.ml_direction === 'down' ? '#ef4444' : '#f59e0b' }}>
-                    {opp.ml_direction === 'up' ? '▲ Up' : opp.ml_direction === 'down' ? '▼ Down' : '— Flat'}
-                  </strong>
-                  {opp.ml_prediction_confidence != null && ` (${(opp.ml_prediction_confidence * 100).toFixed(0)}% conf)`}
-                  {opp.ml_method && <span className="text-muted"> · {opp.ml_method === 'ml' ? 'ML Model' : 'Statistical'}</span>}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Pricing Detail */}
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 10, color: 'var(--cyan)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              Pricing Detail
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div><span className="text-muted">Buy @ </span><span className="text-red">{formatGP(opp.buy_price || opp.recommended_buy)}</span></div>
-              <div><span className="text-muted">Sell @ </span><span className="text-green">{formatGP(opp.sell_price || opp.recommended_sell)}</span></div>
-              <div><span className="text-muted">Gross Spread: </span>{formatGP(opp.margin || opp.gross_profit)}</div>
-              <div><span className="text-muted">GE Tax (2%): </span><span className="text-red">−{formatGP(opp.tax)}</span></div>
-              <div><span className="text-muted">Net Profit: </span><span className="text-green">+{formatGP(opp.potential_profit)}</span></div>
-              <div><span className="text-muted">ROI: </span><span style={{ color: (opp.roi_pct || 0) > 0 ? 'var(--green)' : 'var(--red)' }}>{opp.roi_pct?.toFixed(2)}%</span></div>
-              <div><span className="text-muted">GP/hr est: </span>{formatGP(opp.gp_per_hour)}</div>
-              <div><span className="text-muted">Est. fill: </span>{opp.est_fill_time_minutes?.toFixed(0) ?? '—'} min</div>
-            </div>
-          </div>
-
-          {/* Position Sizing */}
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 10, color: 'var(--cyan)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5 }}>
-              Position Sizing
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              {opp.trade_plan ? (
-                <>
-                  <div><span className="text-muted">Qty: </span>{opp.trade_plan.qty_to_buy?.toLocaleString()}</div>
-                  <div><span className="text-muted">Max Invest: </span>{formatGP(opp.trade_plan.max_invest_gp)}</div>
-                  <div><span className="text-muted">Est Profit: </span><span className="text-green">+{formatGP(opp.trade_plan.total_profit)}</span></div>
-                </>
-              ) : opp.qty_suggested > 0 ? (
-                <>
-                  <div>
-                    <span className="text-muted">Qty Suggested: </span>
-                    {qtySuggested.toLocaleString()}
-                    {geCapped ? ' (GE cap)' : ''}
-                  </div>
-                  <div><span className="text-muted">GE Limit: </span>{geLimit4h > 0 ? `${geLimit4h.toLocaleString()} / 4h` : '—'}</div>
-                  <div><span className="text-muted">Est Profit: </span><span className="text-green">+{formatGP(opp.expected_profit)}</span></div>
-                </>
-              ) : <div className="text-muted">No sizing data</div>}
-              {opp.win_rate != null && <div><span className="text-muted">Win Rate: </span>{(opp.win_rate * 100)?.toFixed(0)}%</div>}
-              {opp.total_flips > 0   && <div><span className="text-muted">Your Flips: </span>{opp.total_flips}</div>}
-              {opp.avg_profit != null && <div><span className="text-muted">Avg Profit: </span><span className="text-green">{formatGP(opp.avg_profit)}</span></div>}
-            </div>
-            {opp.reason && (
-              <div className="text-muted" style={{ marginTop: 10, fontSize: 11, lineHeight: 1.5, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                {opp.reason}
-              </div>
-            )}
-          </div>
-        </div>
-      </td>
-    </tr>
+    <div style={{ flex: 1, height: 3, borderRadius: 2, background: 'rgba(255,255,255,0.08)' }}>
+      <div style={{ height: '100%', width: `${pct}%`, borderRadius: 2, background: color || scoreColor(pct), transition: 'width 0.4s' }} />
+    </div>
   );
 }
 
-/* ── Filter definitions ──────────────────────────────────────────────────── */
+/* ── Trend indicator ─────────────────────────────────────────────────────── */
+
+function TrendIcon({ trend }) {
+  if (trend === 'STRONG_UP')   return <TrendingUp size={13} color="#22c55e" />;
+  if (trend === 'UP')          return <TrendingUp size={13} color="#86efac" />;
+  if (trend === 'DOWN')        return <TrendingDown size={13} color="#ef4444" />;
+  if (trend === 'STRONG_DOWN') return <TrendingDown size={13} color="#fca5a5" />;
+  return <Minus size={13} color="#6b7280" />;
+}
+
+/* ── Dump sparkline ──────────────────────────────────────────────────────── */
+
+function DumpSparkline({ dumpPrice, refAvg }) {
+  const low  = Math.min(dumpPrice || 0, refAvg || 0) || 1;
+  const high = Math.max(dumpPrice || 0, refAvg || 0) || 1;
+  const norm = (v) => 26 - ((v - low) / Math.max(1, high - low)) * 18;
+  const y1   = norm(refAvg || low);
+  const y2   = norm(dumpPrice || low);
+  return (
+    <svg width="80" height="30" viewBox="0 0 80 30" aria-hidden>
+      <polyline points={`2,${y1} 40,${(y1 + y2) / 2} 78,${y2}`}
+        fill="none" stroke="var(--cyan)" strokeWidth="1.8" />
+      <circle cx="78" cy={y2} r="2.5" fill="var(--red)" />
+    </svg>
+  );
+}
+
+/* ── Category definitions ────────────────────────────────────────────────── */
+
+const CATEGORIES = [
+  { key: 'all',      label: 'All',          Icon: BarChart3,    color: '#06b6d4' },
+  { key: 'pvm',      label: 'PvM Gear',     Icon: Sword,        color: '#22c55e' },
+  { key: 'pvp',      label: 'PvP Gear',     Icon: Shield,       color: '#ef4444' },
+  { key: 'supplies', label: 'Supplies',     Icon: FlaskConical, color: '#f59e0b' },
+  { key: 'skilling', label: 'Skilling',     Icon: Pickaxe,      color: '#a78bfa' },
+  { key: 'merch',    label: 'Merch',        Icon: ShoppingBag,  color: '#fb923c' },
+  { key: 'dumps',    label: 'Dumps',        Icon: Trophy,       color: '#f43f5e' },
+];
+
+/* ── Opportunity Card ────────────────────────────────────────────────────── */
+
+function OpportunityCard({ opp, rank, activeScoreMode, freeSlots, activeTrades,
+  acceptingId, replaceForItem, setReplaceForItem, onAccept, nav }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const score     = activeScoreMode === 'margin_hunter'
+    ? (opp.margin_hunter_score ?? opp.flip_score ?? 0)
+    : (opp.flip_score ?? 0);
+  const sc        = scoreColor(score);
+  const margin    = opp.margin_gp ?? opp.margin ?? 0;
+  const profit    = opp.potential_profit ?? opp.expected_profit ?? 0;
+  const roi       = opp.roi_pct ?? 0;
+  const vol       = opp.volume_5m ?? opp.volume ?? 0;
+  const conf      = opp.confidence ?? opp.ml_confidence;
+
+  const geLimit4h    = Number(opp.ge_limit_4h || 0);
+  const qtySuggested = Number(opp.qty_suggested || 0);
+  const qtyRaw       = Number(opp.qty_raw ?? opp.qty_suggested ?? 0);
+  const geCapped     = geLimit4h > 0 && qtyRaw > qtySuggested;
+
+  return (
+    <div style={{
+      background: 'var(--bg-secondary)',
+      border: '1px solid var(--border)',
+      borderRadius: 12,
+      overflow: 'hidden',
+      transition: 'box-shadow 0.2s, border-color 0.2s',
+      display: 'flex',
+      flexDirection: 'column',
+    }}
+      onMouseEnter={e => { e.currentTarget.style.borderColor = sc; e.currentTarget.style.boxShadow = `0 0 0 1px ${sc}22, 0 4px 20px ${sc}15`; }}
+      onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none'; }}
+    >
+
+      {/* ── Card header ── */}
+      <div style={{ padding: '12px 14px 10px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        {/* Rank badge */}
+        <span style={{
+          fontSize: 10, fontWeight: 700, color: 'var(--text-muted)',
+          minWidth: 18, textAlign: 'center',
+        }}>#{rank}</span>
+
+        {/* Item image */}
+        <img src={IMG(opp.item_id)} alt="" width={36} height={36}
+          style={{ imageRendering: 'pixelated', flexShrink: 0, borderRadius: 6, background: 'rgba(0,0,0,0.2)' }}
+          onError={e => { e.target.style.display = 'none'; }} />
+
+        {/* Name + badges */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--text-primary)',
+          }}>
+            {opp.name || opp.item_name}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 3, flexWrap: 'wrap' }}>
+            <TrendIcon trend={opp.trend} />
+            {conf != null && (
+              <span style={{ fontSize: 10, color: conf > 0.7 ? '#22c55e' : conf > 0.5 ? '#f59e0b' : '#6b7280' }}>
+                AI {(conf * 100).toFixed(0)}%
+              </span>
+            )}
+            {qtySuggested > 0 && (
+              <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                ×{formatQty(qtySuggested)}{geCapped ? ' (GE cap)' : ''}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Score ring */}
+        <ScoreRing score={score} />
+      </div>
+
+      {/* ── Price strip ── */}
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr 1fr',
+        background: 'rgba(0,0,0,0.18)', borderTop: '1px solid var(--border)',
+        borderBottom: '1px solid var(--border)',
+      }}>
+        <div style={{ padding: '7px 12px', borderRight: '1px solid var(--border)' }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>Buy</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#4ade80' }}>{formatGP(opp.buy_price)}</div>
+        </div>
+        <div style={{ padding: '7px 12px' }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>Sell</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#38bdf8' }}>{formatGP(opp.sell_price)}</div>
+        </div>
+      </div>
+
+      {/* ── Stats grid ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 0 }}>
+        {[
+          { label: 'Margin',  value: formatGP(margin),           color: '#f59e0b' },
+          { label: 'Profit',  value: `+${formatGP(profit)}`,     color: '#22c55e' },
+          { label: 'ROI',     value: `${roi.toFixed(1)}%`,       color: roi > 2 ? '#22c55e' : roi > 0 ? '#06b6d4' : '#ef4444' },
+          { label: 'Volume',  value: formatQty(vol),             color: 'var(--text-primary)' },
+        ].map(({ label, value, color }, idx) => (
+          <div key={label} style={{
+            padding: '8px 10px',
+            borderRight: idx < 3 ? '1px solid var(--border)' : 'none',
+            borderBottom: '1px solid var(--border)',
+          }}>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 3 }}>{label}</div>
+            <div style={{ fontSize: 12, fontWeight: 700, color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Score component bars ── */}
+      <div style={{ padding: '8px 14px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {[
+          { label: 'VOL',    val: opp.volume_score,    color: '#06b6d4' },
+          { label: 'MARGIN', val: opp.spread_score,    color: '#f59e0b' },
+          { label: 'SAFETY', val: opp.stability_score, color: '#22c55e' },
+          { label: 'SPEED',  val: opp.freshness_score, color: '#a78bfa' },
+        ].map(({ label, val, color }) => (
+          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', width: 40, letterSpacing: 0.4 }}>{label}</span>
+            <MiniBar value={val} color={color} />
+            <span style={{ fontSize: 9, color: 'var(--text-muted)', width: 22, textAlign: 'right' }}>
+              {(val ?? 0).toFixed(0)}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {/* ── Expanded detail ── */}
+      {expanded && (
+        <div style={{
+          padding: '10px 14px',
+          borderTop: '1px solid var(--border)',
+          background: 'rgba(6,182,212,0.03)',
+          fontSize: 11,
+          display: 'flex', flexDirection: 'column', gap: 5,
+        }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+            {[
+              ['GE Tax',      opp.tax != null ? `-${formatGP(opp.tax)}` : '—'],
+              ['GP/hr est',   formatGP(opp.gp_per_hour)],
+              ['Est fill',    opp.est_fill_time_minutes != null ? `${opp.est_fill_time_minutes.toFixed(0)} min` : '—'],
+              ['GE Limit',    geLimit4h > 0 ? `${formatQty(geLimit4h)} / 4h` : '—'],
+              ['Win Rate',    opp.win_rate != null ? `${(opp.win_rate * 100).toFixed(0)}%` : '—'],
+              ['Your Flips',  opp.total_flips > 0 ? opp.total_flips : '—'],
+            ].map(([k, v]) => (
+              <div key={k} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--text-muted)' }}>{k}</span>
+                <span style={{ fontWeight: 600 }}>{v}</span>
+              </div>
+            ))}
+          </div>
+          {opp.reason && (
+            <div style={{ marginTop: 4, color: 'var(--text-muted)', lineHeight: 1.5, borderTop: '1px solid var(--border)', paddingTop: 6 }}>
+              {opp.reason}
+            </div>
+          )}
+          {opp.ml_direction && (
+            <div style={{ padding: '5px 8px', borderRadius: 6, background: 'rgba(34,197,94,0.07)', marginTop: 2 }}>
+              AI: <strong style={{ color: opp.ml_direction === 'up' ? '#22c55e' : opp.ml_direction === 'down' ? '#ef4444' : '#f59e0b' }}>
+                {opp.ml_direction === 'up' ? '▲ Up' : opp.ml_direction === 'down' ? '▼ Down' : '— Flat'}
+              </strong>
+              {opp.ml_prediction_confidence != null && ` (${(opp.ml_prediction_confidence * 100).toFixed(0)}%)`}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Action footer ── */}
+      <div style={{ padding: '10px 14px', marginTop: 'auto', display: 'flex', gap: 6, alignItems: 'center', borderTop: '1px solid var(--border)' }}>
+        <button
+          style={{
+            flex: 1, padding: '6px 0', borderRadius: 6, border: '1px solid var(--border)',
+            background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer',
+          }}
+          onClick={() => setExpanded(v => !v)}
+        >
+          {expanded ? 'Less ▲' : 'More ▼'}
+        </button>
+        <button
+          style={{
+            padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)',
+            background: 'transparent', color: 'var(--text-muted)', fontSize: 11, cursor: 'pointer',
+          }}
+          onClick={() => nav(`/item/${opp.item_id}`)}
+          title="View full analysis"
+        >↗</button>
+
+        {freeSlots > 0 ? (
+          <button
+            style={{
+              flex: 2, padding: '6px 0', borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+              background: acceptingId === opp.item_id ? 'rgba(34,197,94,0.3)' : 'rgba(34,197,94,0.15)',
+              border: '1px solid rgba(34,197,94,0.4)', color: '#22c55e',
+            }}
+            disabled={acceptingId === opp.item_id}
+            onClick={() => onAccept(opp)}
+          >
+            <Check size={11} style={{ verticalAlign: 'middle', marginRight: 3 }} />
+            Accept
+          </button>
+        ) : (
+          <div style={{ flex: 2 }}>
+            <button
+              style={{
+                width: '100%', padding: '6px 0', borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+                background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.35)', color: '#f59e0b',
+              }}
+              disabled={acceptingId === opp.item_id}
+              onClick={() => setReplaceForItem(replaceForItem === opp.item_id ? null : opp.item_id)}
+            >
+              Replace slot
+            </button>
+            {replaceForItem === opp.item_id && (
+              <select
+                onChange={e => e.target.value && onAccept(opp, e.target.value)}
+                defaultValue=""
+                style={{ marginTop: 4, width: '100%', fontSize: 11, borderRadius: 6 }}
+              >
+                <option value="" disabled>Select trade to replace</option>
+                {activeTrades.map(t => (
+                  <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Dump Card ───────────────────────────────────────────────────────────── */
+
+function DumpCard({ d, freeSlots, activeTrades, acceptingId, onAccept }) {
+  const starColor = d.stars >= 3 ? '#ef4444' : d.stars === 2 ? '#f59e0b' : '#06b6d4';
+  return (
+    <div style={{
+      background: 'var(--bg-secondary)', border: `1px solid rgba(239,68,68,0.25)`,
+      borderRadius: 12, overflow: 'hidden', display: 'flex', flexDirection: 'column',
+    }}>
+      <div style={{ padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 10 }}>
+        <img src={IMG(d.item_id)} alt="" width={36} height={36}
+          style={{ imageRendering: 'pixelated', flexShrink: 0, borderRadius: 6, background: 'rgba(0,0,0,0.2)' }}
+          onError={e => { e.target.style.display = 'none'; }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.name}</div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>Dump signal</div>
+        </div>
+        <span style={{ fontSize: 16, color: starColor, fontWeight: 900, letterSpacing: -1 }}>{'★'.repeat(d.stars || 1)}</span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', background: 'rgba(0,0,0,0.18)', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
+        <div style={{ padding: '7px 12px', borderRight: '1px solid var(--border)' }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>Dump price</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#f87171' }}>{formatGP(d.dump_price)}</div>
+        </div>
+        <div style={{ padding: '7px 12px' }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>Avg price</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#38bdf8' }}>{formatGP(d.ref_avg)}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <DumpSparkline dumpPrice={d.dump_price} refAvg={d.ref_avg} />
+        <div style={{ fontSize: 11, textAlign: 'right' }}>
+          <div style={{ color: '#f87171', fontWeight: 700 }}>▼ {d.drop_pct?.toFixed?.(1) ?? d.drop_pct}%</div>
+          <div style={{ color: 'var(--text-muted)', marginTop: 2 }}>Vol: {(d.volume_5m || 0).toLocaleString()}</div>
+          <div style={{ color: '#22c55e', fontWeight: 700 }}>+{formatGP(d.est_profit)}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: '10px 14px', borderTop: '1px solid var(--border)', marginTop: 'auto' }}>
+        {freeSlots > 0 ? (
+          <button
+            style={{
+              width: '100%', padding: '7px 0', borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+              background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.35)', color: '#f87171',
+            }}
+            disabled={acceptingId === d.item_id}
+            onClick={() => onAccept(d, null, { type: 'dump' })}
+          >
+            <Check size={11} style={{ verticalAlign: 'middle', marginRight: 3 }} />
+            Accept dump
+          </button>
+        ) : (
+          <select
+            defaultValue=""
+            onChange={e => e.target.value && onAccept(d, e.target.value, { type: 'dump' })}
+            style={{ width: '100%', fontSize: 11, borderRadius: 6 }}
+          >
+            <option value="" disabled>Replace slot to accept</option>
+            {activeTrades.map(t => (
+              <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
+            ))}
+          </select>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Loading skeleton cards ──────────────────────────────────────────────── */
+
+function SkeletonCard() {
+  const shimmer = { background: 'rgba(255,255,255,0.05)', borderRadius: 6, animation: 'pulse 1.5s ease-in-out infinite' };
+  return (
+    <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+      <div style={{ padding: '12px 14px', display: 'flex', gap: 10, alignItems: 'center' }}>
+        <div style={{ ...shimmer, width: 36, height: 36, borderRadius: 8 }} />
+        <div style={{ flex: 1 }}>
+          <div style={{ ...shimmer, height: 13, width: '70%', marginBottom: 6 }} />
+          <div style={{ ...shimmer, height: 10, width: '45%' }} />
+        </div>
+        <div style={{ ...shimmer, width: 44, height: 44, borderRadius: '50%' }} />
+      </div>
+      <div style={{ height: 40, background: 'rgba(0,0,0,0.18)', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }} />
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', borderBottom: '1px solid var(--border)' }}>
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} style={{ padding: '8px 10px', borderRight: i < 3 ? '1px solid var(--border)' : 'none' }}>
+            <div style={{ ...shimmer, height: 9, width: '60%', marginBottom: 4 }} />
+            <div style={{ ...shimmer, height: 12, width: '80%' }} />
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: '8px 14px' }}>
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} style={{ ...shimmer, height: 3, marginBottom: 6, width: `${80 - i * 10}%` }} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /* ── Main Component ──────────────────────────────────────────────────────── */
 
 export default function Opportunities() {
   const nav = useNavigate();
-  const [filter, setFilter] = useState('All');
+  const [category, setCategory] = useState('all');
   const [sortCol, setSortCol] = useState('flip_score');
   const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
-  const [minPrice, setMinPrice] = useState(0);
   const [profile, setProfile] = useState('balanced');
   const [scoreMode, setScoreMode] = useState('balanced');
   const [valueMode, setValueMode] = useState('all');
   const [minProfitPerItemGp, setMinProfitPerItemGp] = useState(0);
-  const [expandedId, setExpandedId] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
-  const [viewMode, setViewMode] = useState('opportunities');
+
   const debugEnabled = import.meta.env.DEV || new URLSearchParams(window.location.search).get('debug') === '1';
+
   const opportunitiesParams = useMemo(
     () => ({
       limit: 200,
       profile,
       score_mode: scoreMode,
-      min_price: minPrice,
-      min_price_gp: minPrice,
+      min_price: 0,
+      min_price_gp: 0,
       min_volume: 0,
       min_roi_pct: 0,
       min_profit_gp: 0,
@@ -327,53 +546,29 @@ export default function Opportunities() {
       value_mode: valueMode,
       min_profit_per_item_gp: minProfitPerItemGp,
     }),
-    [minPrice, profile, scoreMode, valueMode, minProfitPerItemGp],
+    [profile, scoreMode, valueMode, minProfitPerItemGp],
   );
-  const opportunitiesRequestUrl = useMemo(() => {
-    const qs = new URLSearchParams(opportunitiesParams).toString();
-    return `${API_BASE}/opportunities${qs ? `?${qs}` : ''}`;
-  }, [opportunitiesParams]);
+
   const { data: raw, loading, error, reload } = useApi(
-    ({ signal }) => api.getOpportunities(
-      opportunitiesParams,
-      { signal, timeoutMs: 15000 },
-    ),
+    ({ signal }) => api.getOpportunities(opportunitiesParams, { signal, timeoutMs: 15000 }),
     [opportunitiesParams],
-    autoRefresh ? 60_000 : null,  // 60 s auto-refresh, cancellable
+    autoRefresh ? 60_000 : null,
   );
-  const { data: tradeData, reload: reloadTrades } = useApi(
-    () => api.getActiveTrades(),
-    [], 10000,
-  );
+  const { data: tradeData, reload: reloadTrades } = useApi(() => api.getActiveTrades(), [], 10000);
   const { data: dumpsRaw, loading: dumpsLoading, error: dumpsError, reload: reloadDumps } = useApi(
-    () => api.getDumps(),
-    [], 120000,
+    () => api.getDumps(), [], 120000,
   );
 
-  const firstOpportunityExample = useMemo(() => {
-    const first = raw?.items?.[0];
-    if (!first) return null;
-    return {
-      name: first.name,
-      buy_price: first.buy_price,
-      sell_price: first.sell_price,
-      volume_5m: first.volume_5m,
-      flip_score: first.flip_score,
-    };
-  }, [raw]);
-
-  const opps = useMemo(() => raw?.items || [], [raw]);
-  const dumps = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
-  const activeMode = raw?.profile || 'balanced';
+  const opps      = useMemo(() => raw?.items || [], [raw]);
+  const dumps     = useMemo(() => dumpsRaw?.items || [], [dumpsRaw]);
+  const apiCount  = Number(raw?.count || 0);
+  const lastUpdated     = timeAgo(raw?.generated_at);
+  const filtersApplied  = raw?.filters_applied || null;
+  const activeTrades    = tradeData?.items || [];
+  const slotsUsed       = tradeData?.slots_used || 0;
+  const slotsTotal      = tradeData?.slots_total || 8;
+  const freeSlots       = Math.max(0, tradeData?.free_slots ?? (slotsTotal - slotsUsed));
   const activeScoreMode = raw?.score_mode || scoreMode;
-  const apiCount = Number(raw?.count || 0);
-  const filtersApplied = raw?.filters_applied || null;
-  const lastUpdated = timeAgo(raw?.generated_at);
-  const activeTrades = tradeData?.items || [];
-  const slotsUsed = tradeData?.slots_used || 0;
-  const slotsTotal = tradeData?.slots_total || 8;
-  const freeSlots = Math.max(0, tradeData?.free_slots ?? (slotsTotal - slotsUsed));
-
 
   const acceptOpportunity = async (opp, replaceTradeId = null, overrides = {}) => {
     try {
@@ -392,7 +587,7 @@ export default function Opportunities() {
       });
       setReplaceForItem(null);
       reloadTrades();
-      if (viewMode === "dumps") reloadDumps();
+      if (category === 'dumps') reloadDumps();
     } catch (e) {
       window.alert(e.message || 'Failed to accept trade');
     } finally {
@@ -400,28 +595,30 @@ export default function Opportunities() {
     }
   };
 
-  const toggleSort = (col) => {
-    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    else { setSortCol(col); setSortDir('desc'); }
-  };
+  /* ── Category counts (for badges) ── */
+  const categoryCounts = useMemo(() => {
+    const counts = { all: opps.length, pvm: 0, pvp: 0, supplies: 0, skilling: 0, merch: 0, dumps: dumps.length };
+    opps.forEach(o => { counts[classifyItem(o)] = (counts[classifyItem(o)] || 0) + 1; });
+    return counts;
+  }, [opps, dumps]);
 
+  /* ── Filter + sort ── */
   const filtered = useMemo(() => {
+    if (category === 'dumps') return [];
+
     let items = [...opps];
 
     if (search) {
       const q = search.toLowerCase();
-      items = items.filter(o =>
-        (o.name || o.item_name)?.toLowerCase().includes(q) || String(o.item_id).includes(q)
-      );
+      items = items.filter(o => (o.name || o.item_name)?.toLowerCase().includes(q) || String(o.item_id).includes(q));
     }
 
-    if (filter === 'High Volume') items = items.filter(o => (o.volume_5m || 0) >= 500);
-    else if (filter === 'Best EV') items.sort((a, b) => (b.potential_profit * (b.volume_5m || 1)) - (a.potential_profit * (a.volume_5m || 1)));
-    else if (filter === 'Low Risk') items = items.filter(o => (o.stability_score || 0) >= 70);
+    if (category !== 'all') {
+      items = items.filter(o => classifyItem(o) === category);
+    }
 
-    const sortKey = (activeScoreMode === 'margin_hunter' && sortCol === 'flip_score')
-      ? 'margin_hunter_score'
-      : sortCol;
+    const scoreKey = activeScoreMode === 'margin_hunter' ? 'margin_hunter_score' : 'flip_score';
+    const sortKey  = sortCol === 'flip_score' ? scoreKey : sortCol;
     items.sort((a, b) => {
       const av = a[sortKey] ?? 0;
       const bv = b[sortKey] ?? 0;
@@ -429,270 +626,200 @@ export default function Opportunities() {
     });
 
     return items;
-  }, [opps, filter, sortCol, sortDir, search, activeScoreMode]);
+  }, [opps, category, search, sortCol, sortDir, activeScoreMode]);
 
+  /* ── Summary stats ── */
   const summaryStats = useMemo(() => {
-    if (!filtered.length) return null;
-    const avgMargin  = filtered.reduce((s, o) => s + (o.margin_pct ?? 0), 0) / filtered.length;
-    const avgScore   = filtered.reduce((s, o) => s + ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0), 0) / filtered.length;
-    const totalProfit= filtered.reduce((s, o) => s + (o.potential_profit ?? 0), 0);
-    const totalVol   = filtered.reduce((s, o) => s + (o.volume_5m ?? 0), 0);
-    const best       = filtered.reduce(
-      (b, o) => (
-        ((activeScoreMode === 'margin_hunter' ? o.margin_hunter_score : o.flip_score) ?? 0)
-        > ((activeScoreMode === 'margin_hunter' ? b.margin_hunter_score : b.flip_score) ?? 0)
-      ) ? o : b,
-      filtered[0],
-    );
-    return { avgMargin, avgScore, totalProfit, totalVol, best };
-  }, [filtered, activeScoreMode]);
+    const src = category === 'dumps' ? dumps : filtered;
+    if (!src.length) return null;
+    if (category === 'dumps') {
+      const totalProfit = dumps.reduce((s, d) => s + (d.est_profit || 0), 0);
+      const best = dumps.reduce((b, d) => (d.stars || 0) > (b.stars || 0) ? d : b, dumps[0]);
+      return { count: dumps.length, totalProfit, best: { name: best?.name, sub: `${best?.drop_pct?.toFixed(1)}% drop` } };
+    }
+    const scoreKey  = activeScoreMode === 'margin_hunter' ? 'margin_hunter_score' : 'flip_score';
+    const avgScore  = filtered.reduce((s, o) => s + (o[scoreKey] ?? 0), 0) / filtered.length;
+    const avgMargin = filtered.reduce((s, o) => s + (o.margin_pct ?? 0), 0) / filtered.length;
+    const totalProfit = filtered.reduce((s, o) => s + (o.potential_profit ?? 0), 0);
+    const best = filtered.reduce((b, o) => ((o[scoreKey] ?? 0) > (b[scoreKey] ?? 0)) ? o : b, filtered[0]);
+    return {
+      count: filtered.length, avgScore, avgMargin, totalProfit,
+      best: { name: best?.name || best?.item_name, sub: `score ${(best?.[scoreKey] ?? 0).toFixed(0)}` },
+    };
+  }, [filtered, dumps, category, activeScoreMode]);
 
-  const th = (label, col) => (
-    <th
-      className={sortCol === col ? 'sorted' : ''}
-      onClick={() => toggleSort(col)}
-      style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
-    >
-      {label}{sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}
-    </th>
-  );
-
+  /* ── Render ── */
   return (
     <div>
       {debugEnabled && (
         <div className="card" style={{ marginBottom: 12, border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.08)' }}>
-          <div style={{ padding: 12, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, lineHeight: 1.5 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6, color: '#f59e0b' }}>Debug banner (temporary)</div>
-            <div><strong>apiBaseUrl:</strong> {API_BASE}</div>
-            <div><strong>opportunitiesRequestUrl:</strong> {opportunitiesRequestUrl}</div>
-            <div>
-              <strong>response:</strong>{' '}
-              generated_at={raw?.generated_at ?? '—'}, count={raw?.count ?? '—'}, profile={raw?.profile ?? '—'}, score_mode={raw?.score_mode ?? '—'}
-            </div>
-            <div>
-              <strong>firstItem:</strong>{' '}
-              {firstOpportunityExample ? JSON.stringify(firstOpportunityExample) : '—'}
-            </div>
+          <div style={{ padding: 12, fontFamily: 'monospace', fontSize: 11 }}>
+            <strong style={{ color: '#f59e0b' }}>Debug</strong>{' '}
+            count={raw?.count ?? '—'} profile={raw?.profile ?? '—'} score_mode={raw?.score_mode ?? '—'}{' '}
+            api={API_BASE}
           </div>
         </div>
       )}
 
-      {/* ── Header ── */}
       <MarketSearchPanel />
 
+      {/* ── Page header ── */}
       <div className="page-header">
         <div>
           <h2 className="page-title">Opportunities</h2>
           <p className="page-subtitle">
-            {apiCount} items · ranked by{' '}
-            {sortCol === 'flip_score' ? 'flip score' : sortCol === 'potential_profit' ? 'profit' : sortCol} · last updated {lastUpdated} · slots {slotsUsed}/{slotsTotal}
+            {apiCount} items · {lastUpdated} · slots {slotsUsed}/{slotsTotal}
           </p>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <select
-            value={profile}
-            onChange={e => {
-              const next = e.target.value;
-              setProfile(next);
-            }}
-            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
-          >
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={profile} onChange={e => setProfile(e.target.value)}
+            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}>
             <option value="conservative">Conservative</option>
             <option value="balanced">Balanced</option>
             <option value="aggressive">Aggressive</option>
           </select>
-          <select
-            value={scoreMode}
-            onChange={e => setScoreMode(e.target.value)}
-            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
-          >
+          <select value={scoreMode} onChange={e => setScoreMode(e.target.value)}
+            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}>
             <option value="balanced">Balanced</option>
             <option value="margin_hunter">Margin Hunter</option>
           </select>
-          <button
-            className={`pill ${autoRefresh ? 'active' : ''}`}
-            onClick={() => setAutoRefresh(v => !v)}
-            title={autoRefresh ? 'Auto-refresh ON (60s) – click to pause' : 'Auto-refresh OFF – click to enable'}
-            style={{ fontSize: 11 }}
-          >
+          <button className={`pill ${autoRefresh ? 'active' : ''}`} onClick={() => setAutoRefresh(v => !v)} style={{ fontSize: 11 }}>
             {autoRefresh ? '⟳ Live' : '⟳ Paused'}
           </button>
-          <button className="btn" onClick={() => (viewMode === 'opportunities' ? reload() : reloadDumps())} disabled={loading}>
+          <button className="btn" onClick={() => category === 'dumps' ? reloadDumps() : reload()} disabled={loading}>
             <RefreshCw size={14} style={loading ? { animation: 'spin 1s linear infinite' } : {}} /> Refresh
           </button>
         </div>
       </div>
 
+      {/* ── Category tabs ── */}
+      <div style={{
+        display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16,
+        padding: '12px 14px', background: 'var(--bg-secondary)',
+        border: '1px solid var(--border)', borderRadius: 12,
+      }}>
+        {CATEGORIES.map(({ key, label, Icon, color }) => {
+          const active = category === key;
+          const count  = categoryCounts[key] ?? 0;
+          return (
+            <button key={key} onClick={() => setCategory(key)} style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              padding: '7px 14px', borderRadius: 8, cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              border: active ? `1px solid ${color}` : '1px solid var(--border)',
+              background: active ? `${color}18` : 'transparent',
+              color: active ? color : 'var(--text-muted)',
+              transition: 'all 0.15s',
+            }}>
+              <Icon size={13} />
+              {label}
+              {count > 0 && (
+                <span style={{
+                  fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 10,
+                  background: active ? `${color}30` : 'rgba(255,255,255,0.07)',
+                  color: active ? color : 'var(--text-muted)',
+                }}>
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
 
-      <div className="filter-bar" style={{ marginBottom: 12 }}>
-        <button className={`pill ${viewMode === 'opportunities' ? 'active' : ''}`} onClick={() => setViewMode('opportunities')}>Opportunities</button>
-        <button className={`pill ${viewMode === 'dumps' ? 'active' : ''}`} onClick={() => setViewMode('dumps')}>Dumps</button>
+        {/* ── Right-side controls ── */}
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div style={{ position: 'relative' }}>
+            <Search size={12} style={{ position: 'absolute', left: 9, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+            <input type="text" placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)}
+              style={{ padding: '7px 12px 7px 28px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg-card, var(--bg-secondary))', color: 'var(--text-primary)', fontSize: 12, width: 160 }} />
+          </div>
+        </div>
       </div>
 
-      <div className="filter-bar" style={{ marginBottom: 12 }}>
-        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>Mode: {activeMode}</span>
-        <span className={`pill active`} style={{ textTransform: 'capitalize' }}>
-          Score: {activeScoreMode === 'margin_hunter' ? 'Margin Hunter' : 'Balanced'}
-        </span>
-      </div>
-
-      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        {['all', '1m', '10m'].map((mode) => (
-          <button
-            key={mode}
-            className={`pill ${valueMode === mode ? 'active' : ''}`}
-            onClick={() => setValueMode(mode)}
-          >
-            Value: {mode}
-          </button>
-        ))}
-      </div>
-
-      <div className="filter-bar" style={{ marginBottom: 12, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-        <span className="text-muted" style={{ fontSize: 12, alignSelf: 'center' }}>Min profit/item:</span>
-        {[
-          { label: 'Off', gp: 0 },
-          { label: '100gp+', gp: 100 },
-          { label: '500gp+', gp: 500 },
-          { label: '2k+', gp: 2000 },
-        ].map(({ label, gp }) => (
-          <button
-            key={gp}
-            className={`pill ${minProfitPerItemGp === gp ? 'active' : ''}`}
-            onClick={() => setMinProfitPerItemGp(gp)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {/* Summary Stats */}
-      {summaryStats && (
-        <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginBottom: 20 }}>
+      {/* ── Sub-filters (non-dumps) ── */}
+      {category !== 'dumps' && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Value:</span>
+          {['all', '1m', '10m'].map(m => (
+            <button key={m} className={`pill ${valueMode === m ? 'active' : ''}`}
+              onClick={() => setValueMode(m)} style={{ fontSize: 11 }}>
+              {m === 'all' ? 'Any' : m === '1m' ? '1M+' : '10M+'}
+            </button>
+          ))}
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>Min profit/item:</span>
+          {[{ label: 'Off', gp: 0 }, { label: '100gp+', gp: 100 }, { label: '500gp+', gp: 500 }, { label: '2k+', gp: 2000 }].map(({ label, gp }) => (
+            <button key={gp} className={`pill ${minProfitPerItemGp === gp ? 'active' : ''}`}
+              onClick={() => setMinProfitPerItemGp(gp)} style={{ fontSize: 11 }}>
+              {label}
+            </button>
+          ))}
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>Sort:</span>
           {[
-            { title: 'Items Shown',       value: loading ? '…' : filtered.length,                             color: null },
-            { title: 'Avg Score',         value: loading ? '…' : (summaryStats?.avgScore.toFixed(0) + '/100'),color: null },
-            { title: 'Avg Margin',        value: loading ? '…' : (summaryStats?.avgMargin.toFixed(1) + '%'),  color: (summaryStats?.avgMargin ?? 0) > 0 ? 'var(--green)' : null },
-            { title: 'Total Liq Score',   value: loading ? '…' : summaryStats?.totalVol.toFixed(0),           color: null },
-            {
-              title: 'Best Opportunity',
-              value: loading ? '…' : (summaryStats?.best?.name || summaryStats?.best?.item_name),
-              sub: summaryStats?.best
-                ? `score ${(
-                  activeScoreMode === 'margin_hunter'
-                    ? summaryStats.best.margin_hunter_score
-                    : summaryStats.best.flip_score
-                )?.toFixed(0)}`
-                : null,
-              color: 'var(--green)',
-            },
-          ].map(({ title, value, sub, color }) => (
-            <div key={title} className="card" style={{ padding: '14px 16px' }}>
-              <div className="card-title">{title}</div>
-              <div style={{ fontSize: sub ? 13 : 20, fontWeight: 700, color: color || undefined, marginTop: 4 }}>{value}</div>
-              {sub && <div className="text-muted" style={{ fontSize: 11 }}>{sub}</div>}
+            { label: 'Score',  col: 'flip_score' },
+            { label: 'Profit', col: 'potential_profit' },
+            { label: 'ROI',    col: 'roi_pct' },
+            { label: 'Volume', col: 'volume_5m' },
+          ].map(({ label, col }) => (
+            <button key={col} className={`pill ${sortCol === col ? 'active' : ''}`}
+              onClick={() => { if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc'); else { setSortCol(col); setSortDir('desc'); } }}
+              style={{ fontSize: 11 }}>
+              {label}{sortCol === col ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── Summary strip ── */}
+      {summaryStats && (
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+          gap: 10, marginBottom: 16,
+        }}>
+          {category !== 'dumps' ? [
+            { label: 'Showing',     value: summaryStats.count },
+            { label: 'Avg Score',   value: `${summaryStats.avgScore?.toFixed(0)}/100` },
+            { label: 'Avg Margin',  value: `${summaryStats.avgMargin?.toFixed(1)}%`, color: (summaryStats.avgMargin ?? 0) > 0 ? '#22c55e' : undefined },
+            { label: 'Top Pick',    value: summaryStats.best?.name, sub: summaryStats.best?.sub, color: '#22c55e' },
+          ] : [
+            { label: 'Dumps',        value: summaryStats.count },
+            { label: 'Total Est',    value: `+${formatGP(summaryStats.totalProfit)}`, color: '#22c55e' },
+            { label: 'Top Dump',     value: summaryStats.best?.name, sub: summaryStats.best?.sub, color: '#ef4444' },
+          ].map(({ label, value, sub, color }) => (
+            <div key={label} className="card" style={{ padding: '12px 14px' }}>
+              <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: 'var(--text-muted)', marginBottom: 4 }}>{label}</div>
+              <div style={{ fontSize: sub ? 13 : 18, fontWeight: 700, color: color || 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value ?? '—'}</div>
+              {sub && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{sub}</div>}
             </div>
           ))}
         </div>
       )}
 
-      {/* ── Filter Bar ── */}
-      <div className="filter-bar" style={{ alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
-        {FILTERS.map(f => (
-          <button
-            key={f.key}
-            className={`pill ${filter === f.key ? 'active' : ''}`}
-            onClick={() => {
-              setFilter(f.key);
-              if (f.key === 'High Value 1M+') setValueMode('1m');
-              else if (f.key === 'High Value 10M+') setValueMode('10m');
-              else setValueMode('all');
-            }}
-            title={f.desc}
-          >
-            {f.icon && <f.icon size={11} style={{ marginRight: 3, verticalAlign: 'middle' }} />}
-            {f.key}
-          </button>
-        ))}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
-          <div style={{ position: 'relative' }}>
-            <Search size={13} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-            <input
-              type="text"
-              placeholder="Search items..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              style={{ padding: '7px 14px 7px 30px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12, width: 190 }}
-            />
+      {/* ── Dumps grid ── */}
+      {category === 'dumps' ? (
+        dumpsLoading ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 }}>
+            {Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)}
           </div>
-          <select
-            value={minPrice}
-            onChange={e => setMinPrice(Number(e.target.value))}
-            style={{ padding: '7px 12px', borderRadius: 20, border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: 12 }}
-          >
-            <option value={0}>Any price</option>
-            <option value={100000}>100K+</option>
-            <option value={1000000}>1M+</option>
-            <option value={10000000}>10M+</option>
-            <option value={50000000}>50M+</option>
-          </select>
-        </div>
-      </div>
-
-      {viewMode === 'dumps' ? (
-        <div>
-          {dumpsLoading ? (
-            <div className="card" style={{ padding: 16 }}>Loading dump candidates…</div>
-          ) : dumpsError ? (
-            <div className="empty" style={{ color: '#ef4444' }}>{dumpsError.message || 'Failed to load dumps'}</div>
-          ) : dumps.length === 0 ? (
-            <div className="empty">No dump candidates right now.</div>
-          ) : (
-            <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))' }}>
-              {dumps.map((d) => (
-                <div key={d.item_id} className="card" style={{ padding: 14 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div style={{ fontWeight: 700 }}>{d.name}</div>
-                    <span className={`badge ${d.stars >= 3 ? 'badge-red' : d.stars === 2 ? 'badge-yellow' : 'badge-cyan'}`}>{'★'.repeat(d.stars || 1)}</span>
-                  </div>
-                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <DumpSparkline dumpPrice={d.dump_price} refAvg={d.ref_avg} />
-                    <div style={{ fontSize: 12 }}>
-                      <div>Drop: <strong>{d.drop_pct?.toFixed?.(1) ?? d.drop_pct}%</strong></div>
-                      <div>Vol: <strong>{(d.volume_5m || 0).toLocaleString()}</strong></div>
-                      <div>Est profit: <strong>+{formatGP(d.est_profit)}</strong></div>
-                    </div>
-                  </div>
-                  <div style={{ marginTop: 10, display: 'flex', gap: 8 }}>
-                    {freeSlots > 0 ? (
-                      <button className="btn" onClick={() => acceptOpportunity(d, null, { type: 'dump' })}>
-                        <Check size={12} /> Accept dump
-                      </button>
-                    ) : (
-                      <select
-                        defaultValue=""
-                        onChange={(e) => e.target.value && acceptOpportunity(d, e.target.value, { type: 'dump' })}
-                        style={{ width: '100%' }}
-                      >
-                        <option value="" disabled>Replace slot to accept</option>
-                        {activeTrades.map(t => (
-                          <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        ) : dumpsError ? (
+          <div className="empty" style={{ color: '#ef4444' }}>
+            <AlertTriangle size={24} style={{ marginBottom: 8 }} /><br />
+            Failed to load dumps — {dumpsError.message || 'connection error'}
+          </div>
+        ) : dumps.length === 0 ? (
+          <div className="empty">No dump candidates right now. Check back soon.</div>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 }}>
+            {dumps.map(d => (
+              <DumpCard key={d.item_id} d={d}
+                freeSlots={freeSlots} activeTrades={activeTrades}
+                acceptingId={acceptingId} onAccept={acceptOpportunity} />
+            ))}
+          </div>
+        )
       ) : (
-      /* ── Table ── */
-      <div className="card" style={{ padding: 0, overflow: 'auto' }}>
-        {loading ? (
-          <div>
-            <div className="text-muted" style={{ padding: '10px 14px' }}>Refreshing opportunities…</div>
-            <LoadingSkeletonRows rows={8} />
+        /* ── Opportunities card grid ── */
+        loading ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 14 }}>
+            {Array.from({ length: 9 }).map((_, i) => <SkeletonCard key={i} />)}
           </div>
         ) : error ? (
           <div className="empty" style={{ color: '#ef4444' }}>
@@ -706,164 +833,34 @@ export default function Opportunities() {
             {filtersApplied && (
               filtersApplied.value_mode !== 'all'
               || Number(filtersApplied.min_profit_per_item_gp || 0) > 0
-              || Number(filtersApplied.min_total_profit_gp || 0) > 0
-              || Number(filtersApplied.min_price_gp || 0) > 0
             )
-              ? `No items in ${filtersApplied.value_mode || 'this mode'} right now — try all or adjust filters.`
+              ? `No items in ${filtersApplied.value_mode || 'this mode'} right now — try Any or adjust filters.`
               : 'No opportunities in cache yet.'}
           </div>
         ) : filtered.length === 0 ? (
           <div className="empty">
             <Filter size={24} style={{ marginBottom: 8, opacity: 0.5 }} /><br />
-            No items match your filters. Try adjusting criteria.
+            No {CATEGORIES.find(c => c.key === category)?.label || ''} items right now — try another category.
           </div>
         ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th style={{ width: 30 }}>#</th>
-                <th>Item</th>
-                {th(activeScoreMode === 'margin_hunter' ? 'MARGIN SCORE' : 'RUNE SCORE', 'flip_score')}
-                {th('Buy', 'buy_price')}
-                {th('Sell', 'sell_price')}
-                {th('Margin', 'margin_gp')}
-                {th('Profit', 'potential_profit')}
-                {th('ROI',    'roi_pct')}
-                {th('Vol',    'volume_5m')}
-                <th>Trend</th>
-                <th>AI</th>
-                <th style={{ width: 30 }}></th>
-                <th style={{ width: 180 }}>Trade</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((opp, i) => {
-                const t = trendBadge(opp.trend);
-                const isExpanded = expandedId === opp.item_id;
-                return [
-                  <tr key={`row-${i}`}
-                    onClick={() => setExpandedId(isExpanded ? null : opp.item_id)}
-                    style={isExpanded ? { background: 'rgba(6,182,212,0.05)' } : {}}
-                  >
-                    <td className="text-muted">{i + 1}</td>
-                    <td>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <img src={IMG(opp.item_id)} alt="" width={28} height={28}
-                          style={{ imageRendering: 'pixelated', flexShrink: 0 }}
-                          onError={e => { e.target.style.display = 'none'; }} />
-                        <div>
-                          <div style={{ fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
-                            {opp.name}
-                            <span className={`badge ${riskBadge(opp).cls}`} style={{ fontSize: 10 }}>{riskBadge(opp).label}</span>
-                          </div>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <MiniSparkline buyPrice={opp.buy_price} sellPrice={opp.sell_price} />
-                            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                              {scoreChips(opp).map((chip) => (
-                                <span key={chip} className="badge badge-cyan" style={{ fontSize: 9 }}>{chip}</span>
-                              ))}
-                            </div>
-                          </div>
-                          {opp.win_rate != null && (
-                            <div className="text-muted" style={{ fontSize: 10 }}>
-                              {opp.total_flips} flips · {opp.win_rate?.toFixed(0)}% WR
-                            </div>
-                          )}
-                          {Number(opp.qty_suggested || 0) > 0 && (
-                            <div
-                              className="text-muted"
-                              style={{ fontSize: 10 }}
-                              title={Number(opp.ge_limit_4h || 0) > 0 ? `GE limit: ${Number(opp.ge_limit_4h).toLocaleString()} / 4h` : 'No GE limit data'}
-                            >
-                              Qty {formatQty(opp.qty_suggested)}
-                              {(Number(opp.ge_limit_4h || 0) > 0 && Number(opp.qty_raw ?? opp.qty_suggested ?? 0) > Number(opp.qty_suggested || 0)) ? ' (GE cap)' : ''}
-                              {Number(opp.ge_limit_4h || 0) > 0 ? ` · GE limit ${formatQty(opp.ge_limit_4h)} / 4h` : ''}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </td>
-                    <td>
-                      <span className={`badge ${scoreColor(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)}`}>
-                        {(activeScoreMode === 'margin_hunter' ? (opp.margin_hunter_score ?? opp.flip_score) : opp.flip_score)?.toFixed(0)}
-                      </span>
-                    </td>
-                    <td className="gp text-green">{formatGP(opp.buy_price)}</td>
-                    <td className="gp text-cyan">{formatGP(opp.sell_price)}</td>
-                    <td className="gp">{formatGP(opp.margin_gp)}</td>
-                    <td className="gp text-green">+{formatGP(opp.potential_profit)}</td>
-                    <td className="gp">{opp.roi_pct?.toFixed(1) || '—'}%</td>
-                    <td className="gp">{opp.volume_5m || 0}</td>
-                    <td><span className={`badge ${t.cls}`} title={t.label}>{t.icon}</span></td>
-                    <td>
-                      {(opp.confidence ?? opp.ml_confidence) != null ? (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <div style={{ width: 36, height: 5, borderRadius: 3, background: 'var(--bg-secondary)' }}>
-                            <div style={{
-                              height: '100%', borderRadius: 3,
-                              width: `${Math.min(100, ((opp.confidence ?? opp.ml_confidence) || 0) * 100)}%`,
-                              background: ((opp.confidence ?? opp.ml_confidence) || 0) > 0.7 ? 'var(--green)' : ((opp.confidence ?? opp.ml_confidence) || 0) > 0.5 ? 'var(--yellow)' : 'var(--red)',
-                            }} />
-                          </div>
-                          <span className="text-muted" style={{ fontSize: 10 }}>{((((opp.confidence ?? opp.ml_confidence) || 0) * 100)).toFixed(0)}%</span>
-                        </div>
-                      ) : <span className="text-muted">—</span>}
-                    </td>
-                    <td>
-                      <button
-                        className="btn"
-                        style={{ padding: '4px 8px', fontSize: 11 }}
-                        onClick={e => { e.stopPropagation(); nav(`/item/${opp.item_id}`); }}
-                        title="View full analysis"
-                      >
-                        <ArrowUpRight size={12} />
-                      </button>
-                    </td>
-
-                        <td>
-                          {freeSlots > 0 ? (
-                            <button
-                              className="btn"
-                              disabled={acceptingId === opp.item_id}
-                              onClick={e => { e.stopPropagation(); acceptOpportunity(opp); }}
-                              style={{ fontSize: 11 }}
-                            >
-                              <Check size={12} /> Accept
-                            </button>
-                          ) : (
-                            <div>
-                              <button
-                                className="btn"
-                                disabled={acceptingId === opp.item_id}
-                                onClick={e => { e.stopPropagation(); setReplaceForItem(replaceForItem === opp.item_id ? null : opp.item_id); }}
-                                style={{ fontSize: 11 }}
-                              >
-                                Replace slot
-                              </button>
-                              {replaceForItem === opp.item_id && (
-                                <select
-                                  onClick={e => e.stopPropagation()}
-                                  onChange={(e) => e.target.value && acceptOpportunity(opp, e.target.value)}
-                                  defaultValue=""
-                                  style={{ marginTop: 6, width: '100%', fontSize: 11 }}
-                                >
-                                  <option value="" disabled>Select trade to replace</option>
-                                  {activeTrades.map(t => (
-                                    <option key={t.trade_id} value={t.trade_id}>Slot {t.slot_index}: {t.name}</option>
-                                  ))}
-                                </select>
-                              )}
-                            </div>
-                          )}
-                        </td>
-                      </tr>,
-                  isExpanded && <ExpandedDetail key={`detail-${opp.item_id ?? i}`} opp={opp} />,
-                ];
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 14 }}>
+            {filtered.map((opp, i) => (
+              <OpportunityCard
+                key={opp.item_id ?? i}
+                opp={opp}
+                rank={i + 1}
+                activeScoreMode={activeScoreMode}
+                freeSlots={freeSlots}
+                activeTrades={activeTrades}
+                acceptingId={acceptingId}
+                replaceForItem={replaceForItem}
+                setReplaceForItem={setReplaceForItem}
+                onAccept={acceptOpportunity}
+                nav={nav}
+              />
+            ))}
+          </div>
+        )
       )}
     </div>
   );
