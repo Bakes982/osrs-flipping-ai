@@ -116,6 +116,14 @@ INDEXES: dict[str, list[IndexModel]] = {
             name="item_id_timestamp_desc",
         ),
         IndexModel([("timestamp", ASCENDING)], name="timestamp_asc"),
+        # TTL index: MongoDB auto-deletes documents older than 6 hours.
+        # This is a safety net on top of DataPruner's 4-hour manual deletion,
+        # ensuring price_snapshots never grows beyond ~1,200 documents on Atlas M0.
+        IndexModel(
+            [("timestamp", ASCENDING)],
+            expireAfterSeconds=21600,  # 6 hours
+            name="timestamp_ttl_6h",
+        ),
     ],
 
     # ------------------------------------------------------------------
