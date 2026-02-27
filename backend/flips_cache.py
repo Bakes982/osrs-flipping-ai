@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Sequence
 
@@ -101,19 +102,30 @@ def _live_margin_scan(
                 buy_limit = wiki_limit or db_limit or 125
 
                 roi_pct = round(margin / max(low, 1) * 100.0, 2)
-                # Conservative qty for expected-profit calc (10 M capital budget)
-                qty = min(buy_limit, max(1, int(10_000_000 // max(low, 1))))
+                # Scale capital budget by item price so high-value items get
+                # meaningful qty (e.g. 100 M budget for a 50 M item → qty 2).
+                capital = max(10_000_000, min(low * 3, 200_000_000))
+                qty = min(buy_limit, max(1, int(capital // max(low, 1))))
                 expected_profit = margin * qty
 
-                # Simple score: weighted by expected GP profit and ROI.
-                # Volume is only a small tiebreaker — presence of zero volume
-                # does NOT veto the item (unlike the complex scorer).
-                # Cap at 65 so MongoDB-scored items always rank higher.
-                gp_score = min(1.0, expected_profit / 5_000_000.0)
-                roi_score = min(1.0, roi_pct / 5.0)
-                vol_score = min(1.0, vol / 100.0) if vol > 0 else 0.0
-                base = 0.55 * gp_score + 0.30 * roi_score + 0.15 * vol_score
-                total_score = round(base * 65.0)
+                # Score components — all log-scaled so expensive items with
+                # small qty aren't penalised relative to cheap bulk items.
+                # Cap at 65 so fully-analysed MongoDB items always rank higher.
+                gp_score     = min(1.0, expected_profit / 5_000_000.0)
+                margin_score = min(1.0, math.log10(margin + 1) / 6.0)  # 1 M margin → 1.0
+                roi_score    = min(1.0, roi_pct / 5.0)
+                vol_score    = min(1.0, vol / 100.0) if vol > 0 else 0.0
+                # Price-tier bonus: rewards items worth 500 K+ on their own merit
+                price_bonus  = min(1.0, math.log10(low + 1) / 8.0) if low >= 500_000 else 0.0
+
+                base = (
+                    0.35 * gp_score
+                    + 0.25 * margin_score
+                    + 0.20 * roi_score
+                    + 0.12 * vol_score
+                    + 0.08 * price_bonus
+                )
+                total_score = round(min(65.0, base * 65.0))
 
                 results.append({
                     # Identity

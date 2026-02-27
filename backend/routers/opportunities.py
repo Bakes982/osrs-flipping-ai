@@ -372,9 +372,9 @@ def _margin_hunter_score(item: Dict[str, Any], value_mode: str) -> float:
 
     # Value-mode relevance bonus.
     if value_mode == "1m" and unit_price >= 1_000_000:
-        score += 4.0
+        score += 12.0
     if value_mode == "10m" and unit_price >= 10_000_000:
-        score += 6.0
+        score += 18.0
 
     # Penalties.
     if unit_price < 100_000 and margin_gp < 2_000:
@@ -383,10 +383,13 @@ def _margin_hunter_score(item: Dict[str, Any], value_mode: str) -> float:
         score -= 9.0
     if stability < 0.35:
         score -= 8.0
+    # High-value items trade less frequently by nature — reduce volume penalty
+    # so a Bandos tasset trading 3/5 m isn't buried below 10 k cannonballs.
+    vol_penalty_scale = 0.25 if unit_price >= 10_000_000 else (0.55 if unit_price >= 1_000_000 else 1.0)
     if volume_5m < 20:
-        score -= 12.0
+        score -= 12.0 * vol_penalty_scale
     elif volume_5m < 60:
-        score -= 5.0
+        score -= 5.0 * vol_penalty_scale
     if trend_q < -0.2:
         score -= 6.0 if unit_price < 1_000_000 else 10.0
 

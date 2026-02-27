@@ -60,44 +60,130 @@ function parseGP(str) {
 function classifyItem(opp) {
   const name = (opp.name || opp.item_name || '').toLowerCase();
 
-  const SUPPLY = ['potion', 'brew', 'restore', 'shark', 'anglerfish', 'manta ray',
-    'karambwan', 'anti-', 'antivenin', 'antipoison', 'stamina', 'prayer', 'overload',
-    'divine', 'super combat', 'super attack', 'super strength', 'super defence',
-    'ranging potion', 'magic potion', 'super energy', 'agility potion',
-    'bastion potion', 'battlemage potion', 'dark crab', 'tuna potato', 'lobster',
-    'pizza', 'cake', 'pie', 'cooked', 'monkfish', 'swordfish', 'wine of'];
-  if (SUPPLY.some(k => name.includes(k))) return 'supplies';
+  // ── 1. Construction flatpacks & materials (catch before broad keywords) ───
+  if (
+    name.includes('flatpack') || name.includes('wardrobe') ||
+    name.includes('bookcase') || name.includes('bolts of cloth') ||
+    name.includes('gold leaf') || name.includes('marble block') ||
+    name.includes('carved teak') || name.includes('carved mahogany')
+  ) return 'skilling';
 
-  const SKILLING = [' ore', ' bar', ' log', ' seed', ' herb', 'essence', 'feather',
-    'leather', 'dragon hide', 'd-hide', 'green hide', 'blue hide', 'red hide', 'black hide',
-    'raw ', 'grimy ', 'clean ', 'coal', 'flax', 'bowstring', 'wool', 'uncut ', 'cut ',
-    'sapphire', 'emerald', 'ruby', 'diamond', 'dragonstone', 'onyx', 'amethyst',
-    'cannonball', 'dart tip', 'arrowhead', 'arrow shaft', 'tooth half', 'loop half',
-    'fish', 'bone', 'ashes', 'dust', 'powder', 'planks', 'plank', 'lime', 'sand',
-    'bucket of', 'jar of', 'vial of', 'vial', 'knife', 'chisel', 'needle', 'thread'];
-  if (SKILLING.some(k => name.includes(k))) return 'skilling';
-
-  const PVP = ["vesta's", "statius'", "morrigan's", "zuriel's", 'corrupt dragon',
-    "craw's", "viggora's", "thammaron's", 'volatile orb', 'accursed sceptre',
-    'ancient godsword', 'forgotten brew', 'ancient cloak', 'ancient coif',
-    'ancient d\'hide'];
+  // ── 2. PvP / Wilderness ──────────────────────────────────────────────────
+  const PVP = [
+    "vesta's", "statius'", "morrigan's", "zuriel's", 'corrupt dragon',
+    "craw's", "viggora's", "thammaron's", 'ursine chainmace', 'webweaver bow',
+    'accursed sceptre', 'volatile orb', 'ancient godsword', 'forgotten brew',
+    "ancient d'hide", 'ancient cloak', 'ancient coif',
+    'blighted super restore', 'blighted vengeance', 'blighted ice barrage',
+    'blighted ancient', 'blighted meleeing', 'revenant ether',
+  ];
   if (PVP.some(k => name.includes(k))) return 'pvp';
 
-  const PVM = ['torva', 'bandos', 'armadyl', 'justiciar', 'inquisitor', 'scythe',
-    'lance', 'twisted bow', 'blowpipe', 'sang', 'shadow', 'tumeken', 'osmumten',
-    'masori', 'ancestral', 'dharok', 'guthan', 'karil', 'torag', 'verac', 'ahrim',
-    'barrows', 'zenyte', 'torture', 'anguish', 'occult', 'berserker ring',
-    'archers ring', 'seers ring', 'tyrannical ring', 'treasonous ring',
-    'serpentine', 'pegasian', 'eternal', 'primordial', 'crystal helm',
-    'crystal body', 'crystal legs', 'bowfa', 'toxic blowpipe', 'toxic staff',
-    'slayer helmet', 'black mask', 'imbued', 'void knight', 'fighter torso',
-    'fire cape', 'infernal cape', 'avernic', 'dragon warhammer', 'elder maul',
-    'kodai', 'lightbearer', 'ultor', 'magus ring', 'bellator', 'venator',
-    'sanguinesti', 'elysian', 'spectral', 'arcane', 'ward', 'rapier', 'fang',
-    'partisan', 'vitur', 'noxious', 'blood fury', 'amulet of fury', 'brimstone',
-    'rune pouch', 'jar ', 'clue', 'heart of ', 'crystal key', "ava's",
-    "pegasian crystal", "eternal crystal", "primordial crystal"];
+  // ── 3. PvM gear ───────────────────────────────────────────────────────────
+  const PVM = [
+    // Melee armour
+    'torva', 'bandos', 'inquisitor',
+    // Ranged armour
+    'armadyl', 'masori', 'justiciar',
+    // Magic armour
+    'ancestral',
+    // Barrows sets
+    'dharok', 'guthan', 'karil', 'torag', 'verac', 'ahrim', 'barrows',
+    // Scythe / high-tier melee weapons
+    'scythe of vitur', 'ghrazi rapier', 'dragon hunter lance',
+    'dragon hunter crossbow', 'dragon warhammer', 'elder maul', 'voidwaker',
+    'dragon claws', 'osmumten\'s fang', 'partisan',
+    // Ranged weapons
+    'twisted bow', 'toxic blowpipe', 'blowpipe', 'zaryte',
+    'crystal bow', 'bowfa',
+    // Magic weapons
+    'tumeken\'s shadow', 'sanguinesti', 'kodai', 'toxic staff of the dead',
+    // Rings (DT2 / BIS)
+    'bellator ring', 'ultor ring', 'magus ring', 'venator ring',
+    'bellator vestige', 'ultor vestige', 'magus vestige', 'venator vestige',
+    'berserker ring', 'archers ring', 'seers ring', 'tyrannical ring',
+    'treasonous ring', 'lightbearer', 'brimstone ring', 'ring of endurance',
+    'ring of shadows',
+    // Amulets
+    'amulet of torture', 'necklace of anguish', 'tormented bracelet',
+    'ring of suffering', 'amulet of fury', 'occult necklace',
+    'amulet of blood fury', 'blood fury',
+    'berserker necklace',
+    // Boots
+    'primordial boots', 'pegasian boots', 'eternal boots',
+    // Helms / Capes
+    'slayer helmet', 'black mask', 'serpentine helm',
+    'fire cape', 'infernal cape', 'fighter torso', 'void knight',
+    // Shields / sigils
+    'avernic defender', 'dragonfire shield', "elidinis' ward",
+    'spirit shield', 'arcane sigil', 'elysian sigil', 'spectral sigil',
+    // Crystal armour
+    'crystal helm', 'crystal body', 'crystal legs', 'crystal shield',
+    // Other BIS / notable
+    'imbued heart', 'rune pouch', "ava's assembler", "ava's accumulator",
+    'pegasian crystal', 'eternal crystal', 'primordial crystal',
+    // 2026 additions
+    'tonalztics of ralos', 'echo crystal', 'sunfire fanatic',
+  ];
   if (PVM.some(k => name.includes(k))) return 'pvm';
+
+  // ── 4. Supplies: Food, Potions, Runes, Ammunition ────────────────────────
+  const SUPPLY = [
+    // Food
+    'shark', 'anglerfish', 'manta ray', 'karambwan', 'dark crab',
+    'tuna potato', 'monkfish', 'swordfish', 'lobster', 'bass', 'trout',
+    'cooked', 'wine of',
+    // Potions (match any dose: (4), (3), etc.)
+    'potion', 'brew', 'restore', 'overload', 'stamina',
+    'super combat', 'super attack', 'super strength', 'super defence',
+    'ranging potion', 'magic potion', 'super energy', 'agility potion',
+    'bastion potion', 'battlemage potion', 'prayer potion',
+    'divine super', 'divine ranging', 'divine bastion', 'divine battlemage',
+    'anti-', 'antivenin', 'antipoison', 'antidote', 'relicym',
+    // Runes (' rune' with leading space avoids matching 'runite')
+    ' rune', 'soul rune', 'death rune', 'blood rune', 'chaos rune',
+    'nature rune', 'law rune', 'wrath rune', 'cosmic rune', 'astral rune',
+    'mind rune', 'body rune', 'aether rune', 'sunfire rune',
+    // Ammunition
+    'cannonball', 'dart tip', 'arrowhead', 'arrow shaft',
+    ' arrow', 'broad bolt', 'opal bolt', 'sapphire bolt', 'emerald bolt',
+    'ruby bolt', 'diamond bolt', 'dragon bolt', 'runite bolt',
+    'amethyst dart', 'dragon dart', 'rune dart', 'adamant dart', 'mithril dart',
+    ' javelin', 'chinchompa', 'throwing axe', 'atlatl dart',
+    // Teleport tabs
+    'teleport to house', 'teletab',
+  ];
+  if (SUPPLY.some(k => name.includes(k))) return 'supplies';
+
+  // ── 5. Skilling materials & gathering ────────────────────────────────────
+  const SKILLING = [
+    // Mining & Smithing
+    ' ore', ' bar', 'coal', 'runite', 'adamantite', 'mithril',
+    // Woodcutting / FM
+    ' log', ' logs', 'magic log',
+    // Farming / Herblore
+    ' seed', ' herb', 'grimy ', 'clean ', 'torstol', 'ranarr weed',
+    'snapdragon', 'lantadyme', 'dwarf weed', 'cadantine', 'kwuarm',
+    'avantoe', 'irit', 'harralander', 'toadflax', 'marrentill', 'guam',
+    'snape grass', 'crushed nest', 'demon tears',
+    // Fishing
+    'raw ', 'feather', 'fish',
+    // Crafting
+    'leather', 'dragon hide', 'd-hide', 'uncut ', 'sapphire', 'emerald',
+    'ruby', 'diamond', 'dragonstone', 'amethyst', 'onyx gem',
+    'bowstring', 'wool', 'flax', 'vial', 'chisel', 'needle', 'thread',
+    'tiara', 'gold ore', 'gold bar',
+    // Runecrafting
+    'essence',
+    // Construction
+    'mahogany plank', 'teak plank', 'limestone brick', 'marble',
+    // Misc gathering
+    'bone', 'ashes', 'dust', 'powder', 'sand', 'bucket of',
+    'tooth half', 'loop half',
+    // Sailing (2025/26)
+    'ironwood plank', 'rosewood', 'camphor log', 'narwhal horn', 'squid beak',
+  ];
+  if (SKILLING.some(k => name.includes(k))) return 'skilling';
 
   return 'merch';
 }
@@ -655,7 +741,7 @@ export default function Opportunities() {
   const [profile, setProfile] = useState('balanced');
   const [scoreMode, setScoreMode] = useState('balanced');
   const [valueMode, setValueMode] = useState('all');
-  const [minProfitPerItemGp, setMinProfitPerItemGp] = useState(0);
+  const [minFlipProfit, setMinFlipProfit] = useState(0);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [replaceForItem, setReplaceForItem] = useState(null);
   const [acceptingId, setAcceptingId] = useState(null);
@@ -676,9 +762,9 @@ export default function Opportunities() {
       min_profit_gp: 0,
       min_total_profit_gp: 0,
       value_mode: valueMode,
-      min_profit_per_item_gp: minProfitPerItemGp,
+      min_profit_per_item_gp: 0,
     }),
-    [profile, scoreMode, valueMode, minProfitPerItemGp],
+    [profile, scoreMode, valueMode],
   );
 
   const { data: raw, loading, error, reload } = useApi(
@@ -752,6 +838,10 @@ export default function Opportunities() {
       });
     }
 
+    if (minFlipProfit > 0) {
+      items = items.filter(o => (o.potential_profit ?? o.expected_profit ?? 0) >= minFlipProfit);
+    }
+
     if (category !== 'all') {
       items = items.filter(o => classifyItem(o) === category);
     }
@@ -765,7 +855,7 @@ export default function Opportunities() {
     });
 
     return items;
-  }, [opps, category, search, coinBalance, sortCol, sortDir, activeScoreMode]);
+  }, [opps, category, search, coinBalance, minFlipProfit, sortCol, sortDir, activeScoreMode]);
 
   /* ── Summary stats ── */
   const summaryStats = useMemo(() => {
@@ -907,10 +997,17 @@ export default function Opportunities() {
               {m === 'all' ? 'Any' : m === '1m' ? '1M+' : '10M+'}
             </button>
           ))}
-          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>Min profit/item:</span>
-          {[{ label: 'Off', gp: 0 }, { label: '100gp+', gp: 100 }, { label: '500gp+', gp: 500 }, { label: '2k+', gp: 2000 }].map(({ label, gp }) => (
-            <button key={gp} className={`pill ${minProfitPerItemGp === gp ? 'active' : ''}`}
-              onClick={() => setMinProfitPerItemGp(gp)} style={{ fontSize: 11 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 8 }}>Min profit/flip:</span>
+          {[
+            { label: 'Off',   gp: 0       },
+            { label: '25K',   gp: 25_000  },
+            { label: '50K',   gp: 50_000  },
+            { label: '100K',  gp: 100_000 },
+            { label: '200K',  gp: 200_000 },
+            { label: '500K',  gp: 500_000 },
+          ].map(({ label, gp }) => (
+            <button key={gp} className={`pill ${minFlipProfit === gp ? 'active' : ''}`}
+              onClick={() => setMinFlipProfit(gp)} style={{ fontSize: 11 }}>
               {label}
             </button>
           ))}
