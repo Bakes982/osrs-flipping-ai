@@ -543,10 +543,15 @@ def init_db():
             [("item_id", ASCENDING), ("timestamp", ASCENDING)],
             background=True,
         )
-        _wrapper.price_snapshots.create_index(
-            [("timestamp", ASCENDING)],
-            background=True,
-        )
+        # Drop the old non-TTL timestamp index (auto-named "timestamp_1" or
+        # named "timestamp_asc") so that ensure_all_indexes() can create the
+        # 6-hour TTL index on the same key without a conflict error.
+        for _old_idx in ("timestamp_1", "timestamp_asc"):
+            try:
+                _wrapper.price_snapshots.drop_index(_old_idx)
+                logger.info("Dropped old non-TTL index %s from price_snapshots", _old_idx)
+            except Exception:
+                pass  # index doesn't exist — fine
         _wrapper.price_aggregates.create_index(
             [("item_id", ASCENDING), ("timestamp", ASCENDING), ("interval", ASCENDING)],
             background=True,

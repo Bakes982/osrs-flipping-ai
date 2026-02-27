@@ -146,9 +146,12 @@ class PriceCollector:
     async def store_snapshots(self) -> int:
         """Store current price data as PriceSnapshot rows.
 
-        Stores top 50 items by volume, every 5 minutes (not every 10 seconds).
+        Stores top 25 items by volume every 5 minutes (not every 10 seconds).
         Broadcast + in-memory cache still update every 10s — this only controls
-        MongoDB writes to stay well under the 512 MB Atlas quota.
+        MongoDB writes. Keeping only 25 items caps price_snapshots at ~1,200 docs
+        (25 items × 12 writes/hr × 4h retention) ≈ 600 KB — well under the
+        512 MB Atlas M0 quota. The live margin scan in flips_cache covers all
+        ~6000 items from in-memory caches without needing MongoDB snapshots.
         Returns the number of rows inserted (0 if skipped due to throttle).
         """
         if not self._latest_data:
@@ -163,7 +166,11 @@ class PriceCollector:
             db = get_db()
             count = 0
             try:
-                # Filter to items with meaningful volume, keep top 50
+                # Keep only top 25 items by 5m volume for MongoDB storage.
+                # The live margin scan (flips_cache._live_margin_scan) covers
+                # all ~6000 items from in-memory _price_cache/_5m_cache without
+                # touching MongoDB — so we only need a small set here for the
+                # richer historical scoring in compute_scored_opportunities_sync.
                 items_with_volume = []
                 for item_id_str, instant in self._latest_data.items():
                     avg = self._5m_data.get(item_id_str, {})
@@ -172,7 +179,7 @@ class PriceCollector:
                         items_with_volume.append((item_id_str, instant, avg, vol))
 
                 items_with_volume.sort(key=lambda x: x[3], reverse=True)
-                items_with_volume = items_with_volume[:100]  # was 200; top-100 covers all meaningful flip targets
+                items_with_volume = items_with_volume[:25]
 
                 snapshots_list = []
                 for item_id_str, instant, avg, vol in items_with_volume:
@@ -517,8 +524,13 @@ class DataPruner:
         logger.info("Created %d 1h aggregate candles, deleted %d old 5m candles", total_created, total_deleted)
 
     def _delete_old_snapshots(self, db):
-        """Delete raw snapshots older than 24 hours (already aggregated)."""
-        cutoff = datetime.utcnow() - timedelta(hours=24)
+        """Delete raw snapshots older than 4 hours.
+
+        4 hours covers the full window used by compute_scored_opportunities_sync
+        (get_price_history hours=4), so nothing useful is lost.  Keeping data
+        longer than this would cause storage to grow unboundedly on Atlas M0.
+        """
+        cutoff = datetime.utcnow() - timedelta(hours=4)
         result = db.price_snapshots.delete_many({"timestamp": {"$lt": cutoff}})
         logger.info("Deleted %d old raw snapshots", result.deleted_count)
 
@@ -545,12 +557,29 @@ class DataPruner:
             pass
 
     async def prune(self):
-        """Run the full pruning cycle in a background thread."""
+        """Run the full pruning cycle in a background thread.
+
+        Aggregate creation is disabled: live scoring now reads from the
+        in-memory _price_cache / _5m_cache so price_aggregates documents
+        are never consulted and only waste Atlas M0 storage.  All existing
+        price_aggregates documents are deleted on each prune pass until the
+        collection is empty, then the delete_many becomes a fast no-op.
+        """
         def _sync_prune():
             db = get_db()
             try:
-                self._aggregate_snapshots_to_5m(db)
-                self._aggregate_5m_to_1h(db)
+                # Drop all price_aggregates — they are redundant now that
+                # flips_cache._live_margin_scan uses the in-memory caches.
+                try:
+                    result = db.price_aggregates.delete_many({})
+                    if result.deleted_count:
+                        logger.info(
+                            "DataPruner: freed %d price_aggregates documents",
+                            result.deleted_count,
+                        )
+                except Exception as exc:
+                    logger.warning("DataPruner: price_aggregates cleanup failed: %s", exc)
+
                 self._delete_old_snapshots(db)
             except Exception as e:
                 logger.error("DataPruner error: %s", e)

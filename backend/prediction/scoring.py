@@ -269,10 +269,27 @@ def calculate_flip_metrics(item_data: dict) -> dict:
     cv_ref = _cfg_float("SPREAD_CV_REF", 0.5)
     spread_stability = clamp(1.0 - safe_div(spread_cv, max(cv_ref, 1e-9)), 0.0, 1.0)
 
-    freq_ref = _cfg_float("LIQ_FREQ_REF_SECONDS", 60.0)
+    # High-value items trade less frequently and have wider spreads — scale the
+    # reference thresholds so their liquidity score isn't unfairly crushed.
+    _freq_ref_base = _cfg_float("LIQ_FREQ_REF_SECONDS", 60.0)
+    if buy_now >= 50_000_000:        # 50M+  (Bowfa, Scythe, Tbow …)
+        freq_ref = _freq_ref_base * 5.0   # snapshot every ~5 min is "liquid"
+    elif buy_now >= 10_000_000:      # 10M+
+        freq_ref = _freq_ref_base * 3.0
+    elif buy_now >= 1_000_000:       # 1M+
+        freq_ref = _freq_ref_base * 2.0
+    else:
+        freq_ref = _freq_ref_base
     avg_update_seconds = _avg_update_seconds(points_1h)
     freq_score = clamp(safe_div(freq_ref, max(avg_update_seconds, 1.0)), 0.0, 1.0)
-    spread_pct_ref = _cfg_float("LIQ_SPREAD_PCT_REF", 0.05)
+    # High-value items have naturally wider bid/ask spreads — don't penalise them
+    # for having a 5-10% spread when that represents millions in margin.
+    if buy_now >= 10_000_000:
+        spread_pct_ref = 0.20
+    elif buy_now >= 1_000_000:
+        spread_pct_ref = 0.10
+    else:
+        spread_pct_ref = _cfg_float("LIQ_SPREAD_PCT_REF", 0.05)
     spread_quality = clamp(1.0 - safe_div(spread_pct_now, max(spread_pct_ref, 1e-9)), 0.0, 1.0)
     liquidity_score = clamp(0.4 * freq_score + 0.3 * spread_quality + 0.3 * spread_stability, 0.0, 1.0)
 
@@ -315,7 +332,7 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         risk_level = "HIGH"
 
     user_capital = int(item_data.get("user_capital") or 10_000_000)
-    item_limit = int(item_data.get("item_limit") or item_data.get("buy_limit") or 100_000)
+    item_limit = int(item_data.get("item_limit") or item_data.get("buy_limit") or 10_000)
     qty_cap = int(user_capital // max(buy_now, 1))
     qty_suggested = min(max(qty_cap, 0), max(item_limit, 1))
     qty_suggested = int(math.floor(qty_suggested * (0.5 + 0.5 * liquidity_score)))
@@ -381,12 +398,29 @@ def calculate_flip_metrics(item_data: dict) -> dict:
         veto_reasons.append("Zero 5-min volume")
     profile_fill_thresholds = {"conservative": 0.60, "balanced": 0.45, "aggressive": 0.30}
     fill_min = profile_fill_thresholds.get(profile, 0.45)
+    # High-value items naturally trade slower — lower the fill threshold so they
+    # aren't vetoed just for infrequent volume.  The slower fill is priced in via
+    # the est_fill_time → lower gph_norm, not via a blanket veto.
+    if buy_now >= 50_000_000:
+        fill_min = max(0.10, fill_min - 0.20)
+    elif buy_now >= 10_000_000:
+        fill_min = max(0.10, fill_min - 0.15)
+    elif buy_now >= 1_000_000:
+        fill_min = max(0.10, fill_min - 0.10)
     if fill_probability < fill_min:
         final_score = min(final_score, 30 if profile != "aggressive" else 40)
         veto_reasons.append(f"Low fill probability for {profile} profile")
         if fill_probability < max(0.10, fill_min * 0.4):
             vetoed = True
-    if spread_pct_now >= float(item_data.get("spread_max_pct") or 0.20):
+    _spread_max_default = float(item_data.get("spread_max_pct") or 0.20)
+    # For expensive items a wide spread is the profit opportunity, not a red flag.
+    if buy_now >= 10_000_000:
+        spread_max_pct = max(_spread_max_default, 0.35)
+    elif buy_now >= 1_000_000:
+        spread_max_pct = max(_spread_max_default, 0.25)
+    else:
+        spread_max_pct = _spread_max_default
+    if spread_pct_now >= spread_max_pct:
         vetoed = True
         veto_reasons.append("Spread too wide")
     if decay_penalty >= float(item_data.get("decay_spike_threshold") or 0.85):
